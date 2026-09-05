@@ -1,0 +1,140 @@
+/* PickleLive design tokens — "premium scoreboard" identity.
+   Warm paper neutrals + near-black ink + a court-green accent, with tabular
+   numerals reserved for scores. Mirrors src/theme/tokens.js (JS needs literal
+   hex for alpha-concat call sites like `D.accent+"22"`), so keep both in sync
+   if the palette changes. */
+:root {
+  /* Neutrals (light) */
+  --bg: #F7F7F5;
+  --surface: #FFFFFF;
+  --surface-2: #F1F1EF;
+  --surface-hover: #ECECE9;
+  --border: #E7E6E2;
+  --border-strong: #D5D4CF;
+
+  /* Ink (light) */
+  --ink: #101113;
+  --ink-2: #55565B;
+  --ink-3: #8A8B90;
+  --ink-inverse: #FFFFFF;
+
+  /* Brand accent — court green */
+  --accent: #0F7B4D;
+  --accent-hover: #0B6A42;
+  --accent-soft: #E6F4ED;
+  --accent-line: #B7E0CC;
+
+  /* Secondary */
+  --blue: #3B6FE0;
+  --blue-soft: #EAF1FE;
+
+  /* Status */
+  --success: #188A4E;
+  --success-soft: #E9F7EF;
+  --warn: #B45309;
+  --warn-soft: #FEF6E7;
+  --danger: #C93B3B;
+  --danger-soft: #FBEDED;
+  --info: #2563EB;
+  --info-soft: #EAF1FE;
+  --live: #C93B3B;
+
+  /* Dark scoring surface (intentional — ScoringScreen/LiveBoard keep dark chrome) */
+  --court: #101113;
+  --court-card: #1B1C1F;
+  --court-border: #2A2B2F;
+  --court-border-soft: rgba(255,255,255,.08);
+  --court-disabled: #334155;
+  --court-text: #F8FAFC;
+  --court-text-muted: #94A3B8;
+  --court-text-subtle: #64748B;
+  --court-text-faint: #475569;
+  --court-amber: #E0A339;
+  --court-red: #E5696E;
+  --court-green: #33C285;
+  --team-a: #4E8DF7;
+  --team-b: #3FBF7F;
+  --lime: #B5E24B;
+
+  /* Type scale */
+  --fs-micro: 11px;
+  --fs-caption: 12px;
+  --fs-body-sm: 13px;
+  --fs-body: 15px;
+  --fs-title-sm: 17px;
+  --fs-title: 20px;
+  --fs-headline: 24px;
+  --fs-display: 30px;
+  --fs-score: 34px;
+  --fs-score-lg: 44px;
+  --font-sans: 'InterVariable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+
+  /* Spacing (4px base) */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s7: 32px;
+  --s8: 40px;
+
+  /* Radius */
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 20px;
+  --r-full: 999px;
+
+  /* Shadows */
+  --sh-1: 0 1px 2px rgba(16,17,19,0.06), 0 1px 1px rgba(16,17,19,0.04);
+  --sh-2: 0 4px 12px rgba(16,17,19,0.08), 0 2px 4px rgba(16,17,19,0.05);
+  --sh-3: 0 12px 32px rgba(16,17,19,0.14), 0 4px 10px rgba(16,17,19,0.06);
+
+  /* Motion */
+  --t-fast: 120ms;
+  --t-base: 200ms;
+  --t-slow: 300ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* Dark-capable structure (no toggle shipped yet — see SECURITY.md/plan notes).
+   Kept as a real, usable block so a future theme switch is a flag flip, not a rewrite. */
+:root[data-theme="dark"] {
+  --bg: #101113;
+  --surface: #1B1C1F;
+  --surface-2: #202124;
+  --surface-hover: #26272B;
+  --border: #2A2B2F;
+  --border-strong: #35363B;
+
+  --ink: #F3F3F2;
+  --ink-2: #B7B8BC;
+  --ink-3: #808186;
+  --ink-inverse: #101113;
+
+  --accent: #33C285;
+  --accent-hover: #2AA872;
+  --accent-soft: rgba(51,194,133,0.14);
+  --accent-line: rgba(51,194,133,0.35);
+
+  --blue: #6E97F2;
+  --blue-soft: rgba(110,151,242,0.14);
+
+  --success: #33C285;
+  --success-soft: rgba(51,194,133,0.14);
+  --warn: #E0A339;
+  --warn-soft: rgba(224,163,57,0.14);
+  --danger: #E5696E;
+  --danger-soft: rgba(229,105,110,0.14);
+  --info: #6E97F2;
+  --info-soft: rgba(110,151,242,0.14);
+
+  --sh-1: 0 1px 2px rgba(0,0,0,0.3), 0 1px 1px rgba(0,0,0,0.2);
+  --sh-2: 0 4px 12px rgba(0,0,0,0.35), 0 2px 4px rgba(0,0,0,0.2);
+  --sh-3: 0 12px 32px rgba(0,0,0,0.45), 0 4px 10px rgba(0,0,0,0.25);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --t-fast: 0ms; --t-base: 0ms; --t-slow: 0ms; }
+}

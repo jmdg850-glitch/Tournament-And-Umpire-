@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Tournament Umpire</string>
+    <string name="title_activity_main">Tournament Umpire</string>
+    <string name="package_name">app.tournament.umpire</string>
+    <string name="custom_url_scheme">app.tournament.umpire</string>
+</resources>

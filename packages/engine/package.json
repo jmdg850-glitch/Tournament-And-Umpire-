@@ -1,0 +1,15 @@
+{
+  "name": "@tournament/engine",
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "lint": "node -e \"process.exit(0)\""
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  }
+}

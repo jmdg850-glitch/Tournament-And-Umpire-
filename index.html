@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#F7F7F5" />
+    <!--
+      Supabase project ref varies per deploy, so this can't be scoped tighter
+      than the whole *.supabase.co domain via a static meta tag. No
+      unsafe-inline/unsafe-eval for scripts; style-src allows unsafe-inline
+      because every component in this app styles via the React `style` prop.
+      frame-ancestors/sandbox are deliberately omitted — both are ignored (and
+      logged as console errors) when delivered via <meta> instead of a real
+      HTTP header, per spec. frame-src explicitly allow-lists both DUPR
+      "Login with DUPR" SSO hosts (uat.dupr.gg / dashboard.dupr.com, see
+      link-dupr-account/index.ts's sso-config mode) — without it, frame-src
+      falls back to default-src 'self' and silently blocks that iframe.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; frame-src https://uat.dupr.gg https://dashboard.dupr.com; object-src 'none'; base-uri 'self'; form-action 'self';" />
+      <meta name="description" content="Tournament — brackets, registration, live scoring, and results." />
+    <title>Tournament</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

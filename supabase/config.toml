@@ -1,0 +1,34 @@
+# Tournament App — new project (evuvgxruavnadpbiehgb). Not PickleLive / NextG.
+# This file does not push to the hosted Auth dashboard. Set Site URL there separately.
+project_id = "evuvgxruavnadpbiehgb"
+
+[api]
+enabled = true
+
+[auth]
+enabled = true
+# Local default. Hosted production Site URL should be:
+# https://tournament-operator.vercel.app
+site_url = "http://localhost:5174"
+additional_redirect_urls = [
+  "http://localhost:5174",
+  "http://localhost:5174/**",
+  "http://localhost:5175",
+  "http://localhost:5175/**",
+  "http://localhost:4174/**",
+  "http://localhost:4175/**",
+  "https://tournament-operator.vercel.app",
+  "https://tournament-operator.vercel.app/**",
+  "https://tournament-umpire.vercel.app",
+  "https://tournament-umpire.vercel.app/**",
+  "tournament-operator://auth/callback",
+  "tournament-operator://auth/callback/**"
+]
+enable_signup = true
+
+[functions.command]
+# Auth JWT and court-station JWT are verified inside the function.
+verify_jwt = false
+
+[functions.pair-station]
+verify_jwt = false

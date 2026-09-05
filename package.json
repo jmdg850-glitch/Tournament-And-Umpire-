@@ -1,0 +1,60 @@
+{
+  "name": "tournament",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Tournament operator and umpire platform",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "npm run dev:operator",
+    "dev:operator": "npm run dev -w @tournament/operator",
+    "dev:umpire": "npm run dev -w @tournament/umpire",
+    "dev:api": "npm run start -w @tournament/api",
+    "build": "npm run build -w @tournament/operator && npm run build -w @tournament/umpire",
+    "build:desktop": "npm run build:desktop -w @tournament/operator",
+    "build:android": "npm run build:android -w @tournament/umpire",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm test -w @tournament/engine && npm test -w @tournament/contracts && npm test -w @tournament/api",
+    "typecheck": "node -e \"console.log('no TypeScript typecheck in this repo')\"",
+    "bundle:command": "node scripts/bundle-command.mjs",
+    "publish:desktop": "npm run publish:desktop -w @tournament/operator",
+    "legacy:dev": "vite",
+    "legacy:build": "vite build",
+    "legacy:test": "vitest run",
+    "legacy:lint": "eslint src"
+  },
+  "dependencies": {
+    "@capacitor/app": "^8.1.0",
+    "@capacitor/core": "^8.4.1",
+    "@fontsource-variable/inter": "^5.3.0",
+    "@radix-ui/react-dialog": "^1.1.23",
+    "@radix-ui/react-switch": "^1.3.7",
+    "@supabase/supabase-js": "^2.110.1",
+    "framer-motion": "^12.42.2",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "eslint": "^10.6.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.3",
+    "globals": "^17.7.0",
+    "vite": "^8.1.1",
+    "vitest": "^4.1.10"
+  },
+  "allowScripts": {
+    "electron@38.8.6": true,
+    "electron-winstaller@5.4.0": true
+  }
+}

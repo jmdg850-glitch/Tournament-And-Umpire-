@@ -1,0 +1,14 @@
+legacy
+node_modules
+apps/operator/dist
+apps/umpire/dist
+apps/operator/release
+apps/umpire/android
+**/.env
+**/.env.local
+**/*.jks
+**/*.keystore
+**/keystore.properties
+apps/umpire/android/keystores
+**/.deploy-chunks
+.git

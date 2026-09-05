@@ -1,0 +1,8 @@
+{
+  "appId": "app.tournament.umpire",
+  "appName": "Tournament Umpire",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  }
+}

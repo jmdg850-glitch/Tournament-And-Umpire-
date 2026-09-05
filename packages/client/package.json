@@ -1,0 +1,15 @@
+{
+  "name": "@tournament/client",
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "echo skip",
+    "lint": "node -e \"process.exit(0)\""
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.1"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "@tournament/umpire",
+  "private": true,
+  "version": "1.3.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5175",
+    "build": "vite build",
+    "preview": "vite preview --port 4175",
+    "lint": "node -e \"process.exit(0)\"",
+    "build:android": "cross-env CAPACITOR=1 vite build && npx cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.4.1",
+    "@capacitor/core": "^8.4.1",
+    "@tournament/client": "*",
+    "@tournament/contracts": "*",
+    "@tournament/engine": "*",
+    "@tournament/ui": "*",
+    "lucide-react": "^1.41.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.4.1",
+    "@vitejs/plugin-react": "^6.0.3",
+    "cross-env": "^7.0.3",
+    "eslint": "^10.6.0",
+    "vite": "^8.1.1"
+  }
+}

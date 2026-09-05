@@ -1,0 +1,34 @@
+import { createClient } from "npm:@supabase/supabase-js@2";
+import { handlePairStation } from "./stationAuth.js";
+
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+function json(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...cors, "Content-Type": "application/json" },
+  });
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  if (req.method !== "POST") return json({ ok: false, error: { code: "METHOD", message: "POST only" } }, 405);
+
+  try {
+    const url = Deno.env.get("SUPABASE_URL");
+    const service = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const admin = createClient(url, service, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    const body = await req.json();
+    const result = await handlePairStation({ admin, body });
+    return json(result);
+  } catch (err) {
+    const status = Number(err.status) || 500;
+    return json({ ok: false, error: { code: err.code || "INTERNAL", message: err.message } }, status);
+  }
+});
