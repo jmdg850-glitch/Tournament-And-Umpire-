@@ -54,15 +54,15 @@ cd apps/umpire/android
 .\gradlew.bat assembleRelease bundleRelease
 ```
 
-Release APK/AAB is **unsigned** until you create `apps/umpire/android/keystore.properties` from `keystore.properties.example` and a JKS that is **never committed**.
+Release signing requires `apps/umpire/android/keystore.properties` (from `keystore.properties.example`) and a JKS that is **never committed** — both now exist on disk as of this release; APK/AAB output is genuinely signed (verified via `apksigner verify --print-certs`). Do not regenerate or replace the existing keystore.
 
 ## Artifacts
 
 - Operator web: `apps/operator/dist/`
 - Umpire web: `apps/umpire/dist/`
-- Windows installer: `apps/operator/release/Tournament-Operator-Setup-1.0.0.exe`
+- Windows installer: `apps/operator/release/Tournament-Operator-Setup-<version>.exe` (filename tracks `apps/operator/package.json`'s current version, e.g. `1.1.0` — do not hardcode a version here, it will drift again)
 - Android debug: `apps/umpire/android/app/build/outputs/apk/debug/app-debug.apk`
-- Android release (after gradle): `apps/umpire/android/app/build/outputs/apk/release/`
+- Android release (signed): `apps/umpire/android/app/build/outputs/apk/release/app-release.apk`, `apps/umpire/android/app/build/outputs/bundle/release/app-release.aab`
 
 ## Dev seed (not production users)
 

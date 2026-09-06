@@ -1,0 +1,8 @@
+node_modules
+dist
+dist-slim
+release
+electron
+android
+.env*
+!.env.example

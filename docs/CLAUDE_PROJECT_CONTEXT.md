@@ -61,7 +61,7 @@ e:\.1
 │   └── ui/               Shared React UI components/styles
 ├── supabase/
 │   ├── config.toml       Points at project evuvgxruavnadpbiehgb ("Tournament App")
-│   ├── migrations/       CURRENT schema: 0001–0009
+│   ├── migrations/       CURRENT schema: 0001–0010
 │   ├── migrations-applied/  LEGACY (PickleLive) schema history, ~144 files — NOT applied to the current project
 │   ├── functions/        command (current), pair-station (current), submit-match / dupr-webhook-receiver /
 │   │                     link-dupr-account / _shared (LEGACY, DUPR/PickleLive-only)
@@ -94,7 +94,7 @@ e:\.1
 - Vite + React 19 SPA, also packaged as an Android app via Capacitor (`app.tournament.umpire`).
 - Dev: `npm run dev:umpire` → `http://localhost:5175` (strictPort). Preview: 4175.
 - Key source: `apps/umpire/src/App.jsx` (auth, match list, scoring UI for both human-umpire and court-station identities), `apps/umpire/src/CoinTossPanel.jsx`, `apps/umpire/src/PairingScanner.jsx`, `apps/umpire/src/stationSession.js` (localStorage-persisted court-station credentials).
-- Deployed to Vercel project `tournament-umpire`. Android signing keystore is **not currently present** (see Known Issues).
+- Deployed to Vercel project `tournament-umpire`. Android release signing is configured (`keystore.properties` + JKS present on disk, kept out of version control) and produces genuinely signed APK/AAB output — verified via `apksigner verify`.
 
 ## Root SPA (`src/`, `index.html`) — LEGACY PickleLive product
 - Old MixMatch/PickleLive/NextG single-page app. Full app in `src/App.jsx` (~194KB), `src/lib/{cloud.js,mixmatch.js,dupr.js,ratingEngine.js,tournament*.js}`.
@@ -223,7 +223,7 @@ Every score event has a client-generated UUID (`event_id`) and monotonic `seq`; 
 Project: **Tournament App** (`evuvgxruavnadpbiehgb`, `ap-southeast-1`). Confirmed live-linked via `supabase/config.toml` and `supabase/.temp/linked-project.json`.
 
 **⚠️ Two schemas exist on disk — only one is current:**
-- `supabase/migrations/0001–0009` — **current, active** schema (this section).
+- `supabase/migrations/0001–0010` — **current, active** schema (this section).
 - `supabase/migrations-applied/` (144 files, `01`–`144`) — **legacy PickleLive schema history** (players/accounts/events/clubs/matches/messages/posts/live_matches/friend_requests, DUPR integration, etc.). Not referenced by `config.toml`. Kept on disk for historical reference only. The base schema its earliest migration assumes (`01_mixmatch_core.sql`) is not itself defined anywhere in this folder — it predates this migration history (UNKNOWN origin, likely created via dashboard).
 
 ## Current schema — key tables (`supabase/migrations/0001_initial_schema.sql` unless noted)
@@ -261,7 +261,7 @@ Project: **Tournament App** (`evuvgxruavnadpbiehgb`, `ap-southeast-1`). Confirme
 
 ## RLS posture
 
-`supabase/migrations/0004_rls.sql`: RLS **enabled and forced** on all 19 domain tables, deny-by-default. `SELECT` policies gated by tournament membership. The only write grant to `anon`/`authenticated` on any table is `UPDATE (display_name, updated_at)` on `profiles`. All real writes happen through `apply_official_writes`, `EXECUTE` granted only to `service_role`/`postgres`/`supabase_admin`.
+`supabase/migrations/0004_rls.sql` (plus `0006_court_stations.sql`, which adds `court_devices`/`court_pairing_grants`): RLS **enabled and forced** on all 21 domain tables, deny-by-default. `SELECT` policies gated by tournament membership. The only write grant to `anon`/`authenticated` on any table is `UPDATE (display_name, updated_at)` on `profiles`. All real writes happen through `apply_official_writes`, `EXECUTE` granted only to `service_role`/`postgres`/`supabase_admin`. **Note**: `0004_rls.sql` never explicitly revoked the Supabase-default `UPDATE` grant on `profiles` before adding the narrow column grant (unlike every other table, which does both) — live-confirmed to have let `authenticated` users overwrite their own `profiles.created_at`. Fixed by `0010_profiles_update_grant_revoke.sql`, live-verified via `information_schema.column_privileges` and a real update-attempt test.
 
 ## Migration history (current schema)
 
@@ -276,8 +276,11 @@ Project: **Tournament App** (`evuvgxruavnadpbiehgb`, `ap-southeast-1`). Confirme
 | `0007_official_writes_present_columns.sql` | Bug fix: only write columns actually present in the payload (avoids NULL-overwriting defaults) |
 | `0008_realtime.sql` | Enables Realtime on `matches`/`score_events`/`match_results`/`court_assignments` |
 | `0009_desktop_updates_storage.sql` | Public storage bucket `desktop-updates` for Electron auto-update artifacts |
+| `0010_profiles_update_grant_revoke.sql` | Security fix: revokes the broad default `UPDATE` grant on `profiles` from `anon`/`authenticated` before re-asserting the intended `display_name`/`updated_at`-only column grant, matching the pattern every other table already used |
 
-**⚠️ Flag for follow-up**: `supabase/functions/{submit-match,dupr-webhook-receiver,link-dupr-account}` query tables (`matches.data` jsonb blob, `dupr_match_submissions`, `tournament_divisions`) that exist only in the **legacy** schema, not in `migrations/0001–0009`. These functions have no entry in `config.toml`. Whether they are dead code or intentionally still deployed against the legacy Supabase project is UNKNOWN — clarify with the user before touching or assuming either way.
+**Note on the live migration ledger**: the local `supabase/migrations/` files are squashed/renamed relative to the project's actual 13-entry Supabase migration history (`list_migrations` shows 14 now, including `0010`), which still uses the original timestamp-prefixed version identifiers. CLI tooling (`supabase db push`/`migration list`/`migration repair`) may not recognize these local filenames as already-applied — reconcile before relying on CLI-driven migration workflows for this project.
+
+**⚠️ Flag for follow-up**: `supabase/functions/{submit-match,dupr-webhook-receiver,link-dupr-account}` query tables (`matches.data` jsonb blob, `dupr_match_submissions`, `tournament_divisions`) that exist only in the **legacy** schema, not in `migrations/0001–0010`. These functions have no entry in `config.toml`. Whether they are dead code or intentionally still deployed against the legacy Supabase project is UNKNOWN — clarify with the user before touching or assuming either way.
 
 ---
 
@@ -311,11 +314,13 @@ What exists instead is **optimistic-UI-with-rollback**, which is a weaker guaran
 
 # Deployment Architecture
 
-- **Vercel**: two independent projects — `tournament-operator` and `tournament-umpire` — each built from the monorepo root via `-w @tournament/<app>`. **Four Vercel config files exist** (`vercel.operator.json`, `vercel.umpire.json` at root; `apps/operator/vercel.json`, `apps/umpire/vercel.json` per-app) representing two alternate strategies for the same two deployments depending on which directory Vercel's project root is set to. This is redundant but not necessarily broken — do not consolidate without checking which strategy each live Vercel project is actually configured to use.
-- **Electron (Windows, operator)**: `npm run build:desktop -w @tournament/operator` → electron-builder + NSIS installer (`apps/operator/build/installer.nsh` also writes a desktop shortcut). Auto-update reads from the public Supabase Storage bucket `desktop-updates` (`supabase/migrations/0009_desktop_updates_storage.sql`, uploaded via `scripts/publish-desktop-update.mjs`).
-- **Capacitor (Android, umpire)**: `npm run build:android -w @tournament/umpire` then Gradle (`apps/umpire/android`). Requires JDK 17/21 (not 25). Release signing requires `apps/umpire/android/keystore.properties` (copied from `.example`) pointing at a JKS that must never be committed — **not currently present**, so no signed release APK/AAB exists yet.
-- **No CI/CD** — no `.github/workflows` or other CI config found anywhere. Release verification is entirely manual, tracked in `docs/PUBLIC_RELEASE_AUDIT.md` and `docs/FINAL_PUBLIC_RELEASE_REPORT.md`.
-- Per the most recent manual release report (dated 2026-08-29): overall status was "🟡 CONDITIONAL — OWNER ACTION REQUIRED" pending: hosted Supabase Auth Site URL (still localhost), enabling email confirmation, Android signing keystore, and a physical-device umpire scoring test. **This may have changed since 2026-08-29 — re-verify before relying on it for any auth/deployment-related task.**
+- **Vercel**: two independent projects — `tournament-operator` and `tournament-umpire` — each linked per-app (`apps/operator/.vercel/project.json`, `apps/umpire/.vercel/project.json`) and deployed via `vercel --prod` from inside each app directory, which uses that app's own `vercel.json`. **Four Vercel config files still exist** (`vercel.operator.json`, `vercel.umpire.json` at root; `apps/operator/vercel.json`, `apps/umpire/vercel.json` per-app) — redundant but not broken; the per-app link/deploy path above is the one actually used. Both `installCommand`s now include `--ignore-scripts` as a supply-chain hardening measure for the Vercel build environment.
+- Both production URLs (`tournament-operator.vercel.app`, `tournament-umpire.vercel.app`) are confirmed, as of this release-hardening pass, to be serving the current repo's build (verified by exact bundle content-hash match against a local build, plus a passing live API test suite against the same backend both apps call).
+- **Electron (Windows, operator)**: `npm run build:desktop -w @tournament/operator` → electron-builder + NSIS installer (`apps/operator/build/installer.nsh` also writes a desktop shortcut). Auto-update reads from the public Supabase Storage bucket `desktop-updates` (`supabase/migrations/0009_desktop_updates_storage.sql`, uploaded via `scripts/publish-desktop-update.mjs`) — confirmed this is a real, live-reachable feed, not a placeholder. The installer itself is confirmed **unsigned** (`Get-AuthenticodeSignature` → `NotSigned`); no certificate is configured anywhere in the builder config.
+- **Capacitor (Android, umpire)**: `npm run build:android -w @tournament/umpire` then Gradle (`apps/umpire/android`). Requires JDK 17/21 (not 25). Release signing **is configured** — `apps/umpire/android/keystore.properties` and the JKS both exist on disk (kept out of version control) — and produces a genuinely signed `app-release.apk`/`app-release.aab`, confirmed via `apksigner verify --print-certs`. Physical on-device testing remains unverified (no device available in this environment).
+- **No CI/CD** — no `.github/workflows` or other CI config found anywhere. Release verification is entirely manual, tracked in `docs/PUBLIC_RELEASE_AUDIT.md`, `docs/FINAL_PUBLIC_RELEASE_REPORT.md`, and (as of this pass) a full FINAL RELEASE READINESS AUDIT plus a POST-AUDIT RELEASE HARDENING pass captured in project history/commit messages rather than a separate report file.
+- Per the most recent manual release report (dated 2026-08-29): hosted Supabase Auth Site URL and email confirmation were owner-action items pending against the live Supabase dashboard. **These are dashboard-only settings not visible from source — re-verify directly against the dashboard before relying on them**; nothing in this repo's code can confirm or deny their current state.
+- **Version control**: this repository now has a real git history (previously had none — `git init` plus an initial commit was part of this hardening pass). Package versions diverge across workspaces (root `1.0.0`, operator `1.1.0`, umpire `1.3.0`); rather than inventing one misleading top-level version, the initial commit is tagged both `operator-v1.1.0` and `umpire-v1.3.0`.
 
 ---
 
@@ -376,7 +381,7 @@ See **Database Architecture** above for the full table list. The tables most rel
 
 # Important Migrations
 
-`supabase/migrations/0001` through `0009` (current schema — see table under Database Architecture for what each does). Migrations are additive/append-only; `0005` and `0007` are bug-fix follow-ups to `0002` and `0003`/`0006` respectively, not reverts.
+`supabase/migrations/0001` through `0010` (current schema — see table under Database Architecture for what each does). Migrations are additive/append-only; `0005` and `0007` are bug-fix follow-ups to `0002` and `0003`/`0006` respectively, not reverts.
 
 **Do not confuse these with `supabase/migrations-applied/` (144 files) — that is the unrelated legacy PickleLive schema history and is not applied to the current project.**
 
@@ -413,11 +418,15 @@ See **Database Architecture** above for the full table list. The tables most rel
 - **No player-facing app** — only operator and umpire apps exist.
 - **`npm run lint` and `npm run typecheck` are non-functional stubs** for the current product — no real static analysis coverage exists.
 - **No CI/CD** — all release verification is manual and tracked in dated markdown reports.
-- **Android release is unsigned** — no keystore present.
+- **Windows installer is unsigned** — no code-signing certificate configured (`apps/operator/package.json`'s builder config has no `certificateFile`/`cscLink`); confirmed via `Get-AuthenticodeSignature` returning `NotSigned` on a freshly-built installer. SmartScreen will warn on install. Owner action required to obtain and wire a certificate, or accept unsigned distribution.
+- **Windows/Electron runtime could not be conclusively verified in this repo's automation environment** — the packaged app launches and stays responsive but does not produce a visible window here; ruled out a crash (no logged Application Error event) and ruled out a missing display (other GUI apps show real windows on the same desktop). Most consistent with a known class of Electron/Chromium GPU-compositor initialization issue in constrained/virtualized rendering environments, not an app code defect (standard `BrowserWindow`/`app.whenReady()` pattern, no `show:false` gate). Verify on an ordinary physical Windows desktop before relying on this build.
+- Android release signing **is** configured and produces genuinely signed APK/AAB output (see Deployment Architecture) — physical on-device testing remains **NOT VERIFIED** (no device available in this environment); this is a distinct, still-open owner/device gate.
 - **Four redundant/overlapping Vercel config files** for two deployments.
 - **Three Supabase Edge Functions (`submit-match`, `dupr-webhook-receiver`, `link-dupr-account`) reference tables that don't exist in the current schema** — status (dead code vs. deployed against the legacy project) is UNKNOWN; clarify before touching.
 - **`profiles.platform_role` admin tier is dormant** — protected at the DB level but never set or checked by any command/UI.
-- Per the last manual release audit (2026-08-29): hosted Supabase Auth Site URL still pointed at `localhost`, email confirmation was off, and a physical Android device scoring test was still pending. **Re-verify current state before assuming this is still true.**
+- **`supabase/config.toml` sets `verify_jwt = false`** for the `command`/`pair-station` Edge Functions (verification happens inside the function code instead, documented inline) — this contradicts other docs in this repo claiming `verify_jwt = true`; the local file and the live dashboard function setting may have diverged (the local config does not push to the hosted dashboard). Reconcile directly against the live Supabase function settings before trusting either claim.
+- Per the last manual release audit (2026-08-29): hosted Supabase Auth Site URL still pointed at `localhost`, email confirmation was off. **Re-verify current state against the live Supabase dashboard before assuming this is still true** — it is a dashboard-only setting not visible from source.
+- As of this release-hardening pass: both `tournament-operator.vercel.app` and `tournament-umpire.vercel.app` are confirmed serving the current audited build (bundle content hash matches the local build exactly), git version control now exists (see below), and the `profiles` RLS gap above this list has been fixed and live-verified.
 
 ---
 
@@ -427,7 +436,7 @@ Classification scheme: **A. ACTIVE, B. PROBABLY ACTIVE, C. LEGACY, D. DUPLICATE,
 
 | Item | Classification | Evidence |
 |---|---|---|
-| `apps/operator`, `apps/umpire`, `packages/{engine,contracts,api,client,ui}`, `supabase/migrations/0001-0009`, `supabase/functions/{command,pair-station}` | **A. ACTIVE** | Current product, current schema, referenced by `config.toml`, tests passing |
+| `apps/operator`, `apps/umpire`, `packages/{engine,contracts,api,client,ui}`, `supabase/migrations/0001-0010`, `supabase/functions/{command,pair-station}` | **A. ACTIVE** | Current product, current schema, referenced by `config.toml`, tests passing |
 | `packages/engine/src/{doubleElimination,roundRobin,poolPlay,standings,seeding}.js` | **B. PROBABLY ACTIVE (dormant)** | Real, tested code; not legacy; simply unreachable from any command/UI today |
 | Root `src/`, `index.html`, root `vite.config.js`, root `dist/`, `supabase/migrations-applied/`, `supabase/functions/{submit-match,dupr-webhook-receiver,link-dupr-account,_shared}` | **C. LEGACY** | `legacy/README.md` explicit warning; distinct Supabase project (`qfyfomiqxouqftrgganh`); schema mismatch against current `migrations/` |
 | `vercel.operator.json`, `vercel.umpire.json`, `apps/operator/vercel.json`, `apps/umpire/vercel.json` | **D. DUPLICATE** | Two alternate strategies (root-relative vs. per-app-relative `outputDirectory`/build command) for the same two Vercel deployments |
