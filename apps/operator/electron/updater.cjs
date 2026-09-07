@@ -5,7 +5,7 @@ const {
 } = require("electron-updater");
 const { app } = require("electron");
 const {
-  genericPublishConfig,
+  githubPublishConfig,
   shouldCheckForUpdates,
   isUnsafeToAutoRestart,
   shouldInstallNow,
@@ -139,7 +139,7 @@ function createDesktopUpdater({
     };
 
     try {
-      autoUpdater.setFeedURL(genericPublishConfig());
+      autoUpdater.setFeedURL(githubPublishConfig());
     } catch (err) {
       console.warn("[updater] feed URL not applied; using packaged app-update.yml if present");
     }

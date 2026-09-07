@@ -6,14 +6,15 @@ import PairingScanner from "./PairingScanner.jsx";
 import CoinTossPanel from "./CoinTossPanel.jsx";
 import {
   Alert,
+  Badge,
   Button,
   Card,
+  ClickableCard,
   ConfirmDialog,
   EmptyState,
   Input,
   LoadingState,
   Scoreboard,
-  ServeIndicator,
   StatusBadge,
 } from "@tournament/ui";
 import { ArrowLeft, LogOut, QrCode, RefreshCw } from "lucide-react";
@@ -387,23 +388,34 @@ function MyMatches({ supabase, session, onOpen, onSignOut }) {
   );
 }
 
+const STAGE_LABEL = {
+  round_robin: "Qualification",
+  semifinal: "Semifinal",
+  bronze: "Bronze",
+  final: "Final",
+  knockout: "Playoffs",
+};
+function stageTitle(label) {
+  return STAGE_LABEL[label] || String(label || "").replaceAll("_", " ");
+}
+
 function MatchGroup({ title, rows, onOpen, nameFor }) {
   if (!rows.length) return null;
   return (
     <section>
       <div className="section-label">{title}</div>
       {rows.map((m) => (
-        <button key={m.id} type="button" className="ump-card" data-live={m.status === "in_progress" ? "true" : undefined} onClick={() => onOpen(m.id)}>
+        <ClickableCard key={m.id} className="ump-card" live={m.status === "in_progress"} onClick={() => onOpen(m.id)}>
           <div className="row" style={{ justifyContent: "space-between" }}>
             <strong>{m.courtName || "No court"}</strong>
-            <StatusBadge status={m.status} />
+            {m.status === "in_progress" ? <Badge tone="live">● LIVE</Badge> : <StatusBadge status={m.status} />}
           </div>
           <div className="ump-name">{nameFor(m.id, "A")} vs {nameFor(m.id, "B")}</div>
           <div className="muted" style={{ color: "var(--muted-court)" }}>
             {m.score_state?.scoreA != null ? `${m.score_state.scoreA}–${m.score_state.scoreB}` : "No score yet"}
-            {m.stage_label ? ` · ${m.stage_label.replaceAll("_", " ")}` : ` · Round ${m.round}`}
+            {m.stage_label ? ` · ${stageTitle(m.stage_label)}` : ` · Round ${m.round}`}
           </div>
-        </button>
+        </ClickableCard>
       ))}
     </section>
   );
@@ -723,7 +735,7 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   const winnerName = match.winner === "A" ? nameA : match.winner === "B" ? nameB : null;
   const gamesA = score.gamesWonA ?? score.gamesA ?? (match.winner === "A" ? 1 : 0);
   const gamesB = score.gamesWonB ?? score.gamesB ?? (match.winner === "B" ? 1 : 0);
-  const canStart = match.status === "assigned" || match.status === "ready";
+  const canStart = (match.status === "assigned" || match.status === "ready") && isCoinTossCommitted(match);
   const scoring = match.status === "in_progress";
   const readyToComplete = match.status === "in_progress" && score.status === "completed";
   const completed = match.status === "completed";
@@ -758,10 +770,12 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         />
         {score.servingTeam && (
           <p className="ump-serve">
-            {score.servingTeam === "A" ? nameA : nameB} serves
+            <strong>{score.servingTeam === "A" ? nameA : nameB}</strong> to serve
+            {(Number(score.server) === 1 || Number(score.server) === 2) && (
+              <span className="ump-serve-num"> — {Number(score.server) === 1 ? "1st serve" : "2nd serve"}</span>
+            )}
           </p>
         )}
-        <ServeIndicator state={score} />
       </div>
 
       <div className="ump-actions">
@@ -808,14 +822,14 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         {scoring && !readyToComplete && (
           <>
             <div className="pads">
-              <Button className="point a" aria-label={`Point ${nameA}`} onClick={() => sendScore("point", { team: "A" })}>
+              <Button className="point a" disabled={pending > 0} aria-label={`Point ${nameA}`} onClick={() => sendScore("point", { team: "A" })}>
                 Point {nameA}
               </Button>
-              <Button className="point b" aria-label={`Point ${nameB}`} onClick={() => sendScore("point", { team: "B" })}>
+              <Button className="point b" disabled={pending > 0} aria-label={`Point ${nameB}`} onClick={() => sendScore("point", { team: "B" })}>
                 Point {nameB}
               </Button>
             </div>
-            <Button variant="secondary" disabled={busy} onClick={() => setConfirmUndo(true)}>
+            <Button variant="secondary" disabled={busy || pending > 0} onClick={() => setConfirmUndo(true)}>
               Undo last point
             </Button>
           </>

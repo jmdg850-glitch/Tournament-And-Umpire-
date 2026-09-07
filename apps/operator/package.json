@@ -1,7 +1,7 @@
 {
   "name": "@tournament/operator",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "Tournament operator desktop application",
   "author": "Tournament",
@@ -14,7 +14,9 @@
     "build:desktop": "cross-env VITE_ELECTRON=1 vite build && electron-builder --win nsis --publish never",
     "pack:desktop": "cross-env VITE_ELECTRON=1 vite build && electron-builder --win dir --publish never",
     "publish:desktop": "node ../../scripts/publish-desktop-update.mjs",
-    "test": "node --test electron/updatePolicy.test.cjs"
+    "publish:desktop:check": "node ../../scripts/publish-desktop-update.mjs --check",
+    "release:win": "npm run build:desktop && npm run publish:desktop",
+    "test": "node --test electron/updatePolicy.test.cjs src/excelImportExport.test.js"
   },
   "dependencies": {
     "@tournament/client": "*",
@@ -23,7 +25,8 @@
     "electron-updater": "^6.6.2",
     "lucide-react": "^1.41.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^6.0.3",
@@ -54,9 +57,10 @@
     ],
     "icon": "build/icon.ico",
     "publish": {
-      "provider": "generic",
-      "url": "https://evuvgxruavnadpbiehgb.supabase.co/storage/v1/object/public/desktop-updates/operator/win",
-      "useMultipleRangeRequest": false
+      "provider": "github",
+      "owner": "jmdg840",
+      "repo": "tournament-operator-updates",
+      "releaseType": "release"
     },
     "protocols": [
       {

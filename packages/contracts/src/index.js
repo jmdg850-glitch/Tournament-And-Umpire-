@@ -5,6 +5,8 @@ export const COMMAND_TYPES = Object.freeze([
   "create_division",
   "update_division",
   "add_person",
+  "update_person",
+  "remove_person",
   "create_team",
   "add_team_member",
   "remove_team_member",

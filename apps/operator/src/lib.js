@@ -1,3 +1,5 @@
+import { rankIndividualPairsForSemifinals } from "@tournament/engine";
+
 export const TOURNAMENT_FLOW = [
   "draft",
   "registration",
@@ -176,6 +178,81 @@ export function assignedPersonIdsInDivision(data, divisionId, {
 
 export function personLabel(personId, persons = []) {
   return persons.find((p) => p.id === personId)?.display_name || personId;
+}
+
+// Round-robin qualification standings for a team_elimination division — the single
+// source of truth reused by the Brackets tab, the Results tab, and the Excel export
+// (packages/engine's rankIndividualPairsForSemifinals does the actual ranking; this
+// just reshapes this app's persisted rows into what that function expects).
+export function teamEliminationStandings(division, data) {
+  const teams = (data.teams || [])
+    .filter((t) => t.division_id === division.id)
+    .map((t) => ({
+      teamId: t.id,
+      teamName: t.name,
+      pairs: (data.participants || []).filter((p) => p.team_id === t.id).map((p) => ({ id: p.id })),
+    }));
+  const parents = (data.matches || []).filter((m) => m.division_id === division.id && !m.parent_match_id);
+  const teamMatchups = parents.map((m) => ({
+    id: m.id,
+    stage: m.stage_label === "round_robin" || m.bracket_side === "round_robin" ? "round_robin" : m.stage_label,
+    status: m.status,
+  }));
+  const pairMatches = (data.matches || [])
+    .filter((m) => m.division_id === division.id && m.parent_match_id)
+    .map((m) => {
+      const a = (data.matchParticipants || []).find((p) => p.match_id === m.id && p.slot === "A");
+      const b = (data.matchParticipants || []).find((p) => p.match_id === m.id && p.slot === "B");
+      const result = resultFor(m, data.results);
+      return {
+        id: m.id,
+        teamMatchupId: m.parent_match_id,
+        status: m.status,
+        winner: m.winner,
+        registrationAId: a?.participant_id,
+        registrationBId: b?.participant_id,
+        score: {
+          scoreA: result?.score_a ?? m.score_state?.scoreA ?? 0,
+          scoreB: result?.score_b ?? m.score_state?.scoreB ?? 0,
+        },
+      };
+    });
+  try {
+    return rankIndividualPairsForSemifinals(teams, teamMatchups, pairMatches);
+  } catch {
+    return [];
+  }
+}
+
+export function finalMatchOf(division, matches) {
+  const inDivision = matches.filter((m) => m.division_id === division.id && !m.parent_match_id);
+  if (!inDivision.length) return null;
+  if (division.format === "team_elimination") {
+    return inDivision.find((m) => m.stage_label === "final") || null;
+  }
+  return inDivision.find((m) => !m.next_match_id) || null;
+}
+
+export function bronzeMatchOf(division, matches) {
+  return matches.find((m) => m.division_id === division.id && m.stage_label === "bronze") || null;
+}
+
+// Champion/runner-up/third place for a division, derived purely from persisted match
+// winners — never a computed ranking. Shared by the Results tab and the Excel export.
+export function placementsForDivision(division, data) {
+  const final = finalMatchOf(division, data.matches);
+  const bronze = bronzeMatchOf(division, data.matches);
+  const placements = { champion: "", runnerUp: "", third: "" };
+  if (final && final.status === "completed" && final.winner) {
+    const winner = sideOf(final.id, final.winner, data);
+    const loser = sideOf(final.id, final.winner === "A" ? "B" : "A", data);
+    placements.champion = winner.name;
+    placements.runnerUp = loser.name;
+  }
+  if (bronze && bronze.status === "completed" && bronze.winner) {
+    placements.third = sideOf(bronze.id, bronze.winner, data).name;
+  }
+  return placements;
 }
 
 export function pairingQrText(payload) {

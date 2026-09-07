@@ -698,6 +698,43 @@ async function handleAddPerson(admin, actor, payload, envelope) {
   });
 }
 
+async function handleUpdatePerson(admin, actor, payload, envelope) {
+  if (!isUuid(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
+  const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
+  if (!person) throw httpError(404, "NOT_FOUND", "Person not found");
+  const member = await loadMember(admin, person.tournament_id, actor.id);
+  requireOrganizer(member);
+  const display_name = String(payload.display_name || "").trim();
+  if (!display_name) throw httpError(400, "INVALID_COMMAND", "display_name is required");
+  const next = { ...person, display_name };
+  const batch = createBatch();
+  batch.upsert("persons", next);
+  return commit(admin, batch, {
+    ...envelope,
+    actorId: actor.id,
+    tournamentId: person.tournament_id,
+    result: { person: next },
+  });
+}
+
+async function handleRemovePerson(admin, actor, payload, envelope) {
+  if (!isUuid(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
+  const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
+  if (!person) throw httpError(404, "NOT_FOUND", "Person not found");
+  const member = await loadMember(admin, person.tournament_id, actor.id);
+  requireOrganizer(member);
+  const { data: used } = await admin.from("participant_members").select("id").eq("person_id", person.id).limit(1);
+  if (used?.length) throw httpError(409, "PERSON_IN_USE", "Cannot remove a player who is already registered into a division");
+  const batch = createBatch();
+  batch.delete("persons", person.id);
+  return commit(admin, batch, {
+    ...envelope,
+    actorId: actor.id,
+    tournamentId: person.tournament_id,
+    result: { person_id: person.id, removed: true },
+  });
+}
+
 async function handleCreateTeam(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
@@ -1328,6 +1365,7 @@ async function handleCoinToss(admin, actor, payload, envelope) {
     result: payload.result,
     winner: payload.winner,
     servingTeam: payload.serving_team,
+    courtSide: payload.court_side,
   }, match.serving_team);
   if (!payload.result && !payload.winner && !payload.serving_team) {
     throw httpError(400, "INVALID_COMMAND", "coin toss result is required");
@@ -1590,6 +1628,8 @@ const HANDLERS = {
   create_division: handleCreateDivision,
   update_division: handleUpdateDivision,
   add_person: handleAddPerson,
+  update_person: handleUpdatePerson,
+  remove_person: handleRemovePerson,
   create_team: handleCreateTeam,
   add_team_member: handleAddTeamMember,
   remove_team_member: handleRemoveTeamMember,

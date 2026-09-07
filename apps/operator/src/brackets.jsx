@@ -1,6 +1,5 @@
-import { rankIndividualPairsForSemifinals } from "@tournament/engine";
-import { Badge, Card, EmptyState, StatusBadge, Table } from "@tournament/ui";
-import { courtFor, isTeamMatchup, resultFor, scoreLine, sideOf, stageTitle, umpireFor } from "./lib.js";
+import { Badge, Card, EmptyState, StandingsTable, StatusBadge } from "@tournament/ui";
+import { courtFor, isTeamMatchup, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor } from "./lib.js";
 
 function MatchChip({ match, data }) {
   const a = sideOf(match.id, "A", data);
@@ -41,46 +40,6 @@ function RoundColumn({ title, matches, data }) {
   );
 }
 
-function teStandings(division, data) {
-  const teams = data.teams
-    .filter((t) => t.division_id === division.id)
-    .map((t) => ({
-      teamId: t.id,
-      teamName: t.name,
-      pairs: data.participants.filter((p) => p.team_id === t.id).map((p) => ({ id: p.id })),
-    }));
-  const parents = data.matches.filter((m) => m.division_id === division.id && !m.parent_match_id);
-  const teamMatchups = parents.map((m) => ({
-    id: m.id,
-    stage: m.stage_label === "round_robin" || m.bracket_side === "round_robin" ? "round_robin" : m.stage_label,
-    status: m.status,
-  }));
-  const pairMatches = data.matches
-    .filter((m) => m.division_id === division.id && m.parent_match_id)
-    .map((m) => {
-      const a = data.matchParticipants.find((p) => p.match_id === m.id && p.slot === "A");
-      const b = data.matchParticipants.find((p) => p.match_id === m.id && p.slot === "B");
-      const result = resultFor(m, data.results);
-      return {
-        id: m.id,
-        teamMatchupId: m.parent_match_id,
-        status: m.status,
-        winner: m.winner,
-        registrationAId: a?.participant_id,
-        registrationBId: b?.participant_id,
-        score: {
-          scoreA: result?.score_a ?? m.score_state?.scoreA ?? 0,
-          scoreB: result?.score_b ?? m.score_state?.scoreB ?? 0,
-        },
-      };
-    });
-  try {
-    return rankIndividualPairsForSemifinals(teams, teamMatchups, pairMatches);
-  } catch {
-    return [];
-  }
-}
-
 function TeamEliminationBoard({ division, data }) {
   const parents = data.matches.filter((m) => m.division_id === division.id && isTeamMatchup(m));
   const qualParents = parents.filter((m) => m.stage_label === "round_robin" || m.bracket_side === "round_robin");
@@ -88,7 +47,7 @@ function TeamEliminationBoard({ division, data }) {
   const bronze = parents.filter((m) => m.stage_label === "bronze");
   const finals = parents.filter((m) => m.stage_label === "final");
   const kidsOf = (list) => data.matches.filter((m) => list.some((p) => p.id === m.parent_match_id));
-  const standings = teStandings(division, data);
+  const standings = teamEliminationStandings(division, data);
   const playoffsExist = semis.length + bronze.length + finals.length > 0;
   const qualified = playoffsExist ? standings.slice(0, 4) : [];
 
@@ -115,32 +74,32 @@ function TeamEliminationBoard({ division, data }) {
       )}
 
       {standings.length > 0 && (
-        <Table
-          columns={[
-            { key: "rank", header: "Rank" },
-            {
-              key: "pair",
-              header: "Pair",
-              render: (row) => data.participants.find((p) => p.id === row.registrationId)?.display_name || row.registrationId,
-            },
-            { key: "teamName", header: "Team" },
-            { key: "wins", header: "W" },
-            { key: "losses", header: "L" },
-            { key: "pointDiff", header: "+/−" },
-          ]}
-          rows={standings.map((row) => ({ id: row.registrationId, ...row }))}
+        <StandingsTable
+          rows={standings.map((row) => ({
+            id: row.registrationId,
+            rank: row.rank,
+            name: data.participants.find((p) => p.id === row.registrationId)?.display_name || row.registrationId,
+            team: row.teamName,
+            wins: row.wins,
+            losses: row.losses,
+            pointDiff: row.pointDiff,
+          }))}
         />
       )}
 
       {qualified.length > 0 && (
         <div>
-          <h3>Qualified</h3>
-          <ol>
+          <h3>Qualified for playoffs</h3>
+          <div className="row">
             {qualified.map((row) => {
               const part = data.participants.find((p) => p.id === row.registrationId);
-              return <li key={row.registrationId}>{part?.display_name || row.registrationId} · {row.teamName}</li>;
+              return (
+                <Badge key={row.registrationId} tone={row.rank <= 3 ? `rank-${row.rank}` : "ok"}>
+                  #{row.rank} {part?.display_name || row.registrationId} · {row.teamName}
+                </Badge>
+              );
             })}
-          </ol>
+          </div>
         </div>
       )}
 

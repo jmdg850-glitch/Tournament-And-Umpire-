@@ -98,7 +98,7 @@ export function Input({ label, id, hint, error, ...props }) {
   );
 }
 
-export function Select({ label, id, hideLabel, children, ...props }) {
+export function Select({ label, id, hideLabel, hint, children, ...props }) {
   const autoId = useId();
   const inputId = id || autoId;
   return (
@@ -107,6 +107,7 @@ export function Select({ label, id, hideLabel, children, ...props }) {
       <select id={inputId} {...props}>
         {children}
       </select>
+      {hint ? <span className="hint">{hint}</span> : null}
     </label>
   );
 }
@@ -156,10 +157,10 @@ export function Tabs({ tabs, value, onChange }) {
   );
 }
 
-export function Table({ columns, rows, empty, rowProps }) {
+export function Table({ columns, rows, empty, rowProps, responsive }) {
   if (!rows?.length) return empty || null;
   return (
-    <div className="table-wrap">
+    <div className="table-wrap" data-responsive-cards={responsive ? "true" : undefined}>
       <table className="table">
         <thead>
           <tr>
@@ -172,12 +173,72 @@ export function Table({ columns, rows, empty, rowProps }) {
           {rows.map((row, i) => (
             <tr key={row.id || i} {...(rowProps ? rowProps(row) : {})}>
               {columns.map((c) => (
-                <td key={c.key}>{c.render ? c.render(row) : row[c.key]}</td>
+                <td key={c.key} data-label={typeof c.header === "string" ? c.header : undefined}>
+                  {c.render ? c.render(row) : row[c.key]}
+                </td>
               ))}
             </tr>
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+const RANK_MEDAL = { 1: "🥇", 2: "🥈", 3: "🥉" };
+
+/** Leaderboard-style table for standings. `rows` need: rank, name, plus any of team/wins/losses/pointDiff/winPct/extra. */
+export function StandingsTable({ rows, extraColumns = [] }) {
+  if (!rows?.length) return null;
+  const hasTeam = rows.some((r) => r.team);
+  return (
+    <Table
+      responsive
+      columns={[
+        {
+          key: "rank",
+          header: "Rank",
+          render: (r) => (
+            <span className="rank-cell">
+              {RANK_MEDAL[r.rank] ? <span className="rank-medal" aria-hidden="true">{RANK_MEDAL[r.rank]}</span> : null}
+              {r.rank}
+            </span>
+          ),
+        },
+        { key: "name", header: hasTeam ? "Pair / Player" : "Player" },
+        ...(hasTeam ? [{ key: "team", header: "Team" }] : []),
+        { key: "wins", header: "W" },
+        { key: "losses", header: "L" },
+        { key: "pointDiff", header: "+/-", render: (r) => (r.pointDiff > 0 ? `+${r.pointDiff}` : r.pointDiff) },
+        ...extraColumns,
+      ]}
+      rows={rows.map((r) => ({ id: r.id ?? r.rank, ...r }))}
+      rowProps={(r) => ({ "data-rank": r.rank <= 3 ? String(r.rank) : undefined })}
+    />
+  );
+}
+
+/** An interactive Card — a whole panel that acts as a button (e.g. a tappable match-list item). */
+export function ClickableCard({ children, className = "", live, ...props }) {
+  return (
+    <Card as="button" type="button" className={`card-clickable ${className}`.trim()} data-live={live ? "true" : undefined} {...props}>
+      {children}
+    </Card>
+  );
+}
+
+/** "What should I do next" setup progress guide. items: [{ id, label, done, action? }] */
+export function SetupChecklist({ items }) {
+  const firstPendingIndex = items.findIndex((i) => !i.done);
+  return (
+    <div className="checklist">
+      {items.map((item, i) => (
+        <div key={item.id} className="checklist-item" data-done={item.done} data-next={i === firstPendingIndex}>
+          <span className="mark" aria-hidden="true">{item.done ? "✓" : ""}</span>
+          <span className="label">{item.label}</span>
+          {!item.done && item.action ? <span className="go">{item.action}</span> : null}
+        </div>
+      ))}
     </div>
   );
 }
@@ -282,7 +343,7 @@ const ToastCtx = createContext(() => {});
 
 export function ToastProvider({ children }) {
   const [toasts, setToasts] = useState([]);
-  const push = useCallback((message, tone = "info") => {
+  const push = useCallback((message, tone = "ok") => {
     const id = crypto.randomUUID();
     setToasts((list) => [...list, { id, message, tone }]);
     window.setTimeout(() => setToasts((list) => list.filter((t) => t.id !== id)), 4200);
@@ -292,7 +353,7 @@ export function ToastProvider({ children }) {
       {children}
       <div className="toast-stack" aria-live="polite">
         {toasts.map((t) => (
-          <div key={t.id} className="toast">{t.message}</div>
+          <div key={t.id} className={`toast ${t.tone}`.trim()}>{t.message}</div>
         ))}
       </div>
     </ToastCtx.Provider>
@@ -301,4 +362,57 @@ export function ToastProvider({ children }) {
 
 export function useToast() {
   return useContext(ToastCtx);
+}
+
+/**
+ * Shared app shell: a sidebar rail (brand + optional context block + grouped nav + footer)
+ * beside a main content area. Replaces per-app hand-rolled shells so both apps share one
+ * accessible, consistent layout.
+ */
+export function PageShell({ brand, context, nav, navLabel = "Sections", foot, children, overlay }) {
+  return (
+    <div className="shell">
+      <aside className="shell-rail">
+        {brand ? <div className="shell-brand">{brand}</div> : null}
+        {context ? <div className="shell-context">{context}</div> : null}
+        <nav className="shell-nav" aria-label={navLabel}>{nav}</nav>
+        {foot ? <div className="shell-foot">{foot}</div> : null}
+      </aside>
+      <main className="shell-main">{children}</main>
+      {overlay}
+    </div>
+  );
+}
+
+/**
+ * A labeled group of NavItems inside PageShell's nav. Each item navigates to a
+ * genuinely different screen, so this uses plain nav/button semantics with
+ * aria-current — not a WAI-ARIA tab widget (which would require roving-tabindex
+ * arrow-key navigation to be a correct implementation, not just the tab/tablist
+ * roles). Native Tab/Enter/Space already fully covers keyboard use here.
+ */
+export function NavGroup({ label, children }) {
+  return (
+    <div className="shell-nav-group">
+      {label ? <div className="shell-nav-group-label">{label}</div> : null}
+      {children}
+    </div>
+  );
+}
+
+/** One entry in a PageShell nav — an icon, a label, an optional live/plain count badge. */
+export function NavItem({ icon: Icon, label, active, live, count, ...props }) {
+  return (
+    <button
+      type="button"
+      aria-current={active ? "page" : undefined}
+      data-live={live ? "true" : undefined}
+      className="shell-nav-item"
+      {...props}
+    >
+      {Icon ? <Icon size={16} aria-hidden="true" /> : null}
+      <span>{label}</span>
+      {count != null ? <span className="count">{count}</span> : null}
+    </button>
+  );
 }

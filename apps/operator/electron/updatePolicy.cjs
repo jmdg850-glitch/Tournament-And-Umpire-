@@ -1,18 +1,13 @@
 "use strict";
 
-const DEFAULT_UPDATE_URL =
-  "https://evuvgxruavnadpbiehgb.supabase.co/storage/v1/object/public/desktop-updates/operator/win";
+const GITHUB_UPDATE_OWNER = "jmdg840";
+const GITHUB_UPDATE_REPO = "tournament-operator-updates";
 
-function updateFeedUrl() {
-  const fromEnv = String(process.env.ELECTRON_UPDATE_URL || "").trim().replace(/\/+$/, "");
-  return fromEnv || DEFAULT_UPDATE_URL;
-}
-
-function genericPublishConfig() {
+function githubPublishConfig() {
   return {
-    provider: "generic",
-    url: updateFeedUrl(),
-    useMultipleRangeRequest: false,
+    provider: "github",
+    owner: GITHUB_UPDATE_OWNER,
+    repo: GITHUB_UPDATE_REPO,
   };
 }
 
@@ -51,9 +46,9 @@ function initialUpdaterState(version) {
 }
 
 module.exports = {
-  DEFAULT_UPDATE_URL,
-  updateFeedUrl,
-  genericPublishConfig,
+  GITHUB_UPDATE_OWNER,
+  GITHUB_UPDATE_REPO,
+  githubPublishConfig,
   shouldCheckForUpdates,
   isUnsafeToAutoRestart,
   shouldInstallNow,

@@ -25,18 +25,12 @@
 }
 .ump-top-actions { flex-shrink: 0; }
 .ump-list { padding: 14px; display: grid; gap: 10px; }
-.ump-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  padding: 14px;
-  text-align: left;
-  color: inherit;
-  width: 100%;
-  min-height: 72px;
-  min-width: 0;
-  border-radius: var(--radius);
+/* .ump-card layers onto the shared .panel.card-clickable (background/border/padding/live-tint
+   already come from packages/ui) — this just tunes touch-target sizing for a match-list card. */
+.ump-card { min-height: 72px; min-width: 0; padding: 14px; }
+.ump-card[data-live="true"] {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--live) 40%, transparent);
 }
-.ump-card[data-live="true"] { border-left: 3px solid var(--live); background: color-mix(in srgb, var(--live) 12%, var(--surface)); }
 .ump-name {
   overflow-wrap: anywhere;
   word-break: break-word;
@@ -51,11 +45,16 @@
 .ump-serve {
   text-align: center;
   color: var(--gold-accent);
-  letter-spacing: 0.12em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
-  font-size: 0.8rem;
+  font-size: var(--text-md);
   overflow-wrap: anywhere;
-  padding: 0 12px;
+  padding: 4px 12px 0;
+}
+.ump-serve-num {
+  color: var(--muted-court);
+  font-weight: 500;
+  letter-spacing: 0.06em;
 }
 .ump-sync {
   margin-top: 8px;
@@ -184,27 +183,31 @@ html, body, #root {
 .ump-toss {
   text-align: center;
 }
-.coin-call-row {
+.ump-toss-setup {
+  margin-top: 14px;
+  text-align: left;
+}
+.ump-choice-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  margin: 12px 0 16px;
+  gap: 8px;
+  margin-top: 6px;
 }
-.coin-call {
+.ump-choice {
+  min-height: var(--touch);
   border: 1px solid var(--border);
-  padding: 12px 8px;
-  display: grid;
-  gap: 4px;
-}
-.coin-call strong {
-  font-family: "Barlow Condensed", sans-serif;
-  letter-spacing: 0.16em;
-  font-size: 1.2rem;
-}
-.coin-call span {
-  font-size: 0.85rem;
+  background: var(--elevated);
+  color: var(--text);
+  border-radius: var(--radius);
+  font-weight: 700;
+  font-size: 0.95rem;
   overflow-wrap: anywhere;
-  color: var(--muted);
+  transition: border-color 140ms var(--ease-out), background 140ms var(--ease-out);
+}
+.ump-choice.selected {
+  border-color: var(--tape);
+  background: color-mix(in srgb, var(--tape) 20%, var(--elevated));
+  color: var(--tape);
 }
 .coin-scene {
   perspective: 720px;

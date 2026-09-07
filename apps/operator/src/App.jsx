@@ -1,25 +1,30 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createBrowserClient, envConfig, sendCommand, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
 import { parseLiveHash } from "@tournament/engine";
 import {
   Alert,
   Button,
+  ConfirmDialog,
   EmptyState,
   Input,
   LoadingState,
   Modal,
+  NavGroup,
+  NavItem,
   PageHeader,
+  PageShell,
+  Select,
   Skeleton,
   Stat,
   StatusBadge,
   Table,
   ToastProvider,
+  useToast,
 } from "@tournament/ui";
-import { ArrowRight, LogOut, Plus, RefreshCw } from "lucide-react";
+import { ArrowRight, LayoutDashboard, LogOut, Plus, RefreshCw, Trash2 } from "lucide-react";
 import TournamentDesk from "./TournamentDesk.jsx";
 import LiveMatchWindow from "./LiveMatchWindow.jsx";
 import UpdateBanner, { useDesktopUpdateContext } from "./UpdateBanner.jsx";
-import AppShell from "./AppShell.jsx";
 import AuthLayout from "./AuthLayout.jsx";
 import { firstQueryError, isToday } from "./lib.js";
 
@@ -234,13 +239,19 @@ function RecoveryScreen({ supabase, title, onDone, onSignOut }) {
 }
 
 function SignedIn({ supabase, session, command, onSignOut }) {
+  const toast = useToast();
   const [tournaments, setTournaments] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [loadError, setLoadError] = useState("");
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
+  const [newSport, setNewSport] = useState("pickleball");
   const [showCreate, setShowCreate] = useState(false);
+  const [checkedIds, setCheckedIds] = useState(new Set());
+  const [confirmArchive, setConfirmArchive] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  const headerCheckboxRef = useRef(null);
   useDesktopUpdateContext({
     liveMatches: metrics?.live || 0,
     busy: creating,
@@ -303,7 +314,7 @@ function SignedIn({ supabase, session, command, onSignOut }) {
     setCreating(true);
     setLoadError("");
     try {
-      const res = await command("create_tournament", { name: newName.trim() });
+      const res = await command("create_tournament", { name: newName.trim(), sport: newSport });
       setNewName("");
       setShowCreate(false);
       await reloadList();
@@ -312,6 +323,44 @@ function SignedIn({ supabase, session, command, onSignOut }) {
       setLoadError(err.message);
     } finally {
       setCreating(false);
+    }
+  }
+
+  const visibleTournaments = (tournaments || []).filter((t) => t.status !== "cancelled" && t.status !== "archived");
+  const allChecked = visibleTournaments.length > 0 && visibleTournaments.every((t) => checkedIds.has(t.id));
+  const someChecked = visibleTournaments.some((t) => checkedIds.has(t.id));
+  const checkedCount = visibleTournaments.filter((t) => checkedIds.has(t.id)).length;
+
+  useEffect(() => {
+    if (headerCheckboxRef.current) headerCheckboxRef.current.indeterminate = someChecked && !allChecked;
+  }, [someChecked, allChecked]);
+
+  function toggleAllTournaments() {
+    setCheckedIds(allChecked ? new Set() : new Set(visibleTournaments.map((t) => t.id)));
+  }
+  function toggleTournament(id) {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+  async function archiveSelectedTournaments() {
+    setArchiving(true);
+    try {
+      const targets = visibleTournaments.filter((t) => checkedIds.has(t.id));
+      for (const t of targets) {
+        const status = (t.status === "completed" || t.status === "cancelled") ? "archived" : "cancelled";
+        await command("transition_tournament", { tournament_id: t.id, status });
+      }
+      setCheckedIds(new Set());
+      await reloadList();
+      toast(`Removed ${targets.length} tournament${targets.length === 1 ? "" : "s"} from your dashboard`);
+    } catch (err) {
+      setLoadError(err.message);
+    } finally {
+      setArchiving(false);
+      setConfirmArchive(false);
     }
   }
 
@@ -329,25 +378,63 @@ function SignedIn({ supabase, session, command, onSignOut }) {
   }
 
   return (
-    <AppShell
-      nav={<button type="button" data-active="true">Dashboard</button>}
-      railFoot={
+    <PageShell
+      brand={<><h1>Tournament</h1><div className="kicker">Control</div></>}
+      navLabel="Sections"
+      nav={
+        <NavGroup>
+          <NavItem icon={LayoutDashboard} label="Dashboard" active />
+        </NavGroup>
+      }
+      foot={
         <>
           <div>{session.user.email}</div>
           <Button variant="ghost" onClick={onSignOut}><LogOut size={15} aria-hidden="true" /> Sign out</Button>
         </>
       }
-      overlay={showCreate && (
-        <Modal title="New tournament" onClose={() => !creating && setShowCreate(false)}>
+      overlay={(
+        <>
+          {showCreate && (
+        <Modal title="Create your tournament" onClose={() => !creating && setShowCreate(false)}>
           <form className="stack" onSubmit={createTournament}>
-            <Input label="Tournament name" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Open at Riverside" required autoFocus />
+            <Input
+              label="Tournament name"
+              hint="What should we call this tournament?"
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="Open at Riverside"
+              required
+              autoFocus
+            />
+            <Select label="Sport" hint="What sport are you running?" value={newSport} onChange={(e) => setNewSport(e.target.value)}>
+              <option value="pickleball">Pickleball</option>
+              <option value="tennis">Tennis</option>
+              <option value="badminton">Badminton</option>
+              <option value="squash">Squash</option>
+              <option value="table_tennis">Table tennis</option>
+              <option value="other">Other</option>
+            </Select>
+            <p className="muted" style={{ margin: 0 }}>Next you'll add divisions, players, and courts — we'll walk you through each step.</p>
             {loadError && <Alert>{loadError}</Alert>}
             <div className="row">
-              <Button type="submit" disabled={creating}>{creating ? "Creating…" : "Create tournament"}</Button>
+              <Button type="submit" disabled={creating || !newName.trim()}>{creating ? "Creating…" : "Create tournament"}</Button>
               <Button type="button" variant="secondary" disabled={creating} onClick={() => setShowCreate(false)}>Cancel</Button>
             </div>
           </form>
         </Modal>
+          )}
+          {confirmArchive && (
+            <ConfirmDialog
+              title={`Remove ${checkedCount} selected tournament${checkedCount === 1 ? "" : "s"}?`}
+              body="This removes them from your active dashboard. Tournament data isn't deleted, but this can't be undone from this screen."
+              confirmLabel="Remove from dashboard"
+              danger
+              busy={archiving}
+              onCancel={() => setConfirmArchive(false)}
+              onConfirm={archiveSelectedTournaments}
+            />
+          )}
+        </>
       )}
     >
           <PageHeader
@@ -358,9 +445,8 @@ function SignedIn({ supabase, session, command, onSignOut }) {
               <Button key="new" onClick={() => setShowCreate(true)}><Plus size={15} aria-hidden="true" /> New tournament</Button>,
             ]}
           >
-        <p className="muted" style={{ marginTop: 8 }}>Active events, live courts, and staff from the official database.</p>
+        <p>Everything happening across your tournaments, live courts, and staff.</p>
           </PageHeader>
-          <div className="tape" />
           {loadError && (
             <div className="stack">
               <Alert>{loadError}</Alert>
@@ -375,15 +461,14 @@ function SignedIn({ supabase, session, command, onSignOut }) {
           )}
           {!loadError && metrics && (
             <>
-              <div className="section-label">Match status</div>
               <div className="ops-board">
                 <Stat tone={metrics.live ? "hero live" : "hero"} value={metrics.live} label="Live matches" />
                 <Stat value={metrics.ready} label="Ready to start" />
                 <Stat value={metrics.scheduled} label="Scheduled" />
                 <Stat value={metrics.completed} label="Completed" />
               </div>
-              <div className="section-label" style={{ marginTop: "var(--space-4)" }}>Tournament overview</div>
-              <div className="ops-board">
+              <div className="section-label" style={{ marginTop: "var(--space-5)" }}>Tournament overview</div>
+              <div className="grid4">
                 <Stat value={metrics.active} label="Active tournaments" />
                 <Stat value={metrics.paired} label="Paired courts" />
                 <Stat value={metrics.courts} label="Courts" />
@@ -393,16 +478,47 @@ function SignedIn({ supabase, session, command, onSignOut }) {
                 <Stat tone="quiet" value={metrics.teams} label="Teams" />
               </div>
               <div style={{ height: "var(--space-5)" }} />
-              {tournaments.length === 0 ? (
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <div className="section-label" style={{ marginBottom: 0 }}>Your tournaments</div>
+                {someChecked && (
+                  <Button variant="danger" className="compact" onClick={() => setConfirmArchive(true)}>
+                    <Trash2 size={14} aria-hidden="true" /> Delete Selected ({checkedCount})
+                  </Button>
+                )}
+              </div>
+              {visibleTournaments.length === 0 ? (
                 <EmptyState
-                  title="No tournaments yet"
-                  action={<Button onClick={() => setShowCreate(true)}><Plus size={15} aria-hidden="true" /> New tournament</Button>}
+                  title={tournaments.length === 0 ? "No tournaments yet" : "No active tournaments"}
+                  action={<Button onClick={() => setShowCreate(true)}><Plus size={15} aria-hidden="true" /> Create your first tournament</Button>}
                 >
-                  Create a tournament to open the operator desk.
+                  {tournaments.length === 0
+                    ? "Set up a name and sport, then add divisions, players, and courts — we'll guide you through each step."
+                    : "Every tournament here has been removed from the dashboard."}
                 </EmptyState>
               ) : (
                 <Table
+                  responsive
                   columns={[
+                    {
+                      key: "select",
+                      header: (
+                        <input
+                          ref={headerCheckboxRef}
+                          type="checkbox"
+                          aria-label="Select all tournaments"
+                          checked={allChecked}
+                          onChange={toggleAllTournaments}
+                        />
+                      ),
+                      render: (row) => (
+                        <input
+                          type="checkbox"
+                          aria-label={`Select ${row.name}`}
+                          checked={checkedIds.has(row.id)}
+                          onChange={() => toggleTournament(row.id)}
+                        />
+                      ),
+                    },
                     { key: "name", header: "Tournament" },
                     {
                       key: "status",
@@ -418,11 +534,11 @@ function SignedIn({ supabase, session, command, onSignOut }) {
                       ),
                     },
                   ]}
-                  rows={tournaments}
+                  rows={visibleTournaments}
                 />
               )}
             </>
           )}
-    </AppShell>
+    </PageShell>
   );
 }

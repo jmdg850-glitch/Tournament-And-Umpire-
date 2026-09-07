@@ -74,6 +74,13 @@ function normalizeTeam(team) {
   if (t === "b") return "B";
   return null;
 }
+function normalizeCourtSide(side) {
+  if (side == null) return null;
+  const s = String(side).toLowerCase();
+  if (s === "left") return "left";
+  if (s === "right") return "right";
+  return null;
+}
 function normalizeCoinTossPayload(payload = {}, fallbackServingTeam = "A") {
   const nested = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
   const raw = nested.result ?? nested.outcome ?? (typeof payload === "string" || typeof payload === "number" ? payload : null);
@@ -95,7 +102,8 @@ function normalizeCoinTossPayload(payload = {}, fallbackServingTeam = "A") {
   if (!winner) winner = servingFromPayload || normalizeTeam(fallbackServingTeam) || "A";
   if (!result) result = winner === "B" ? "tails" : "heads";
   const servingTeam = servingFromPayload || winner;
-  return { result, winner, servingTeam };
+  const courtSide = normalizeCourtSide(nested.courtSide ?? nested.court_side);
+  return { result, winner, servingTeam, courtSide };
 }
 function readCoinToss(match) {
   if (!match) return null;
@@ -112,7 +120,8 @@ function readCoinToss(match) {
     return normalizeCoinTossPayload({
       result: match.score_state.coinToss,
       winner: match.score_state.tossWinner,
-      servingTeam: match.score_state.servingTeam
+      servingTeam: match.score_state.servingTeam,
+      courtSide: match.score_state.courtSide
     }, match.serving_team);
   }
   return null;
@@ -290,6 +299,9 @@ function applyScoreEvent(state, event) {
     next = { ...state, coinToss: toss.result, tossWinner: toss.winner };
     if (payload.servingTeam != null || payload.serving_team != null) {
       next.servingTeam = toss.servingTeam;
+    }
+    if (toss.courtSide != null) {
+      next.courtSide = toss.courtSide;
     }
   } else {
     return { state, applied: false };
@@ -960,6 +972,8 @@ var COMMAND_TYPES = Object.freeze([
   "create_division",
   "update_division",
   "add_person",
+  "update_person",
+  "remove_person",
   "create_team",
   "add_team_member",
   "remove_team_member",
@@ -1877,6 +1891,41 @@ async function handleAddPerson(admin, actor, payload, envelope) {
     result: { person }
   });
 }
+async function handleUpdatePerson(admin, actor, payload, envelope) {
+  if (!isUuid(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
+  const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
+  if (!person) throw httpError(404, "NOT_FOUND", "Person not found");
+  const member = await loadMember(admin, person.tournament_id, actor.id);
+  requireOrganizer(member);
+  const display_name = String(payload.display_name || "").trim();
+  if (!display_name) throw httpError(400, "INVALID_COMMAND", "display_name is required");
+  const next = { ...person, display_name };
+  const batch = createBatch();
+  batch.upsert("persons", next);
+  return commit(admin, batch, {
+    ...envelope,
+    actorId: actor.id,
+    tournamentId: person.tournament_id,
+    result: { person: next }
+  });
+}
+async function handleRemovePerson(admin, actor, payload, envelope) {
+  if (!isUuid(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
+  const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
+  if (!person) throw httpError(404, "NOT_FOUND", "Person not found");
+  const member = await loadMember(admin, person.tournament_id, actor.id);
+  requireOrganizer(member);
+  const { data: used } = await admin.from("participant_members").select("id").eq("person_id", person.id).limit(1);
+  if (used?.length) throw httpError(409, "PERSON_IN_USE", "Cannot remove a player who is already registered into a division");
+  const batch = createBatch();
+  batch.delete("persons", person.id);
+  return commit(admin, batch, {
+    ...envelope,
+    actorId: actor.id,
+    tournamentId: person.tournament_id,
+    result: { person_id: person.id, removed: true }
+  });
+}
 async function handleCreateTeam(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
@@ -2465,7 +2514,8 @@ async function handleCoinToss(admin, actor, payload, envelope) {
   const toss = normalizeCoinTossPayload({
     result: payload.result,
     winner: payload.winner,
-    servingTeam: payload.serving_team
+    servingTeam: payload.serving_team,
+    courtSide: payload.court_side
   }, match.serving_team);
   if (!payload.result && !payload.winner && !payload.serving_team) {
     throw httpError(400, "INVALID_COMMAND", "coin toss result is required");
@@ -2709,6 +2759,8 @@ var HANDLERS = {
   create_division: handleCreateDivision,
   update_division: handleUpdateDivision,
   add_person: handleAddPerson,
+  update_person: handleUpdatePerson,
+  remove_person: handleRemovePerson,
   create_team: handleCreateTeam,
   add_team_member: handleAddTeamMember,
   remove_team_member: handleRemoveTeamMember,

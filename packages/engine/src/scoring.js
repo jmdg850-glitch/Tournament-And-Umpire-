@@ -21,6 +21,14 @@ function normalizeTeam(team) {
   return null;
 }
 
+function normalizeCourtSide(side) {
+  if (side == null) return null;
+  const s = String(side).toLowerCase();
+  if (s === "left") return "left";
+  if (s === "right") return "right";
+  return null;
+}
+
 export function serveNumber(state) {
   return Number(state?.server) === FIRST_SERVE ? FIRST_SERVE : SECOND_SERVE;
 }
@@ -54,7 +62,8 @@ export function normalizeCoinTossPayload(payload = {}, fallbackServingTeam = "A"
   if (!winner) winner = servingFromPayload || normalizeTeam(fallbackServingTeam) || "A";
   if (!result) result = winner === "B" ? "tails" : "heads";
   const servingTeam = servingFromPayload || winner;
-  return { result, winner, servingTeam };
+  const courtSide = normalizeCourtSide(nested.courtSide ?? nested.court_side);
+  return { result, winner, servingTeam, courtSide };
 }
 
 export function readCoinToss(match) {
@@ -73,6 +82,7 @@ export function readCoinToss(match) {
       result: match.score_state.coinToss,
       winner: match.score_state.tossWinner,
       servingTeam: match.score_state.servingTeam,
+      courtSide: match.score_state.courtSide,
     }, match.serving_team);
   }
   return null;
@@ -226,6 +236,9 @@ export function applyScoreEvent(state, event) {
     next = { ...state, coinToss: toss.result, tossWinner: toss.winner };
     if (payload.servingTeam != null || payload.serving_team != null) {
       next.servingTeam = toss.servingTeam;
+    }
+    if (toss.courtSide != null) {
+      next.courtSide = toss.courtSide;
     }
   } else {
     return { state, applied: false };

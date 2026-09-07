@@ -8,7 +8,7 @@ const {
   shouldInstallNow,
   nextCheckAllowed,
   initialUpdaterState,
-  DEFAULT_UPDATE_URL,
+  githubPublishConfig,
 } = require("./updatePolicy.cjs");
 
 test("development / unpackaged builds never check for production updates", () => {
@@ -44,7 +44,10 @@ test("initial state is idle and carries the installed version", () => {
   assert.equal(state.availableVersion, null);
 });
 
-test("production feed is a public HTTPS generic URL, not GitHub", () => {
-  assert.match(DEFAULT_UPDATE_URL, /^https:\/\//);
-  assert.doesNotMatch(DEFAULT_UPDATE_URL, /github\.com/i);
+test("production feed publishes via the GitHub provider, not Supabase Storage", () => {
+  const config = githubPublishConfig();
+  assert.equal(config.provider, "github");
+  assert.equal(config.owner, "jmdg840");
+  assert.equal(config.repo, "tournament-operator-updates");
+  assert.doesNotMatch(JSON.stringify(config), /supabase/i);
 });

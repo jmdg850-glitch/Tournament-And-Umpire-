@@ -3,7 +3,6 @@ import { Button, Card } from "@tournament/ui";
 import {
   coinFaceFromByte,
   isCoinTossCommitted,
-  normalizeCoinTossPayload,
   readCoinToss,
 } from "@tournament/engine";
 
@@ -26,6 +25,9 @@ function Coin({ face, spinning }) {
   );
 }
 
+// The coin only ever shows HEADS or TAILS — it does not decide who serves.
+// After the flip, the umpire asks the actual player/team who won the toss what
+// they chose, then records that choice explicitly. No team is ever assumed.
 export default function CoinTossPanel({
   match,
   nameA,
@@ -38,82 +40,142 @@ export default function CoinTossPanel({
   const lockRef = useRef(false);
   const [spinning, setSpinning] = useState(false);
   const [pending, setPending] = useState(false);
-  const [shown, setShown] = useState(committed);
+  const [localFace, setLocalFace] = useState(null);
+  const [firstServer, setFirstServer] = useState("");
+  const [courtSide, setCourtSide] = useState("");
+  const [confirmError, setConfirmError] = useState("");
+
+  const face = committed?.result || localFace;
 
   useEffect(() => {
-    if (committed && !spinning) setShown(committed);
-  }, [committed, spinning]);
+    if (committed) {
+      setLocalFace(committed.result);
+    }
+  }, [committed]);
 
-  async function flip() {
+  function flip() {
     if (lockRef.current || busy || spinning || isCoinTossCommitted(match)) return;
+    setLocalFace(coinFaceFromByte(crypto.getRandomValues(new Uint8Array(1))[0]));
+    if (prefersReducedMotion()) return;
+    setSpinning(true);
+    window.setTimeout(() => setSpinning(false), SPIN_MS);
+  }
+
+  async function confirm() {
+    if (!face) return;
+    if (!firstServer) {
+      setConfirmError("Please select the first server.");
+      return;
+    }
+    if (!courtSide) {
+      setConfirmError("Please select the court side.");
+      return;
+    }
+    setConfirmError("");
     lockRef.current = true;
     setPending(true);
-    const face = coinFaceFromByte(crypto.getRandomValues(new Uint8Array(1))[0]);
-    const proposed = normalizeCoinTossPayload({ result: face, servingTeam: face === "heads" ? "A" : "B" });
     try {
-      const result = await onCommit({
+      await onCommit({
         match_id: match.id,
         event_id: crypto.randomUUID(),
         seq: lastSeq + 1,
-        result: proposed.result,
-        winner: proposed.winner,
-        serving_team: proposed.servingTeam,
+        result: face,
+        winner: firstServer,
+        serving_team: firstServer,
+        court_side: courtSide,
       });
-      const official = readCoinToss(result?.match || { coin_toss: result?.coin_toss }) || proposed;
-      setShown(official);
-      if (prefersReducedMotion()) {
-        setSpinning(false);
-        return;
-      }
-      setSpinning(true);
-      await new Promise((resolve) => setTimeout(resolve, SPIN_MS));
-      setSpinning(false);
     } catch {
-      setSpinning(false);
+      // error already surfaced by the caller; leave choices in place to retry
     } finally {
       setPending(false);
       lockRef.current = false;
     }
   }
 
-  const display = shown || committed;
-  const winnerName = display?.winner === "B" ? nameB : nameA;
-  const faceLabel = display?.result === "tails" ? "TAILS" : "HEADS";
+  const faceLabel = face === "tails" ? "TAILS" : "HEADS";
+  const readyToConfirm = Boolean(face) && Boolean(firstServer) && Boolean(courtSide);
 
   return (
     <Card className="ump-toss">
       <div className="kicker">Coin toss</div>
-      <h2>Call it</h2>
-      <div className="coin-call-row">
-        <div className="coin-call">
-          <strong>HEADS</strong>
-          <span>{nameA}</span>
-        </div>
-        <div className="coin-call">
-          <strong>TAILS</strong>
-          <span>{nameB}</span>
-        </div>
-      </div>
+      <h2>Flip the coin</h2>
 
-      {!display && (
-        <Button className="tape cta" disabled={busy || spinning || pending} onClick={flip}>
-          {pending ? "Flipping…" : "Flip coin"}
+      {!face && (
+        <Button className="tape cta" disabled={busy || spinning} onClick={flip}>
+          Flip coin
         </Button>
       )}
 
-      {display && (
+      {face && (
         <>
-          <Coin face={display.result} spinning={spinning} />
+          <Coin face={face} spinning={spinning} />
           <p className="coin-flip-label">{spinning ? "COIN FLIP" : faceLabel}</p>
-          {!spinning && (
+          {!spinning && !committed && (
             <div className="coin-result" aria-live="polite">
               <div className="coin-face-word">{faceLabel}</div>
-              <div className="coin-winner-name">{winnerName}</div>
-              <div className="coin-winner-kicker">WON TOSS</div>
-              <p className="coin-award">RECEIVES SERVE</p>
+              <p className="coin-award">Ask the players who won the toss.</p>
             </div>
           )}
         </>
+      )}
+
+      {face && !spinning && !committed && (
+        <div className="ump-toss-setup stack">
+          <div>
+            <div className="section-label">First server</div>
+            <div className="ump-choice-row">
+              <button
+                type="button"
+                className={`ump-choice ${firstServer === "A" ? "selected" : ""}`}
+                aria-pressed={firstServer === "A"}
+                onClick={() => { setFirstServer("A"); setConfirmError(""); }}
+              >
+                {nameA}
+              </button>
+              <button
+                type="button"
+                className={`ump-choice ${firstServer === "B" ? "selected" : ""}`}
+                aria-pressed={firstServer === "B"}
+                onClick={() => { setFirstServer("B"); setConfirmError(""); }}
+              >
+                {nameB}
+              </button>
+            </div>
+          </div>
+          <div>
+            <div className="section-label">Court / side</div>
+            <div className="ump-choice-row">
+              <button
+                type="button"
+                className={`ump-choice ${courtSide === "left" ? "selected" : ""}`}
+                aria-pressed={courtSide === "left"}
+                onClick={() => { setCourtSide("left"); setConfirmError(""); }}
+              >
+                Left
+              </button>
+              <button
+                type="button"
+                className={`ump-choice ${courtSide === "right" ? "selected" : ""}`}
+                aria-pressed={courtSide === "right"}
+                onClick={() => { setCourtSide("right"); setConfirmError(""); }}
+              >
+                Right
+              </button>
+            </div>
+          </div>
+          {confirmError && <p className="field-error">{confirmError}</p>}
+          <Button className="tape cta" disabled={busy || pending || !readyToConfirm} onClick={confirm}>
+            {pending ? "Saving…" : "Confirm & Continue"}
+          </Button>
+        </div>
+      )}
+
+      {committed && (
+        <div className="coin-result" aria-live="polite">
+          <div className="coin-winner-name">{committed.servingTeam === "B" ? nameB : nameA}</div>
+          <div className="coin-winner-kicker">FIRST SERVER</div>
+          {committed.courtSide && <p className="coin-award">{committed.courtSide === "left" ? "Left" : "Right"} side</p>}
+        </div>
       )}
     </Card>
   );

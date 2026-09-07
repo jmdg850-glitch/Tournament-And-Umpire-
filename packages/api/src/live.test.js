@@ -107,6 +107,28 @@ describe.skipIf(!live)("live tournament path", () => {
       expect(r.body.ok).toBe(true);
       persons.push(r.body.result.person);
     }
+
+    r = await send(organizer.token, "update_person", { person_id: persons[0].id, display_name: "Ada Renamed / Al" });
+    expect(r.body.ok).toBe(true);
+    expect(r.body.result.person.display_name).toBe("Ada Renamed / Al");
+    persons[0] = r.body.result.person;
+
+    r = await send(outsider.token, "update_person", { person_id: persons[0].id, display_name: "Should Not Apply" });
+    expect(r.body.ok).toBe(false);
+    expect(r.status).toBe(403);
+
+    r = await send(organizer.token, "add_person", { tournament_id: tournamentId, display_name: "Unregistered Player" });
+    expect(r.body.ok).toBe(true);
+    const removableId = r.body.result.person.id;
+
+    r = await send(outsider.token, "remove_person", { person_id: removableId });
+    expect(r.body.ok).toBe(false);
+    expect(r.status).toBe(403);
+
+    r = await send(organizer.token, "remove_person", { person_id: removableId });
+    expect(r.body.ok).toBe(true);
+    expect(r.body.result.removed).toBe(true);
+
     for (const [i, p] of persons.entries()) {
       r = await send(organizer.token, "register_participant", {
         division_id: divisionId,
@@ -117,6 +139,10 @@ describe.skipIf(!live)("live tournament path", () => {
       });
       expect(r.body.ok).toBe(true);
     }
+
+    r = await send(organizer.token, "remove_person", { person_id: persons[0].id });
+    expect(r.body.ok).toBe(false);
+    expect(r.body.error.code).toBe("PERSON_IN_USE");
 
     r = await send(organizer.token, "create_court", { tournament_id: tournamentId, name: "Court 1" });
     expect(r.body.ok).toBe(true);

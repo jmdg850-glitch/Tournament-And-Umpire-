@@ -188,10 +188,29 @@ describe("applyScoreEvent — coin toss", () => {
 
   test("legacy A/B result maps to HEADS/TAILS without changing serve number", () => {
     const toss = normalizeCoinTossPayload({ result: "A", serving_team: "A" });
-    expect(toss).toEqual({ result: "heads", winner: "A", servingTeam: "A" });
+    expect(toss).toEqual({ result: "heads", winner: "A", servingTeam: "A", courtSide: null });
     expect(coinFaceFromByte(0)).toBe("heads");
     expect(coinFaceFromByte(1)).toBe("tails");
     expect(readCoinToss({ coin_toss: { result: "tails", winner: "B", servingTeam: "B" } }).result).toBe("tails");
+  });
+
+  test("winner/servingTeam can be set explicitly, independent of the coin face — no auto team assignment is forced", () => {
+    // Heads does NOT have to mean Team A: the umpire's explicit pick is authoritative.
+    const toss = normalizeCoinTossPayload({ result: "heads", winner: "B", servingTeam: "B" });
+    expect(toss.result).toBe("heads");
+    expect(toss.winner).toBe("B");
+    expect(toss.servingTeam).toBe("B");
+  });
+
+  test("court side is optional, normalized, and passed through into state", () => {
+    let st = createInitialScoreState(settings);
+    const r = applyScoreEvent(st, ev("c3", "coin_toss", 1, { result: "heads", servingTeam: "A", courtSide: "Left" }));
+    expect(r.state.courtSide).toBe("left");
+  });
+
+  test("court side is null when not provided, never guessed", () => {
+    const toss = normalizeCoinTossPayload({ result: "heads", servingTeam: "A" });
+    expect(toss.courtSide).toBe(null);
   });
 });
 
