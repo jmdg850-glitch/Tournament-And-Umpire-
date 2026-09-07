@@ -27,6 +27,7 @@ import LiveMatchWindow from "./LiveMatchWindow.jsx";
 import UpdateBanner, { useDesktopUpdateContext } from "./UpdateBanner.jsx";
 import AuthLayout from "./AuthLayout.jsx";
 import { firstQueryError, isToday } from "./lib.js";
+import { version as APP_VERSION } from "../package.json";
 
 function useConfig() {
   return useMemo(() => envConfig(), []);
@@ -390,6 +391,7 @@ function SignedIn({ supabase, session, command, onSignOut }) {
         <>
           <div>{session.user.email}</div>
           <Button variant="ghost" onClick={onSignOut}><LogOut size={15} aria-hidden="true" /> Sign out</Button>
+          <div className="app-version">Version {APP_VERSION}</div>
         </>
       }
       overlay={(

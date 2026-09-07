@@ -70,6 +70,7 @@ import {
   stageTitle,
   umpireFor,
 } from "./lib.js";
+import { version as APP_VERSION } from "../package.json";
 
 const TAB_ICON = {
   overview: Gauge,
@@ -318,6 +319,7 @@ export default function TournamentDesk({ supabase, session, command, tournamentI
         <>
           <div>{session.user.email}</div>
           <Button variant="ghost" onClick={onSignOut}>Sign out</Button>
+          <div className="app-version">Version {APP_VERSION}</div>
         </>
       }
       overlay={confirm && (

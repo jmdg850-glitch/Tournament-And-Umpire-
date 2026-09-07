@@ -18,6 +18,7 @@ import {
   StatusBadge,
 } from "@tournament/ui";
 import { ArrowLeft, LogOut, QrCode, RefreshCw } from "lucide-react";
+import { version as APP_VERSION } from "../package.json";
 
 function isStationInactiveError(err) {
   const msg = String(err?.message || err || "");
@@ -352,6 +353,7 @@ function MyMatches({ supabase, session, onOpen, onSignOut }) {
           <div className="kicker">Umpire</div>
           <h1 style={{ fontSize: "1.4rem" }}>Matches</h1>
           <div className="muted" style={{ color: "var(--muted-court)" }}>{session.user.email}</div>
+          <div className="muted app-version" style={{ color: "var(--muted-court)", fontSize: "var(--text-xs)" }}>Version {APP_VERSION}</div>
         </div>
         <div className="row">
           <Button variant="secondary" onClick={load}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>
