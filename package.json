@@ -24,6 +24,7 @@
     "typecheck": "node -e \"console.log('no TypeScript typecheck in this repo')\"",
     "bundle:command": "node scripts/bundle-command.mjs",
     "publish:desktop": "npm run publish:desktop -w @tournament/operator",
+    "release": "node scripts/release.mjs",
     "legacy:dev": "vite",
     "legacy:build": "vite build",
     "legacy:test": "vitest run",
