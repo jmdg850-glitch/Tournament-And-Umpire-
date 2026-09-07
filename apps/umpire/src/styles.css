@@ -1,3 +1,13 @@
+/* Sport-focused orange/coral accent — this app stays a dark, stadium-style
+   scoring surface (already correct per earlier redesign passes); only the
+   accent color shifts, from the operator's gold to a warmer coral. */
+:root {
+  --tape: #ff6b3d;
+  --tape-ink: #1a0e08;
+  --gold-accent: #ff9466;
+  --focus: #ff6b3d;
+}
+
 .ump-shell {
   min-height: 100dvh;
   min-height: 100svh;
@@ -25,6 +35,20 @@
 }
 .ump-top-actions { flex-shrink: 0; }
 .ump-list { padding: 14px; display: grid; gap: 10px; }
+.ump-context-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 2px 14px 0;
+  flex-shrink: 0;
+  color: var(--muted-court);
+  font-size: 0.78rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.ump-context-sep { opacity: 0.5; }
 /* .ump-card layers onto the shared .panel.card-clickable (background/border/padding/live-tint
    already come from packages/ui) — this just tunes touch-target sizing for a match-list card. */
 .ump-card { min-height: 72px; min-width: 0; padding: 14px; }

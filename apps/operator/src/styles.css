@@ -1,3 +1,104 @@
+/* Tournament control center — dark navy sidebar, light workspace, blue/teal
+   accent. Overrides packages/ui's shared dark "night desk" tokens for the
+   operator app specifically; the umpire app keeps its own dark scoring theme. */
+:root {
+  --bg: #f3f5f9;
+  --surface: #ffffff;
+  --elevated: #eef1f7;
+  --panel: #ffffff;
+  --ink: #101828;
+  --text: #101828;
+  --muted: #64748b;
+  --line: #e3e8f0;
+  --border: #e3e8f0;
+  --tape: #2563eb;
+  --tape-ink: #ffffff;
+  --primary: #2563eb;
+  --focus: #2563eb;
+  --secondary: #0ea5a4;
+  --gold-accent: #d97706;
+  --warn: #b45309;
+  --warning: #b45309;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.08);
+  --shadow-md: 0 8px 20px rgba(16, 24, 40, 0.10);
+  --shadow-lg: 0 20px 45px rgba(16, 24, 40, 0.18);
+  --navy: #0b1220;
+  --navy-elevated: #16223a;
+  --navy-text: #eef2f8;
+  --navy-muted: #93a2ba;
+  --gradient-brand: linear-gradient(135deg, #2563eb 0%, #0ea5a4 100%);
+}
+body { background: var(--bg); }
+
+/* The sidebar stays deliberately dark regardless of the light workspace. */
+.shell-rail {
+  background: var(--navy);
+  color: var(--navy-text);
+}
+.shell-context { border-bottom-color: rgba(255, 255, 255, 0.1); }
+.shell-nav-group + .shell-nav-group { border-top-color: rgba(255, 255, 255, 0.08); }
+.shell-nav-group-label { color: var(--navy-muted); }
+.shell-nav-item { color: var(--navy-muted); }
+.shell-nav-item:hover { background: var(--navy-elevated); color: var(--navy-text); }
+.shell-nav-item[aria-current="page"] {
+  background: var(--navy-elevated);
+  color: #fff;
+}
+.shell-nav-item[aria-current="page"] svg { color: #7fb0ff; }
+.shell-foot { border-top-color: rgba(255, 255, 255, 0.08); color: var(--navy-muted); }
+.shell-brand h1, .shell-brand .kicker { color: var(--navy-text); }
+.shell-context .name { color: var(--navy-text); }
+
+/* Cards read as elevated white surfaces on the light workspace. */
+.panel { box-shadow: var(--shadow-sm); }
+.table th { background: #f8fafc; }
+input, select, textarea { background: #fff; }
+
+.hero-banner {
+  background: var(--gradient-brand);
+  color: #fff;
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-5);
+  margin-bottom: var(--space-5);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  box-shadow: var(--shadow-md);
+}
+.hero-banner h1 { color: #fff; font-size: var(--text-xl); margin: 2px 0 4px; }
+.hero-banner p { color: rgba(255, 255, 255, 0.85); margin: 0; max-width: 52ch; }
+.hero-banner .btn.hero-btn-solid { background: #fff; color: #16223a; }
+.hero-banner .btn.hero-btn-ghost {
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+
+.dashboard-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr);
+  gap: var(--space-5);
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .dashboard-columns { grid-template-columns: 1fr; }
+}
+.activity-feed { padding: var(--space-3); }
+.activity-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-3); }
+.activity-item { display: flex; gap: 10px; align-items: flex-start; }
+.activity-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 6px;
+  background: var(--muted);
+}
+.activity-dot.live { background: var(--live); box-shadow: 0 0 0 3px color-mix(in srgb, var(--live) 25%, transparent); }
+.activity-time { font-size: var(--text-xs); }
+
 .section-label {
   font-size: var(--text-xs);
   letter-spacing: 0.14em;
@@ -10,7 +111,7 @@
 .live-window {
   min-height: 100dvh;
   background: var(--shell-bg);
-  color: var(--text);
+  color: #eef1f4;
   padding: 24px 20px 36px;
   display: flex;
   flex-direction: column;
@@ -30,10 +131,10 @@
   align-items: baseline;
   gap: 10px 16px;
 }
-.live-window-top h1 { font-size: clamp(1.6rem, 4vw, 2.6rem); }
+.live-window-top h1 { font-size: clamp(1.6rem, 4vw, 2.6rem); color: #eef1f4; }
 .live-window-meta {
   text-align: center;
-  color: var(--muted);
+  color: #8b93a1;
   overflow-wrap: anywhere;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -61,7 +162,10 @@
   overflow-wrap: anywhere;
 }
 .live-tile-meta {
-  color: var(--muted);
+  color: #9099a8;
+}
+.live-tile .kicker {
+  color: #9099a8;
 }
 
 .update-banner {
@@ -72,9 +176,10 @@
   z-index: 70;
   width: min(380px, calc(100% - 32px));
   background: var(--shell-bg);
-  color: var(--text);
-  border: 1px solid var(--border);
+  color: #eef1f4;
+  border: 1px solid #2c3340;
   border-left: 3px solid var(--tape);
+  border-radius: var(--radius-lg);
   padding: 14px;
   display: grid;
   gap: 10px;
@@ -85,7 +190,7 @@
   gap: 4px;
   font-size: 0.9rem;
 }
-.update-banner-copy span { color: var(--muted); }
+.update-banner-copy span { color: #8b93a1; }
 .update-banner progress {
   width: 100%;
   height: 8px;
@@ -95,3 +200,4 @@
   gap: 8px;
   flex-wrap: wrap;
 }
+.update-banner .btn.secondary { color: #eef1f4; border-color: #2c3340; }

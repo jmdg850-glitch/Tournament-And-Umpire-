@@ -12,6 +12,7 @@
   --line: #2c3340;
   --border: #2c3340;
   --tape: #f5c518;
+  --tape-ink: #16140b;
   --primary: #f5c518;
   --secondary: #5aa7d6;
   --court: #2f6f58;
@@ -100,6 +101,20 @@ div.tape {
 
 .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .stack { display: grid; gap: 12px; }
+.panel-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+.panel-toolbar-title { margin: 0; }
+.panel-toolbar-sub { margin: 2px 0 0; }
+.panel-toolbar-actions { display: flex; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
+@media (max-width: 560px) {
+  .panel-toolbar-actions { width: 100%; }
+  .panel-toolbar-actions .btn, .panel-toolbar-actions > * { flex: 1; }
+}
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 .grid4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
 .ops-board {
@@ -191,7 +206,7 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   justify-content: center;
   gap: 6px;
   background: var(--tape);
-  color: #16140b;
+  color: var(--tape-ink);
   border: 0;
   border-radius: var(--radius);
   padding: 10px 16px;
@@ -200,15 +215,16 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   font-size: var(--text-sm);
+  box-shadow: var(--shadow-sm);
   transition: transform 140ms var(--ease-out), filter 140ms var(--ease-out), background 140ms var(--ease-out), box-shadow 140ms var(--ease-out);
 }
-.btn:hover:not(:disabled) { filter: brightness(1.08); }
+.btn:hover:not(:disabled) { filter: brightness(1.06); box-shadow: var(--shadow-md); }
 .btn:active { transform: scale(0.97); }
-.btn.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
-.btn.ghost { background: transparent; color: inherit; border: 0; }
+.btn.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); box-shadow: none; }
+.btn.ghost { background: transparent; color: inherit; border: 0; box-shadow: none; }
 .btn.danger { background: var(--danger); color: #fff; }
 .btn.success { background: var(--success); color: #0b1a14; }
-.btn.tape { background: var(--tape); color: #16140b; }
+.btn.tape { background: var(--tape); color: var(--tape-ink); }
 .btn.compact { min-height: 34px; padding: 6px 10px; font-size: 0.74rem; }
 .btn.icon {
   min-width: 42px;
@@ -291,9 +307,11 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   }
 }
 
-.alert { padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border)); background: color-mix(in srgb, var(--danger) 12%, var(--surface)); color: #ffc7c2; border-radius: var(--radius); }
-.alert.ok { border-color: color-mix(in srgb, var(--success) 40%, var(--border)); background: color-mix(in srgb, var(--success) 12%, var(--surface)); color: #b8f0d6; }
-.alert.warn { border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background: color-mix(in srgb, var(--warn) 12%, var(--surface)); color: #ffe3a3; }
+/* Text uses the semantic color itself (not a hardcoded pastel) so alerts stay
+   readable whether --surface (mixed into the background) is light or dark. */
+.alert { padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border)); background: color-mix(in srgb, var(--danger) 12%, var(--surface)); color: var(--danger); font-weight: 600; border-radius: var(--radius); }
+.alert.ok { border-color: color-mix(in srgb, var(--success) 40%, var(--border)); background: color-mix(in srgb, var(--success) 12%, var(--surface)); color: var(--success); }
+.alert.warn { border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background: color-mix(in srgb, var(--warn) 12%, var(--surface)); color: var(--warn); }
 
 .empty {
   padding: 28px 16px;
@@ -348,11 +366,13 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
 body:has(.update-banner) .toast-stack {
   bottom: 132px;
 }
+/* Fixed dark-on-light popup regardless of the surrounding app theme —
+   toasts need to read clearly whether the page itself is light or dark. */
 .toast {
-  background: var(--ink); color: #14181e; padding: 12px 14px; border-radius: var(--radius);
+  background: #1c2432; color: #eef1f4; padding: 12px 14px; border-radius: var(--radius-lg);
   font-size: var(--text-base);
   box-shadow: var(--shadow-md);
-  border-left: 3px solid var(--border);
+  border-left: 3px solid #384357;
   animation: rise 180ms var(--ease-out);
 }
 .toast.ok { border-left-color: var(--success); }
@@ -506,6 +526,7 @@ body:has(.update-banner) .toast-stack {
   border: 1px solid var(--border);
   padding: 28px 24px 24px;
   border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
 }
 .auth-panel h1 { font-size: 2rem; }
 .auth-modes {
@@ -527,13 +548,16 @@ body:has(.update-banner) .toast-stack {
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 10px;
 }
+/* Same "always dark" rule as .scoreboard — a live-match tile is a compact
+   stadium-style readout, not an ordinary themed card. */
 .live-tile {
   background: var(--shell-bg);
-  color: var(--text);
+  color: #eef1f4;
   padding: 14px;
   text-align: left;
   border: 1px solid var(--border);
   border-left: 3px solid var(--live);
+  border-radius: var(--radius-lg);
   width: 100%;
   min-height: 96px;
 }
@@ -581,6 +605,9 @@ body:has(.update-banner) .toast-stack {
 .match-chip .side.won { font-weight: 700; }
 .match-chip[data-status="in_progress"] { border-color: var(--live); }
 
+/* Always a self-contained dark box (stadium scoreboard), regardless of
+   whether the surrounding app is light or dark — so its text is fixed,
+   not tied to the app's own (possibly light) --text/--muted tokens. */
 .scoreboard {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
@@ -588,14 +615,15 @@ body:has(.update-banner) .toast-stack {
   align-items: center;
   text-align: center;
   background: var(--shell-bg);
-  color: var(--text);
+  color: #eef1f4;
   padding: 20px 12px;
   min-width: 0;
   border-bottom: 2px solid var(--tape);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
 }
 .scoreboard .who {
   font-size: 0.85rem;
-  color: var(--muted);
+  color: #9099a8;
   overflow-wrap: anywhere;
   word-break: break-word;
   display: -webkit-box;

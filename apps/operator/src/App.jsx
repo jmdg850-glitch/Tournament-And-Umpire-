@@ -11,7 +11,6 @@ import {
   Modal,
   NavGroup,
   NavItem,
-  PageHeader,
   PageShell,
   Select,
   Skeleton,
@@ -243,6 +242,7 @@ function SignedIn({ supabase, session, command, onSignOut }) {
   const toast = useToast();
   const [tournaments, setTournaments] = useState(null);
   const [metrics, setMetrics] = useState(null);
+  const [recentMatches, setRecentMatches] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [loadError, setLoadError] = useState("");
   const [creating, setCreating] = useState(false);
@@ -281,6 +281,7 @@ function SignedIn({ supabase, session, command, onSignOut }) {
     setLoadError("");
     setTournaments(t.data || []);
     const matchRows = matches.data || [];
+    setRecentMatches(matchRows);
     setMetrics({
       tournaments: (t.data || []).length,
       active: (t.data || []).filter((x) => ["registration", "registration_closed", "ready", "in_progress"].includes(x.status)).length,
@@ -335,6 +336,18 @@ function SignedIn({ supabase, session, command, onSignOut }) {
   useEffect(() => {
     if (headerCheckboxRef.current) headerCheckboxRef.current.indeterminate = someChecked && !allChecked;
   }, [someChecked, allChecked]);
+
+  const recentActivity = recentMatches
+    .filter((m) => m.status === "completed" || m.status === "in_progress" || m.status === "bye")
+    .map((m) => ({
+      id: m.id,
+      at: m.completed_at || m.started_at || m.created_at,
+      status: m.status,
+      tournamentName: (tournaments || []).find((t) => t.id === m.tournament_id)?.name || "Tournament",
+    }))
+    .filter((a) => a.at)
+    .sort((a, b) => new Date(b.at) - new Date(a.at))
+    .slice(0, 8);
 
   function toggleAllTournaments() {
     setCheckedIds(allChecked ? new Set() : new Set(visibleTournaments.map((t) => t.id)));
@@ -439,16 +452,17 @@ function SignedIn({ supabase, session, command, onSignOut }) {
         </>
       )}
     >
-          <PageHeader
-            kicker="Operations"
-            title="Dashboard"
-            actions={[
-              <Button key="refresh" variant="secondary" onClick={reloadList}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>,
-              <Button key="new" onClick={() => setShowCreate(true)}><Plus size={15} aria-hidden="true" /> New tournament</Button>,
-            ]}
-          >
-        <p>Everything happening across your tournaments, live courts, and staff.</p>
-          </PageHeader>
+          <div className="hero-banner">
+            <div>
+              <div className="kicker" style={{ color: "rgba(255,255,255,0.75)" }}>Operations</div>
+              <h1>Welcome back</h1>
+              <p>Everything happening across your tournaments, live courts, and staff.</p>
+            </div>
+            <div className="row">
+              <Button variant="secondary" className="hero-btn-ghost" onClick={reloadList}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>
+              <Button className="hero-btn-solid" onClick={() => setShowCreate(true)}><Plus size={15} aria-hidden="true" /> New tournament</Button>
+            </div>
+          </div>
           {loadError && (
             <div className="stack">
               <Alert>{loadError}</Alert>
@@ -480,65 +494,91 @@ function SignedIn({ supabase, session, command, onSignOut }) {
                 <Stat tone="quiet" value={metrics.teams} label="Teams" />
               </div>
               <div style={{ height: "var(--space-5)" }} />
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <div className="section-label" style={{ marginBottom: 0 }}>Your tournaments</div>
-                {someChecked && (
-                  <Button variant="danger" className="compact" onClick={() => setConfirmArchive(true)}>
-                    <Trash2 size={14} aria-hidden="true" /> Delete Selected ({checkedCount})
-                  </Button>
-                )}
+              <div className="dashboard-columns">
+                <div className="stack">
+                  <div className="row" style={{ justifyContent: "space-between" }}>
+                    <div className="section-label" style={{ marginBottom: 0 }}>Your tournaments</div>
+                    {someChecked && (
+                      <Button variant="danger" className="compact" onClick={() => setConfirmArchive(true)}>
+                        <Trash2 size={14} aria-hidden="true" /> Delete Selected ({checkedCount})
+                      </Button>
+                    )}
+                  </div>
+                  {visibleTournaments.length === 0 ? (
+                    <EmptyState
+                      title={tournaments.length === 0 ? "No tournaments yet" : "No active tournaments"}
+                      action={<Button onClick={() => setShowCreate(true)}><Plus size={15} aria-hidden="true" /> Create your first tournament</Button>}
+                    >
+                      {tournaments.length === 0
+                        ? "Set up a name and sport, then add divisions, players, and courts — we'll guide you through each step."
+                        : "Every tournament here has been removed from the dashboard."}
+                    </EmptyState>
+                  ) : (
+                    <Table
+                      responsive
+                      columns={[
+                        {
+                          key: "select",
+                          header: (
+                            <input
+                              ref={headerCheckboxRef}
+                              type="checkbox"
+                              aria-label="Select all tournaments"
+                              checked={allChecked}
+                              onChange={toggleAllTournaments}
+                            />
+                          ),
+                          render: (row) => (
+                            <input
+                              type="checkbox"
+                              aria-label={`Select ${row.name}`}
+                              checked={checkedIds.has(row.id)}
+                              onChange={() => toggleTournament(row.id)}
+                            />
+                          ),
+                        },
+                        { key: "name", header: "Tournament" },
+                        {
+                          key: "status",
+                          header: "Status",
+                          render: (row) => <StatusBadge status={row.status} kind="tournament" />,
+                        },
+                        { key: "sport", header: "Sport" },
+                        {
+                          key: "open",
+                          header: "",
+                          render: (row) => (
+                            <Button variant="secondary" onClick={() => setSelectedId(row.id)}>Open <ArrowRight size={15} aria-hidden="true" /></Button>
+                          ),
+                        },
+                      ]}
+                      rows={visibleTournaments}
+                    />
+                  )}
+                </div>
+                <div className="stack">
+                  <div className="section-label" style={{ marginBottom: 0 }}>Recent activity</div>
+                  <Card className="activity-feed">
+                    {recentActivity.length === 0 ? (
+                      <EmptyState title="No activity yet">Activity shows up here once matches start or finish.</EmptyState>
+                    ) : (
+                      <ul className="activity-list">
+                        {recentActivity.map((a) => (
+                          <li key={a.id} className="activity-item">
+                            <span className={`activity-dot ${a.status === "in_progress" ? "live" : ""}`} aria-hidden="true" />
+                            <div>
+                              <div>
+                                {a.status === "in_progress" ? "Match live" : a.status === "bye" ? "Bye recorded" : "Match completed"} in {a.tournamentName}
+                              </div>
+                              <div className="muted activity-time">{new Date(a.at).toLocaleString()}</div>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </Card>
+                </div>
               </div>
-              {visibleTournaments.length === 0 ? (
-                <EmptyState
-                  title={tournaments.length === 0 ? "No tournaments yet" : "No active tournaments"}
-                  action={<Button onClick={() => setShowCreate(true)}><Plus size={15} aria-hidden="true" /> Create your first tournament</Button>}
-                >
-                  {tournaments.length === 0
-                    ? "Set up a name and sport, then add divisions, players, and courts — we'll guide you through each step."
-                    : "Every tournament here has been removed from the dashboard."}
-                </EmptyState>
-              ) : (
-                <Table
-                  responsive
-                  columns={[
-                    {
-                      key: "select",
-                      header: (
-                        <input
-                          ref={headerCheckboxRef}
-                          type="checkbox"
-                          aria-label="Select all tournaments"
-                          checked={allChecked}
-                          onChange={toggleAllTournaments}
-                        />
-                      ),
-                      render: (row) => (
-                        <input
-                          type="checkbox"
-                          aria-label={`Select ${row.name}`}
-                          checked={checkedIds.has(row.id)}
-                          onChange={() => toggleTournament(row.id)}
-                        />
-                      ),
-                    },
-                    { key: "name", header: "Tournament" },
-                    {
-                      key: "status",
-                      header: "Status",
-                      render: (row) => <StatusBadge status={row.status} kind="tournament" />,
-                    },
-                    { key: "sport", header: "Sport" },
-                    {
-                      key: "open",
-                      header: "",
-                      render: (row) => (
-                        <Button variant="secondary" onClick={() => setSelectedId(row.id)}>Open <ArrowRight size={15} aria-hidden="true" /></Button>
-                      ),
-                    },
-                  ]}
-                  rows={visibleTournaments}
-                />
-              )}
             </>
           )}
     </PageShell>

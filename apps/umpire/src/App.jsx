@@ -273,10 +273,11 @@ function RecoveryScreen({ supabase, onDone, onSignOut }) {
 
 function groupMatches(rows) {
   const live = rows.filter((m) => m.status === "in_progress");
-  const next = rows.filter((m) => ["scheduled", "ready", "assigned"].includes(m.status));
+  const ready = rows.filter((m) => ["ready", "assigned"].includes(m.status));
+  const upcoming = rows.filter((m) => m.status === "scheduled");
   const done = rows.filter((m) => ["completed", "bye", "cancelled", "abandoned"].includes(m.status));
-  const other = rows.filter((m) => ![...live, ...next, ...done].some((x) => x.id === m.id));
-  return { live, next, done, other };
+  const other = rows.filter((m) => ![...live, ...ready, ...upcoming, ...done].some((x) => x.id === m.id));
+  return { live, ready, upcoming, done, other };
 }
 
 function MyMatches({ supabase, session, onOpen, onSignOut }) {
@@ -374,8 +375,9 @@ function MyMatches({ supabase, session, onOpen, onSignOut }) {
         )}
         {grouped && (
           <>
-            <MatchGroup title="Live" rows={grouped.live} onOpen={onOpen} nameFor={nameFor} />
-            <MatchGroup title="Next" rows={grouped.next} onOpen={onOpen} nameFor={nameFor} />
+            <MatchGroup title="Live now" rows={grouped.live} onOpen={onOpen} nameFor={nameFor} />
+            <MatchGroup title="Ready to start" rows={grouped.ready} onOpen={onOpen} nameFor={nameFor} />
+            <MatchGroup title="Upcoming" rows={grouped.upcoming} onOpen={onOpen} nameFor={nameFor} />
             <MatchGroup title="Completed" rows={doneRows} onOpen={onOpen} nameFor={nameFor} />
             {grouped.done.length > 8 && (
               <Button variant="secondary" onClick={() => setShowAllDone((v) => !v)}>
@@ -526,8 +528,9 @@ function CourtQueue({ cfg, station, setStation, onOpen, onUnpair }) {
         {rows?.length === 0 && <EmptyState title="No matches on this court">When an organizer assigns a match here, it appears without a new QR scan.</EmptyState>}
         {grouped && (
           <>
-            <MatchGroup title="Live" rows={grouped.live} onOpen={onOpen} nameFor={nameFor} />
-            <MatchGroup title="Next" rows={grouped.next} onOpen={onOpen} nameFor={nameFor} />
+            <MatchGroup title="Live now" rows={grouped.live} onOpen={onOpen} nameFor={nameFor} />
+            <MatchGroup title="Ready to start" rows={grouped.ready} onOpen={onOpen} nameFor={nameFor} />
+            <MatchGroup title="Upcoming" rows={grouped.upcoming} onOpen={onOpen} nameFor={nameFor} />
             <MatchGroup title="Completed" rows={grouped.done.slice(0, 8)} onOpen={onOpen} nameFor={nameFor} />
           </>
         )}
@@ -753,6 +756,11 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         </div>
       </header>
 
+      <div className="ump-context-bar">
+        <span className="ump-context-item">{match.stage_label ? stageTitle(match.stage_label) : `Round ${match.round || 1}`}</span>
+        <span className="ump-context-sep" aria-hidden="true">·</span>
+        <span className="ump-context-item">{court?.name || "No court"}</span>
+      </div>
       <div className="ump-score">
         <div className="ump-court-label">
           {(court?.name || "NO COURT").toUpperCase()}

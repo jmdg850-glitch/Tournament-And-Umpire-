@@ -548,6 +548,12 @@ function DivisionsPanel({ data, busy, run }) {
   const [edit, setEdit] = useState({});
   return (
     <div className="stack">
+      <div className="panel-toolbar">
+        <div>
+          <h1 className="panel-toolbar-title">Divisions</h1>
+          <p className="muted panel-toolbar-sub">Group players into competitions, then generate each division's bracket.</p>
+        </div>
+      </div>
       <Card as="form" className="stack" onSubmit={(e) => {
         e.preventDefault();
         const config = { winTo: 11, bestOf: 1, winBy: "two", isDoubles: true, bronzeMatch: true };
@@ -607,8 +613,10 @@ function DivisionsPanel({ data, busy, run }) {
           <Card className="stack" key={d.id}>
             <div className="row" style={{ justifyContent: "space-between" }}>
               <div>
-                <h3>{d.name}</h3>
-                <div className="muted">{FORMAT_LABEL[d.format] || d.format}</div>
+                <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                  <h3 style={{ margin: 0 }}>{d.name}</h3>
+                  <Badge tone="info">{FORMAT_LABEL[d.format] || d.format}</Badge>
+                </div>
               </div>
               <div className="row">
                 {d.format === "team_elimination" ? (
@@ -808,8 +816,29 @@ function PlayersPanel({ data, busy, run, command, load }) {
 
   return (
     <div className="stack">
+      <div className="panel-toolbar">
+        <div>
+          <h1 className="panel-toolbar-title">Player management</h1>
+          <p className="muted panel-toolbar-sub">Add players, import a roster, then register them into a division.</p>
+        </div>
+        <div className="panel-toolbar-actions">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls"
+            style={{ display: "none" }}
+            onChange={handleImportFile}
+          />
+          <Button type="button" variant="secondary" onClick={() => fileInputRef.current?.click()}>Import Excel</Button>
+          <Dropdown label="Export">
+            <Button type="button" variant="ghost" style={{ width: "100%", justifyContent: "flex-start" }} onClick={downloadTemplate}>Download Template</Button>
+            <Button type="button" variant="ghost" style={{ width: "100%", justifyContent: "flex-start" }} disabled={!data.persons.length} onClick={exportPlayers}>Export Players</Button>
+          </Dropdown>
+        </div>
+      </div>
       <Card className="stack">
-        <h2>Add players</h2>
+        <h2>Add player</h2>
+        {importError && <Alert>{importError}</Alert>}
         <form className="row" onSubmit={(e) => {
           e.preventDefault();
           run("Add player", "add_person", { tournament_id: data.tournament.id, display_name: display });
@@ -818,29 +847,7 @@ function PlayersPanel({ data, busy, run, command, load }) {
           <Input label="Player name" hideLabel value={display} onChange={(e) => setDisplay(e.target.value)} placeholder="Player name" required />
           <Button type="submit" disabled={!!busy}>Add player</Button>
         </form>
-        <div className="row" style={{ alignItems: "center", margin: "2px 0" }}>
-          <div style={{ flex: 1, height: 1, background: "var(--line)" }} />
-          <span className="muted" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.08em" }}>or</span>
-          <div style={{ flex: 1, height: 1, background: "var(--line)" }} />
-        </div>
-        {importError && <Alert>{importError}</Alert>}
-        <div className="row" style={{ flexWrap: "wrap", justifyContent: "space-between" }}>
-          <div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".xlsx,.xls"
-              style={{ display: "none" }}
-              onChange={handleImportFile}
-            />
-            <Button type="button" variant="secondary" onClick={() => fileInputRef.current?.click()}>Import from Excel</Button>
-            <span className="muted" style={{ fontSize: "var(--text-sm)", marginLeft: 10 }}>Add many players at once — you'll preview before anything is saved.</span>
-          </div>
-          <Dropdown label="Export">
-            <Button type="button" variant="ghost" style={{ width: "100%", justifyContent: "flex-start" }} onClick={downloadTemplate}>Download Template</Button>
-            <Button type="button" variant="ghost" style={{ width: "100%", justifyContent: "flex-start" }} disabled={!data.persons.length} onClick={exportPlayers}>Export Players</Button>
-          </Dropdown>
-        </div>
+        <span className="muted" style={{ fontSize: "var(--text-sm)" }}>Adding many players at once? Use Import Excel above — you'll preview before anything is saved.</span>
       </Card>
       {importAnalysis && (
         <PlayerImportModal
@@ -898,8 +905,11 @@ function PlayersPanel({ data, busy, run, command, load }) {
         </Button>
         <p className="muted">Players already assigned to a pair or another team in this division are hidden here and rejected by the server.</p>
       </Card>
-      <div className="row" style={{ justifyContent: "space-between" }}>
+      <div className="row" style={{ justifyContent: "space-between", alignItems: "center", flexWrap: "wrap" }}>
         <Input label="Search players" hideLabel value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search players" />
+        <span className="muted" style={{ fontSize: "var(--text-sm)" }}>
+          {filtered.length} player{filtered.length === 1 ? "" : "s"} · {data.participants.length} registered {data.participants.length === 1 ? "entry" : "entries"}
+        </span>
         {somePlayersChecked && (
           <Button variant="danger" className="compact" disabled={deletingPlayers} onClick={() => setConfirmDeletePlayers(true)}>
             <Trash2 size={14} aria-hidden="true" /> Delete Selected ({checkedPlayerCount})
@@ -951,9 +961,34 @@ function PlayersPanel({ data, busy, run, command, load }) {
             },
             { key: "display_name", header: "Player" },
             {
-              key: "entries",
-              header: "Registered as",
-              render: (p) => entryCountFor(p.id) || "—",
+              key: "entry",
+              header: "Entry",
+              render: (p) => {
+                const member = (data.participantMembers || []).find((m) => m.person_id === p.id);
+                const participant = member ? data.participants.find((pt) => pt.id === member.participant_id) : null;
+                if (!participant) return <span className="muted">—</span>;
+                return isPairEntry(participant, data.participantMembers) ? "Pair" : "Individual";
+              },
+            },
+            {
+              key: "division_team",
+              header: "Division / Team",
+              render: (p) => {
+                const member = (data.participantMembers || []).find((m) => m.person_id === p.id);
+                const participant = member ? data.participants.find((pt) => pt.id === member.participant_id) : null;
+                if (!participant) return <span className="muted">Not registered</span>;
+                const division = data.divisions.find((d) => d.id === participant.division_id)?.name || "—";
+                const team = data.teams.find((t) => t.id === participant.team_id)?.name;
+                return team ? `${division} · ${team}` : division;
+              },
+            },
+            {
+              key: "status",
+              header: "Status",
+              render: (p) => {
+                const registered = entryCountFor(p.id) > 0;
+                return <Badge tone={registered ? "ok" : "muted"}>{registered ? "Registered" : "Unregistered"}</Badge>;
+              },
             },
           ]}
           rows={filtered}
@@ -1076,6 +1111,12 @@ function TeamsPanel({ data, busy, run }) {
 
   return (
     <div className="stack">
+      <div className="panel-toolbar">
+        <div>
+          <h1 className="panel-toolbar-title">Teams</h1>
+          <p className="muted panel-toolbar-sub">Group registered players into a team roster for team elimination divisions.</p>
+        </div>
+      </div>
       <Card as="form" className="row" onSubmit={(e) => {
         e.preventDefault();
         run("Create team", "create_team", { tournament_id: data.tournament.id, name, division_id: divisionId || null });
@@ -1307,17 +1348,47 @@ function UmpiresPanel({ data, session, busy, run }) {
           </form>
         )}
       </Card>
-      {data.members.length === 0 ? (
-        <EmptyState title="No staff yet">Assign an umpire above — search your existing pool, or add someone new by their account ID.</EmptyState>
-      ) : (
-        <Table
-          columns={[
-            { key: "name", header: "Person", render: (m) => memberName(m.user_id, data.profiles) },
-            { key: "role", header: "Role" },
-          ]}
-          rows={data.members}
-        />
-      )}
+      {(() => {
+        const staff = data.members.filter((m) => ["umpire", "organizer", "admin"].includes(m.role));
+        const withAssignment = staff.map((m) => {
+          const asg = data.umpireAssignments.find((a) => a.user_id === m.user_id);
+          const match = asg ? data.matches.find((mm) => mm.id === asg.match_id) : null;
+          const court = match ? courtFor(match, data) : null;
+          return { ...m, match, court, isLive: match?.status === "in_progress" };
+        });
+        const activeCount = withAssignment.filter((m) => m.isLive).length;
+        const assignedCount = withAssignment.filter((m) => m.match && !m.isLive).length;
+        const availableCount = withAssignment.length - activeCount - assignedCount;
+        return (
+          <>
+            <div className="grid4">
+              <Stat value={withAssignment.length} label="Staff" />
+              <Stat tone={activeCount ? "hero live" : "hero"} value={activeCount} label="Currently umpiring" />
+              <Stat value={assignedCount} label="Assigned, not live" />
+              <Stat tone="quiet" value={availableCount} label="Available" />
+            </div>
+            <div className="section-label">Staff</div>
+            {withAssignment.length === 0 ? (
+              <EmptyState title="No staff yet">Assign an umpire above — search your existing pool, or add someone new by their account ID.</EmptyState>
+            ) : (
+              <div className="stack" style={{ gap: 8 }}>
+                {withAssignment.map((m) => (
+                  <Card key={m.id} className="row" style={{ justifyContent: "space-between", padding: "12px 16px" }}>
+                    <div>
+                      <strong>{memberName(m.user_id, data.profiles)}</strong>
+                      <div className="muted" style={{ fontSize: "var(--text-sm)" }}>
+                        {m.role}
+                        {m.match ? ` · ${sideOf(m.match.id, "A", data).name} vs ${sideOf(m.match.id, "B", data).name}${m.court ? ` · ${m.court.name}` : ""}` : " · Not currently assigned"}
+                      </div>
+                    </div>
+                    {m.isLive ? <Badge tone="live">● LIVE</Badge> : m.match ? <Badge tone="warn">Assigned</Badge> : <Badge tone="muted">Available</Badge>}
+                  </Card>
+                ))}
+              </div>
+            )}
+          </>
+        );
+      })()}
     </div>
   );
 }
@@ -1382,11 +1453,49 @@ function MatchTable({ data, rows, busy, run }) {
 }
 
 function MatchesPanel({ data, busy, run }) {
+  const [showCompleted, setShowCompleted] = useState(false);
   const rows = playableMatches(data.matches);
+  const live = rows.filter((m) => m.status === "in_progress");
+  const upcoming = rows.filter((m) => ["scheduled", "ready", "assigned"].includes(m.status));
+  const completed = rows.filter((m) => m.status === "completed" || m.status === "bye");
+  const other = rows.filter((m) => !live.includes(m) && !upcoming.includes(m) && !completed.includes(m));
+
   return (
     <div className="stack">
-      <p className="muted">Assign a court and umpire directly from the table below — changes save immediately.</p>
-      <MatchTable data={data} rows={rows} busy={busy} run={run} />
+      <div className="grid4">
+        <Stat value={rows.length} label="Total matches" />
+        <Stat tone={live.length ? "hero live" : "hero"} value={live.length} label="Live" />
+        <Stat value={upcoming.length} label="Upcoming" />
+        <Stat tone="quiet" value={completed.length} label="Completed" />
+      </div>
+
+      {live.length > 0 && (
+        <div>
+          <div className="section-label" style={{ color: "var(--live)" }}>● Live now</div>
+          <LiveTiles data={data} matches={live} onOpenLiveWindow={(matchId) => openLiveMatchWindow(data.tournament.id, matchId)} />
+        </div>
+      )}
+
+      <div>
+        <div className="section-label">Upcoming</div>
+        {upcoming.length === 0 ? (
+          <EmptyState title="Nothing queued">Generate a bracket and assign courts and umpires to schedule matches.</EmptyState>
+        ) : (
+          <MatchTable data={data} rows={upcoming.concat(other)} busy={busy} run={run} />
+        )}
+      </div>
+
+      {completed.length > 0 && (
+        <div>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <div className="section-label" style={{ margin: 0 }}>Completed ({completed.length})</div>
+            <Button variant="ghost" className="compact" onClick={() => setShowCompleted((v) => !v)}>
+              {showCompleted ? "Hide" : "Show"}
+            </Button>
+          </div>
+          {showCompleted && <MatchTable data={data} rows={completed} busy={busy} run={run} />}
+        </div>
+      )}
     </div>
   );
 }
