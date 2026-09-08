@@ -1,7 +1,7 @@
 "use strict";
 
-const GITHUB_UPDATE_OWNER = "jmdg840";
-const GITHUB_UPDATE_REPO = "tournament-operator-updates";
+const GITHUB_UPDATE_OWNER = "jmdg850-glitch";
+const GITHUB_UPDATE_REPO = "Tournament-And-Umpire-";
 
 function githubPublishConfig() {
   return {

@@ -47,7 +47,7 @@ test("initial state is idle and carries the installed version", () => {
 test("production feed publishes via the GitHub provider, not Supabase Storage", () => {
   const config = githubPublishConfig();
   assert.equal(config.provider, "github");
-  assert.equal(config.owner, "jmdg840");
-  assert.equal(config.repo, "tournament-operator-updates");
+  assert.equal(config.owner, "jmdg850-glitch");
+  assert.equal(config.repo, "Tournament-And-Umpire-");
   assert.doesNotMatch(JSON.stringify(config), /supabase/i);
 });

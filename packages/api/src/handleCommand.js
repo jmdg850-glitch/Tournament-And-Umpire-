@@ -46,7 +46,7 @@ function scoringSettings(config = {}) {
   };
 }
 
-async function commit(admin, batch, { command_id, type, actorId, actorDeviceId, tournamentId, matchId, result }) {
+async function commit(admin, batch, { command_id, type, actorId, actorDeviceId, tournamentId, matchId, result, detail }) {
   batch.upsert("command_receipts", {
     id: command_id,
     actor_id: actorDeviceId ? null : actorId,
@@ -63,7 +63,7 @@ async function commit(admin, batch, { command_id, type, actorId, actorDeviceId, 
     command_type: type,
     tournament_id: tournamentId ?? null,
     match_id: matchId ?? null,
-    detail: { ok: true },
+    detail: detail || { ok: true },
     created_at: nowIso(),
   });
   await applyBatch(admin, batch);
@@ -924,6 +924,119 @@ async function handleRemoveParticipant(admin, actor, payload, envelope) {
   });
 }
 
+const MATCH_PARTICIPANT_EDITABLE_STATUSES = new Set(["scheduled", "ready", "assigned", "postponed"]);
+
+// Changes who is assigned to one side of a not-yet-started match — e.g.
+// swapping a doubles partner. This never mutates the master `persons` record,
+// and never mutates the existing `participants`/`participant_members` rows
+// either (those may still be referenced by other matches — e.g. an earlier
+// completed round in the same bracket that this same pair already played).
+// Instead it creates a fresh participant with the new membership and
+// repoints only this match's `match_participants` row at it, leaving every
+// other match (past or future) that references the old participant intact.
+async function handleUpdateMatchParticipant(admin, actor, payload, envelope) {
+  requireUserActor(actor);
+  const match = await getMatch(admin, payload.match_id);
+  const member = await loadMember(admin, match.tournament_id, actor.id);
+  requireOrganizer(member);
+
+  const slot = payload.slot;
+  if (slot !== "A" && slot !== "B") throw httpError(400, "INVALID_COMMAND", "slot must be A or B");
+
+  if (!MATCH_PARTICIPANT_EDITABLE_STATUSES.has(match.status)) {
+    throw httpError(409, "MATCH_NOT_EDITABLE", "Players can only be changed before the match starts");
+  }
+
+  const { data: mp } = await admin.from("match_participants").select("*").eq("match_id", match.id).eq("slot", slot).maybeSingle();
+  if (!mp || !mp.participant_id) throw httpError(404, "NOT_FOUND", "No player pairing is assigned to this side yet");
+
+  const { data: oldParticipant } = await admin.from("participants").select("*").eq("id", mp.participant_id).maybeSingle();
+  if (!oldParticipant) throw httpError(404, "NOT_FOUND", "Current participant not found");
+
+  const { data: oldMemberRows } = await admin.from("participant_members").select("*").eq("participant_id", oldParticipant.id).order("slot");
+  const oldPersonIds = (oldMemberRows || []).map((m) => m.person_id);
+
+  const personIds = (payload.person_ids || []).filter(Boolean);
+  if (personIds.length !== oldPersonIds.length) {
+    throw httpError(400, "INVALID_COMMAND", `This side needs exactly ${oldPersonIds.length} player(s)`);
+  }
+  for (const personId of personIds) {
+    if (!isUuid(personId)) throw httpError(400, "INVALID_COMMAND", "person_ids must be UUIDs");
+  }
+  const { data: personsRows } = await admin.from("persons").select("id, display_name, tournament_id").in("id", [...new Set([...personIds, ...oldPersonIds])]);
+  const personById = new Map((personsRows || []).map((p) => [p.id, p]));
+  for (const personId of personIds) {
+    const person = personById.get(personId);
+    if (!person || person.tournament_id !== match.tournament_id) {
+      throw httpError(400, "INVALID_PLAYER", "Person is not in this tournament");
+    }
+  }
+
+  const division = await getDivision(admin, match.division_id);
+  const snapshot = await loadDivisionAssignment(admin, division.id);
+  const assigned = assignedPersonIds({
+    divisionTeams: snapshot.teams,
+    teamMembers: snapshot.teamMembers,
+    divisionParticipants: snapshot.participants,
+    participantMembers: snapshot.participantMembers,
+    exceptParticipantId: oldParticipant.id,
+    exceptParticipantTeamId: oldParticipant.team_id || null,
+  });
+  const check = validatePersonIdsForAssignment(personIds, assigned);
+  if (!check.ok) throw httpError(409, check.code, check.message);
+
+  const unchanged = personIds.length === oldPersonIds.length && personIds.every((id, i) => id === oldPersonIds[i]);
+  if (unchanged) throw httpError(400, "INVALID_COMMAND", "No player change to save");
+
+  const nameFor = (id) => personById.get(id)?.display_name || id;
+  const newParticipant = {
+    id: uuid(),
+    tournament_id: match.tournament_id,
+    division_id: division.id,
+    kind: oldParticipant.kind,
+    team_id: oldParticipant.team_id,
+    seed: oldParticipant.seed,
+    display_name: personIds.map(nameFor).join(" / "),
+    created_at: nowIso(),
+  };
+
+  const batch = createBatch();
+  batch.upsert("participants", newParticipant);
+  for (const [i, personId] of personIds.entries()) {
+    batch.upsert("participant_members", {
+      id: uuid(),
+      participant_id: newParticipant.id,
+      person_id: personId,
+      slot: i + 1,
+    });
+  }
+  batch.upsert("match_participants", {
+    id: mp.id,
+    match_id: match.id,
+    slot,
+    participant_id: newParticipant.id,
+    team_id: mp.team_id,
+  });
+
+  return commit(admin, batch, {
+    ...envelope,
+    ...actorCommit(actor),
+    tournamentId: match.tournament_id,
+    matchId: match.id,
+    result: { match_id: match.id, slot, participant: newParticipant },
+    detail: {
+      ok: true,
+      participant_change: {
+        match_id: match.id,
+        division_id: division.id,
+        slot,
+        old: { participant_id: oldParticipant.id, players: oldPersonIds.map((id) => ({ id, name: nameFor(id) })) },
+        new: { participant_id: newParticipant.id, players: personIds.map((id) => ({ id, name: nameFor(id) })) },
+      },
+    },
+  });
+}
+
 async function loadDivisionAssignment(admin, divisionId) {
   const { data: teams } = await admin.from("teams").select("*").eq("division_id", divisionId);
   const teamIds = (teams || []).map((t) => t.id);
@@ -1418,19 +1531,38 @@ async function handleCoinToss(admin, actor, payload, envelope) {
 async function handleScoreEvent(admin, actor, payload, envelope) {
   const match = await getMatch(admin, payload.match_id);
   await authorizeMatchOperation(admin, actor, match);
-  if (match.status !== "in_progress") {
-    throw httpError(409, "ILLEGAL_TRANSITION", "Match is not in progress");
-  }
-  if (!isUuid(payload.event_id)) throw httpError(400, "INVALID_COMMAND", "event_id must be a UUID");
   try {
-    assertAllowedScoreEventType(payload.type);
+    assertAllowedScoreEventType(payload.type, actor);
   } catch (err) {
     throw httpError(err.status || 403, err.code || "FORBIDDEN", err.message);
   }
-  if (typeof payload.seq !== "number") throw httpError(400, "INVALID_COMMAND", "seq is required");
-  const { data: dup } = await admin.from("score_events").select("id").eq("id", payload.event_id).maybeSingle();
+  const isCorrection = payload.type === "correction";
+  const wasCompleted = match.status === "completed";
   const division = await getDivision(admin, match.division_id);
   const settings = scoringSettings(division.config);
+  // Event-specific fields (scoreA/scoreB, and for a correction: reason /
+  // confirm_completed) live in the nested event payload, same place as every
+  // other score_event type's fields (e.g. payload.payload.team for "point").
+  const eventPayload = payload.event_payload || payload.payload || {};
+
+  if (wasCompleted) {
+    if (!isCorrection) throw httpError(409, "ILLEGAL_TRANSITION", "Match is not in progress");
+    if ((settings.bestOf || 1) > 1) {
+      throw httpError(409, "CORRECTION_UNSUPPORTED", "Correcting a completed multi-game match is not supported");
+    }
+    if (eventPayload.confirm_completed !== true) {
+      throw httpError(409, "CONFIRMATION_REQUIRED", "Correcting a completed match requires explicit confirmation");
+    }
+    if (typeof eventPayload.reason !== "string" || !eventPayload.reason.trim()) {
+      throw httpError(400, "REASON_REQUIRED", "A reason is required to correct a completed match");
+    }
+  } else if (match.status !== "in_progress") {
+    throw httpError(409, "ILLEGAL_TRANSITION", "Match is not in progress");
+  }
+
+  if (!isUuid(payload.event_id)) throw httpError(400, "INVALID_COMMAND", "event_id must be a UUID");
+  if (typeof payload.seq !== "number") throw httpError(400, "INVALID_COMMAND", "seq is required");
+  const { data: dup } = await admin.from("score_events").select("id").eq("id", payload.event_id).maybeSingle();
   const cached = match.score_state && typeof match.score_state.lastSeq === "number" ? match.score_state : null;
   const canFastForward = Boolean(cached) && payload.seq === cached.lastSeq + 1;
 
@@ -1448,16 +1580,28 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     id: payload.event_id,
     seq: payload.seq,
     type: payload.type,
-    payload: payload.event_payload || payload.payload || {},
+    payload: eventPayload,
   };
+  let base;
   let applied;
   try {
-    const base = canFastForward ? cached : await reducedState();
+    base = canFastForward ? cached : await reducedState();
     applied = applyScoreEvent(base, event);
   } catch (err) {
     throw httpError(409, err.code || "OUT_OF_ORDER", err.message);
   }
+  if (!applied.applied && !applied.duplicate) {
+    throw httpError(400, "INVALID_COMMAND", "That score event could not be applied");
+  }
   const state = applied.state;
+
+  // A completed match may only be corrected in a way that preserves the
+  // existing winner — anything else would require reversing bracket
+  // advancement/standings that already happened, which is out of scope.
+  if (isCorrection && wasCompleted && (state.status !== "completed" || state.winner !== match.score_state?.winner)) {
+    throw httpError(409, "WOULD_CHANGE_WINNER", "This correction would change the match winner. Corrections to a completed match cannot change the winner.");
+  }
+
   const batch = createBatch();
   batch.upsert("score_events", {
     id: event.id,
@@ -1468,22 +1612,51 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     ...scoreActor(actor),
     created_at: nowIso(),
   });
-  persistMatch(batch, { ...match, score_state: state });
+
   let progressed = null;
   let completed = null;
-  if (state.status === "completed") {
-    const fin = await finishMatchIfWon(admin, batch, { ...match, score_state: state }, state, actor.kind === "station" ? actor.deviceId : actor.id);
-    completed = fin.match;
-    progressed = fin.progressed;
+  let detail;
+  if (isCorrection) {
+    detail = {
+      ok: true,
+      correction: {
+        match_id: match.id,
+        game: state.gameNumber,
+        previous: { scoreA: base.scoreA ?? null, scoreB: base.scoreB ?? null },
+        next: { scoreA: state.scoreA, scoreB: state.scoreB },
+        reason: eventPayload.reason || null,
+      },
+    };
   }
+
+  if (wasCompleted) {
+    // Already-completed, same-winner correction (validated above): update the
+    // persisted score line only. finishMatchIfWon is NOT re-run — it asserts
+    // a genuine status transition into "completed" and would either throw or
+    // redundantly re-advance the bracket for a match that already advanced it.
+    persistMatch(batch, { ...match, score_state: state });
+    const { data: existingResult } = await admin.from("match_results").select("*").eq("match_id", match.id).maybeSingle();
+    if (existingResult) {
+      batch.upsert("match_results", { ...existingResult, games: state.games || [], score_a: state.scoreA, score_b: state.scoreB });
+    }
+  } else {
+    persistMatch(batch, { ...match, score_state: state });
+    if (state.status === "completed") {
+      const fin = await finishMatchIfWon(admin, batch, { ...match, score_state: state }, state, actor.kind === "station" ? actor.deviceId : actor.id);
+      completed = fin.match;
+      progressed = fin.progressed;
+    }
+  }
+
   const result = await commit(admin, batch, {
     ...envelope,
     ...actorCommit(actor),
     tournamentId: match.tournament_id,
     matchId: match.id,
     result: { match: completed || { ...match, score_state: state }, score_state: state, duplicate: false, progressed },
+    detail,
   });
-  if (state.status === "completed") {
+  if (!wasCompleted && state.status === "completed") {
     await reconcilePlayoffChildren(admin, match.division_id);
   }
   return result;
@@ -1635,6 +1808,7 @@ const HANDLERS = {
   remove_team_member: handleRemoveTeamMember,
   register_participant: handleRegisterParticipant,
   remove_participant: handleRemoveParticipant,
+  update_match_participant: handleUpdateMatchParticipant,
   create_court: handleCreateCourt,
   add_member: handleAddMember,
   generate_bracket: handleGenerateBracket,

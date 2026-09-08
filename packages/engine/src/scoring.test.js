@@ -305,3 +305,96 @@ describe("applyScoreEvent — doubles serve number", () => {
     expect(serveStatusLabel(st)).toBe("SECOND SERVE");
   });
 });
+
+function correction(state, scoreA, scoreB, seq, id = `c${seq}`) {
+  return applyScoreEvent(state, ev(id, "correction", seq, { scoreA, scoreB }));
+}
+
+describe("applyScoreEvent — correction", () => {
+  test("directly sets the current score, reusing the same win-check as normal scoring", () => {
+    let st = createInitialScoreState(settings);
+    st = applyPoint(st, "a", 1).state;
+    expect(st.scoreA).toBe(1);
+    expect(st.scoreB).toBe(0);
+    const r = correction(st, 8, 6, 2);
+    expect(r.applied).toBe(true);
+    expect(r.state.scoreA).toBe(8);
+    expect(r.state.scoreB).toBe(6);
+    expect(r.state.status).toBe("in_progress");
+    expect(r.state.winner).toBe(null);
+    expect(r.state.lastSeq).toBe(2);
+  });
+
+  test("normal scoring continues from the corrected score, not the pre-correction score", () => {
+    let st = createInitialScoreState(settings);
+    st = correction(st, 8, 6, 1).state;
+    st = applyPoint(st, "a", 2).state;
+    expect(st.scoreA).toBe(9);
+    expect(st.scoreB).toBe(6);
+  });
+
+  test("a correction that reaches the win condition completes the match, same as a normal point would", () => {
+    let st = createInitialScoreState(settings);
+    const r = correction(st, 10, 7, 1);
+    expect(r.state.status).toBe("in_progress");
+    const r2 = correction(r.state, 11, 7, 2);
+    expect(r2.state.status).toBe("completed");
+    expect(r2.state.winner).toBe("A");
+  });
+
+  test("server/servingTeam/courtSide are preserved through a correction, not re-derived", () => {
+    let st = createInitialScoreState({ ...settings, isDoubles: true });
+    st = applyPoint(st, "b", 1).state; // side-out: servingTeam -> B, server -> FIRST_SERVE
+    expect(st.servingTeam).toBe("B");
+    expect(st.server).toBe(FIRST_SERVE);
+    const r = correction(st, 8, 6, 2);
+    expect(r.state.servingTeam).toBe("B");
+    expect(r.state.server).toBe(FIRST_SERVE);
+  });
+
+  test("a lower correction that keeps the same winner is applied normally", () => {
+    let st = createInitialScoreState(settings);
+    st = correction(st, 11, 9, 1).state;
+    expect(st.status).toBe("completed");
+    expect(st.winner).toBe("A");
+    const r = correction(st, 11, 7, 2);
+    expect(r.applied).toBe(true);
+    expect(r.state.scoreA).toBe(11);
+    expect(r.state.scoreB).toBe(7);
+    expect(r.state.winner).toBe("A");
+    expect(r.state.status).toBe("completed");
+  });
+
+  test("a correction that would flip the winner is applied by the reducer (the API layer is responsible for rejecting it before persisting)", () => {
+    let st = createInitialScoreState(settings);
+    st = correction(st, 11, 9, 1).state;
+    expect(st.winner).toBe("A");
+    const r = correction(st, 7, 11, 2);
+    expect(r.applied).toBe(true);
+    expect(r.state.winner).toBe("B");
+  });
+
+  test("rejects non-integer, negative, or missing scores without applying", () => {
+    const st = createInitialScoreState(settings);
+    expect(correction(st, 1.5, 6, 1).applied).toBe(false);
+    expect(correction(st, -1, 6, 1).applied).toBe(false);
+    expect(correction(st, "8", 6, 1).applied).toBe(false);
+    expect(correction(st, null, 6, 1).applied).toBe(false);
+    expect(correction(st, undefined, 6, 1).applied).toBe(false);
+  });
+
+  test("does not increment rally count (a correction is not a rally)", () => {
+    let st = createInitialScoreState(settings);
+    st = applyPoint(st, "a", 1).state;
+    const rallyBefore = st.rally;
+    const r = correction(st, 8, 6, 2);
+    expect(r.state.rally).toBe(rallyBefore);
+  });
+
+  test("duplicate correction event_id is a no-op, same as any other event type", () => {
+    let st = createInitialScoreState(settings);
+    const first = correction(st, 8, 6, 1, "dup-1");
+    const second = correction(first.state, 10, 7, 1, "dup-1");
+    expect(second.duplicate).toBe(true);
+  });
+});

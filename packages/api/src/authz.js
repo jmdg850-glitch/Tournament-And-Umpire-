@@ -47,7 +47,14 @@ export function assertStationMayIssue(actor, type, payload) {
   }
 }
 
-export function assertAllowedScoreEventType(type) {
+// "correction" (manual score edit) is deliberately excluded from
+// STATION_SCORE_EVENT_TYPES — a paired court-tablet device is not an
+// authenticated user and must not be able to issue a score correction, only
+// authenticated organizer/umpire actors can (see handleScoreEvent).
+const USER_ONLY_SCORE_EVENT_TYPES = new Set(["correction"]);
+
+export function assertAllowedScoreEventType(type, actor) {
+  if (actor?.kind !== "station" && USER_ONLY_SCORE_EVENT_TYPES.has(type)) return;
   if (!STATION_SCORE_EVENT_TYPES.has(type)) {
     forbid("This scoring action is not allowed");
   }

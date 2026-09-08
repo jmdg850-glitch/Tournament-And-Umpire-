@@ -341,7 +341,9 @@ if (pushStatus !== 0) {
 
 // --- 12/13. Publish Windows GitHub Release ---
 logStep("Publish Windows GitHub Release");
-const releaseOwner = JSON.parse(readFileSync(operatorPkgPath, "utf8")).build?.publish?.owner;
+const operatorPkgForPublish = JSON.parse(readFileSync(operatorPkgPath, "utf8"));
+const releaseOwner = operatorPkgForPublish.build?.publish?.owner;
+const releaseRepo = operatorPkgForPublish.build?.publish?.repo;
 try {
   ensureGhAccountActive(releaseOwner);
 } catch (err) {
@@ -386,7 +388,7 @@ Working tree: CLEAN
 
 GitHub Release:
 v${nextOperatorVersion}
-Published: YES (jmdg840/tournament-operator-updates)
+Published: YES (${releaseOwner}/${releaseRepo})
 
 Auto-update metadata:
 latest.yml: PASS

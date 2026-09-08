@@ -14,6 +14,7 @@ import {
   EmptyState,
   Input,
   LoadingState,
+  Modal,
   Scoreboard,
   StatusBadge,
 } from "@tournament/ui";
@@ -539,6 +540,106 @@ function CourtQueue({ cfg, station, setStation, onOpen, onUnpair }) {
   );
 }
 
+// Edit Score / Instant Score Entry — sends a "correction" score_event through
+// the same command/engine/audit pipeline as normal point-scoring (see
+// packages/engine/src/scoring.js applyScoreEvent's "correction" case and
+// packages/api/src/handleCommand.js handleScoreEvent). Never mutates the
+// score locally beyond what the server confirms.
+function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose }) {
+  const state = match.score_state || {};
+  const wasCompleted = match.status === "completed";
+  const [scoreA, setScoreA] = useState(String(state.scoreA ?? 0));
+  const [scoreB, setScoreB] = useState(String(state.scoreB ?? 0));
+  const [reason, setReason] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  function digitsOnly(v) { return v.replace(/[^0-9]/g, "").slice(0, 4); }
+  function step(setter, value, delta) {
+    const n = Math.max(0, (Number.parseInt(value, 10) || 0) + delta);
+    setter(String(n));
+  }
+
+  const nextA = Number.parseInt(scoreA, 10);
+  const nextB = Number.parseInt(scoreB, 10);
+  const validNumbers = scoreA !== "" && scoreB !== "" && Number.isInteger(nextA) && Number.isInteger(nextB) && nextA >= 0 && nextB >= 0;
+  const unchanged = validNumbers && nextA === (state.scoreA ?? 0) && nextB === (state.scoreB ?? 0);
+  const reasonOk = !wasCompleted || reason.trim().length > 0;
+  const canContinue = validNumbers && !unchanged && reasonOk && !busy;
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      await sendCorrection({
+        scoreA: nextA,
+        scoreB: nextB,
+        reason: reason.trim() || undefined,
+        ...(wasCompleted ? { confirm_completed: true } : {}),
+      });
+      onClose();
+    } catch (err) {
+      setError(err.message || "Could not save the correction");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="Edit score" onClose={() => !busy && onClose()}>
+      <div className="stack">
+        {wasCompleted && (
+          <Alert>
+            This match is already completed. This correction updates the recorded score only — it cannot change the winner. Standings and bracket progression are not affected.
+          </Alert>
+        )}
+        <p className="muted" style={{ margin: 0 }}>Game {state.gameNumber || 1} · {nameA} vs {nameB}</p>
+        <div className="row" style={{ alignItems: "flex-end" }}>
+          <div className="stack" style={{ gap: 4 }}>
+            <Input label={nameA} inputMode="numeric" value={scoreA} onChange={(e) => setScoreA(digitsOnly(e.target.value))} />
+            <div className="row" style={{ gap: 6 }}>
+              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreA, scoreA, -1)} disabled={busy}>−1</Button>
+              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreA, scoreA, 1)} disabled={busy}>+1</Button>
+            </div>
+          </div>
+          <div className="stack" style={{ gap: 4 }}>
+            <Input label={nameB} inputMode="numeric" value={scoreB} onChange={(e) => setScoreB(digitsOnly(e.target.value))} />
+            <div className="row" style={{ gap: 6 }}>
+              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreB, scoreB, -1)} disabled={busy}>−1</Button>
+              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreB, scoreB, 1)} disabled={busy}>+1</Button>
+            </div>
+          </div>
+        </div>
+        <Input
+          label={wasCompleted ? "Reason (required)" : "Reason (optional)"}
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Why is this score being corrected?"
+        />
+        {error && <Alert>{error}</Alert>}
+        {!confirming ? (
+          <div className="row">
+            <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
+            <Button type="button" disabled={!canContinue} onClick={() => setConfirming(true)}>Save score</Button>
+          </div>
+        ) : (
+          <>
+            <p style={{ margin: 0 }}>
+              Change score from {state.scoreA ?? 0}–{state.scoreB ?? 0} to {nextA}–{nextB}?
+              {wasCompleted ? " This match is completed — the correction will be audited." : ""}
+            </p>
+            <div className="row">
+              <Button type="button" variant="secondary" onClick={() => setConfirming(false)} disabled={busy}>Back</Button>
+              <Button type="button" disabled={busy} onClick={submit}>{busy ? "Saving…" : "Apply correction"}</Button>
+            </div>
+          </>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut }) {
   const [match, setMatch] = useState(null);
   const [sides, setSides] = useState([]);
@@ -550,6 +651,7 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   const [pending, setPending] = useState(0);
   const [confirmComplete, setConfirmComplete] = useState(false);
   const [confirmUndo, setConfirmUndo] = useState(false);
+  const [showEditScore, setShowEditScore] = useState(false);
   const matchRef = useRef(null);
   const seqRef = useRef(0);
   const epochRef = useRef(0);
@@ -652,6 +754,36 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
     } catch (err) {
       setError(err.message);
       await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendCorrection(correctionPayload) {
+    const current = matchRef.current;
+    if (!current) return;
+    setBusy(true);
+    setError("");
+    try {
+      const body = await sendCommand({
+        commandUrl: cfg.commandUrl,
+        accessToken: session.access_token,
+        publishableKey: cfg.publishableKey,
+        type: "score_event",
+        payload: {
+          match_id: current.id,
+          event_id: crypto.randomUUID(),
+          seq: seqRef.current + 1,
+          type: "correction",
+          payload: correctionPayload,
+        },
+      });
+      if (body.result) applyResult(body.result);
+      return body.result;
+    } catch (err) {
+      setError(err.message);
+      await load();
+      throw err;
     } finally {
       setBusy(false);
     }
@@ -839,9 +971,14 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
                 Point {nameB}
               </Button>
             </div>
-            <Button variant="secondary" disabled={busy || pending > 0} onClick={() => setConfirmUndo(true)}>
-              Undo last point
-            </Button>
+            <div className="row">
+              <Button variant="secondary" disabled={busy || pending > 0} onClick={() => setConfirmUndo(true)}>
+                Undo last point
+              </Button>
+              <Button variant="ghost" className="compact" disabled={pending > 0} onClick={() => setShowEditScore(true)}>
+                Edit score
+              </Button>
+            </div>
           </>
         )}
 
@@ -855,9 +992,22 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
             <h2>Winner {winnerName}</h2>
             <p>Final score {gamesA} – {gamesB}</p>
             <p className="muted">{score.scoreA ?? 0}–{score.scoreB ?? 0} in the last game</p>
+            <Button variant="ghost" className="compact" onClick={() => setShowEditScore(true)}>
+              Edit score
+            </Button>
           </Card>
         )}
       </div>
+
+      {showEditScore && (
+        <EditScoreModal
+          match={match}
+          nameA={nameA}
+          nameB={nameB}
+          sendCorrection={sendCorrection}
+          onClose={() => setShowEditScore(false)}
+        />
+      )}
 
       {confirmComplete && (
         <ConfirmDialog

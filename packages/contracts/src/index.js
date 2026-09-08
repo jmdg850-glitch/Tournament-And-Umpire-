@@ -12,6 +12,7 @@ export const COMMAND_TYPES = Object.freeze([
   "remove_team_member",
   "register_participant",
   "remove_participant",
+  "update_match_participant",
   "create_court",
   "add_member",
   "generate_bracket",

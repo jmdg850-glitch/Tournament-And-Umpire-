@@ -55,6 +55,13 @@ describe("station command allowlist", () => {
   test("organizer actors are not blocked by the station allowlist", () => {
     expect(() => assertStationMayIssue({ kind: "user" }, "transition_match", {})).not.toThrow();
   });
+
+  test("a score correction is allowed for user actors but forbidden for stations", () => {
+    expect(() => assertAllowedScoreEventType("correction", { kind: "user", id: "u1" })).not.toThrow();
+    expect(() => assertAllowedScoreEventType("correction")).not.toThrow(); // no actor (defensive default) is treated as a user
+    expect(() => assertAllowedScoreEventType("correction", { kind: "station", deviceId: "d1" })).toThrow(/not allowed/i);
+    expect(() => assertStationMayIssue({ kind: "station" }, "score_event", { type: "correction" })).toThrow(/scoring action/i);
+  });
 });
 
 describe("command envelope", () => {

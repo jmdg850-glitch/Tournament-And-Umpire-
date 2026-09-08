@@ -9,6 +9,7 @@ import {
   EmptyState,
   Input,
   LoadingState,
+  Modal,
   NavGroup,
   NavItem,
   PageHeader,
@@ -371,7 +372,7 @@ export default function TournamentDesk({ supabase, session, command, tournamentI
               onGoto={setTab}
             />
           )}
-          {tab === "live" && <LivePanel data={data} live={live} upcoming={upcoming} tournamentId={t.id} />}
+          {tab === "live" && <LivePanel data={data} live={live} upcoming={upcoming} tournamentId={t.id} command={command} load={load} />}
           {tab === "brackets" && <BracketsPanel data={data} />}
           {tab === "settings" && <SettingsPanel t={t} busy={busy} run={run} />}
           {tab === "divisions" && <DivisionsPanel data={data} busy={busy} run={run} />}
@@ -379,7 +380,7 @@ export default function TournamentDesk({ supabase, session, command, tournamentI
           {tab === "teams" && <TeamsPanel data={data} busy={busy} run={run} />}
           {tab === "courts" && <CourtsPanel data={data} busy={busy} run={run} />}
           {tab === "umpires" && <UmpiresPanel data={data} session={session} busy={busy} run={run} />}
-          {tab === "matches" && <MatchesPanel data={data} busy={busy} run={run} />}
+          {tab === "matches" && <MatchesPanel data={data} busy={busy} run={run} command={command} load={load} />}
           {tab === "results" && <ResultsPanel data={data} />}
     </PageShell>
   );
@@ -470,7 +471,96 @@ function OverviewPanel({ data, t, nextStatus, busy, run, live, upcoming, complet
   );
 }
 
-function LiveTiles({ data, matches, onOpenLiveWindow }) {
+// Edit Score / Instant Score Entry — sends a "correction" score_event through
+// the same command/engine/audit pipeline as normal point-scoring (see
+// packages/engine/src/scoring.js applyScoreEvent's "correction" case and
+// packages/api/src/handleCommand.js handleScoreEvent). Only reachable for
+// live (in-progress) matches from this entry point.
+function EditScoreModal({ match, nameA, nameB, command, onClose, onSaved }) {
+  const state = match.score_state || {};
+  const [scoreA, setScoreA] = useState(String(state.scoreA ?? 0));
+  const [scoreB, setScoreB] = useState(String(state.scoreB ?? 0));
+  const [reason, setReason] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  function digitsOnly(v) { return v.replace(/[^0-9]/g, "").slice(0, 4); }
+  function step(setter, value, delta) {
+    const n = Math.max(0, (Number.parseInt(value, 10) || 0) + delta);
+    setter(String(n));
+  }
+
+  const nextA = Number.parseInt(scoreA, 10);
+  const nextB = Number.parseInt(scoreB, 10);
+  const validNumbers = scoreA !== "" && scoreB !== "" && Number.isInteger(nextA) && Number.isInteger(nextB) && nextA >= 0 && nextB >= 0;
+  const unchanged = validNumbers && nextA === (state.scoreA ?? 0) && nextB === (state.scoreB ?? 0);
+  const canContinue = validNumbers && !unchanged && !busy;
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      await command("score_event", {
+        match_id: match.id,
+        event_id: crypto.randomUUID(),
+        seq: (state.lastSeq || 0) + 1,
+        type: "correction",
+        payload: { scoreA: nextA, scoreB: nextB, reason: reason.trim() || undefined },
+      });
+      await onSaved?.();
+      onClose();
+    } catch (err) {
+      setError(err.message || "Could not save the correction");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="Edit score" onClose={() => !busy && onClose()}>
+      <div className="stack">
+        <p className="muted" style={{ margin: 0 }}>Game {state.gameNumber || 1} · {nameA} vs {nameB}</p>
+        <div className="row" style={{ alignItems: "flex-end" }}>
+          <div className="stack" style={{ gap: 4 }}>
+            <Input label={nameA} inputMode="numeric" value={scoreA} onChange={(e) => setScoreA(digitsOnly(e.target.value))} />
+            <div className="row" style={{ gap: 6 }}>
+              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreA, scoreA, -1)} disabled={busy}>−1</Button>
+              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreA, scoreA, 1)} disabled={busy}>+1</Button>
+            </div>
+          </div>
+          <div className="stack" style={{ gap: 4 }}>
+            <Input label={nameB} inputMode="numeric" value={scoreB} onChange={(e) => setScoreB(digitsOnly(e.target.value))} />
+            <div className="row" style={{ gap: 6 }}>
+              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreB, scoreB, -1)} disabled={busy}>−1</Button>
+              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreB, scoreB, 1)} disabled={busy}>+1</Button>
+            </div>
+          </div>
+        </div>
+        <Input label="Reason (optional)" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why is this score being corrected?" />
+        {error && <Alert>{error}</Alert>}
+        {!confirming ? (
+          <div className="row">
+            <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
+            <Button type="button" disabled={!canContinue} onClick={() => setConfirming(true)}>Save score</Button>
+          </div>
+        ) : (
+          <>
+            <p style={{ margin: 0 }}>Change score from {state.scoreA ?? 0}–{state.scoreB ?? 0} to {nextA}–{nextB}?</p>
+            <div className="row">
+              <Button type="button" variant="secondary" onClick={() => setConfirming(false)} disabled={busy}>Back</Button>
+              <Button type="button" disabled={busy} onClick={submit}>{busy ? "Saving…" : "Apply correction"}</Button>
+            </div>
+          </>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
+  const [editingId, setEditingId] = useState(null);
+  const editingMatch = editingId ? matches.find((m) => m.id === editingId) : null;
   return (
     <div className="live-strip">
       {matches.map((m) => {
@@ -500,21 +590,41 @@ function LiveTiles({ data, matches, onOpenLiveWindow }) {
                 Open Live <ExternalLink size={15} aria-hidden="true" />
               </Button>
             ) : null}
+            {command ? (
+              <Button
+                variant="ghost"
+                className="compact"
+                style={{ marginTop: 6, width: "100%" }}
+                onClick={() => setEditingId(m.id)}
+              >
+                Edit score
+              </Button>
+            ) : null}
           </div>
         );
       })}
+      {editingMatch && (
+        <EditScoreModal
+          match={editingMatch}
+          nameA={sideOf(editingMatch.id, "A", data).name}
+          nameB={sideOf(editingMatch.id, "B", data).name}
+          command={command}
+          onClose={() => setEditingId(null)}
+          onSaved={load}
+        />
+      )}
     </div>
   );
 }
 
-function LivePanel({ data, live, upcoming, tournamentId }) {
+function LivePanel({ data, live, upcoming, tournamentId, command, load }) {
   return (
     <div className="stack">
       <h2>Live</h2>
       {live.length === 0 ? (
         <EmptyState title="No live matches">Assigned matches appear here when an umpire starts them.</EmptyState>
       ) : (
-        <LiveTiles data={data} matches={live} onOpenLiveWindow={(matchId) => openLiveMatchWindow(tournamentId, matchId)} />
+        <LiveTiles data={data} matches={live} onOpenLiveWindow={(matchId) => openLiveMatchWindow(tournamentId, matchId)} command={command} load={load} />
       )}
       <h2>Upcoming</h2>
       {upcoming.length === 0 ? (
@@ -1393,8 +1503,123 @@ function UmpiresPanel({ data, session, busy, run }) {
   );
 }
 
-function MatchTable({ data, rows, busy, run }) {
+const EDITABLE_PLAYERS_STATUSES = new Set(["scheduled", "ready", "assigned", "postponed"]);
+
+// Edit Players / Change Partner — repoints one side's player pairing for a
+// not-yet-started match via update_match_participant (see
+// packages/api/src/handleCommand.js). This never edits the master `persons`
+// record and never mutates the existing participant/pairing in place — the
+// server creates a fresh pairing and repoints only this match's assignment,
+// so any other match that already used the old pairing (e.g. an earlier
+// completed round) is left untouched.
+function EditPlayersModal({ match, data, command, onClose, onSaved }) {
+  const sides = ["A", "B"].map((slot) => {
+    const side = sideOf(match.id, slot, data);
+    const members = side.participant ? membersOfParticipant(side.participant.id, data.participantMembers) : [];
+    return { slot, participant: side.participant, name: side.name, personIds: members.map((m) => m.person_id) };
+  });
+
+  const [selected, setSelected] = useState(() =>
+    Object.fromEntries(sides.map((s) => [s.slot, [...s.personIds]]))
+  );
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  function optionsFor(side, slotIndex) {
+    if (!side.participant) return [];
+    const assigned = assignedPersonIdsInDivision(data, match.division_id, { exceptParticipantId: side.participant.id });
+    const others = selected[side.slot].filter((_, i) => i !== slotIndex);
+    return data.persons.filter((p) => !assigned.has(p.id) && !others.includes(p.id));
+  }
+
+  function setPlayer(slot, index, personId) {
+    setSelected((prev) => {
+      const next = [...prev[slot]];
+      next[index] = personId;
+      return { ...prev, [slot]: next };
+    });
+    setError("");
+  }
+
+  const changedSlots = sides.filter((s) => s.participant && selected[s.slot].some((id, i) => id !== s.personIds[i]));
+  const allValid = sides.every((s) => !s.participant || selected[s.slot].every(Boolean));
+  const noDuplicates = sides.every((s) => new Set(selected[s.slot]).size === selected[s.slot].length);
+  const canContinue = allValid && noDuplicates && changedSlots.length > 0 && !busy;
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      for (const s of changedSlots) {
+        await command("update_match_participant", { match_id: match.id, slot: s.slot, person_ids: selected[s.slot] });
+      }
+      await onSaved?.();
+      onClose();
+    } catch (err) {
+      setError(err.message || "Could not save the player change");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
+    <Modal title="Edit players" onClose={() => !busy && onClose()}>
+      <div className="stack">
+        {sides.map((side) => (
+          <div key={side.slot} className="stack" style={{ gap: 6 }}>
+            <h3 style={{ margin: 0 }}>Team {side.slot}</h3>
+            {!side.participant ? (
+              <p className="muted" style={{ margin: 0 }}>Not assigned yet.</p>
+            ) : (
+              side.personIds.map((personId, i) => (
+                <Select
+                  key={i}
+                  label={`Player ${i + 1}`}
+                  value={selected[side.slot][i]}
+                  disabled={busy}
+                  onChange={(e) => setPlayer(side.slot, i, e.target.value)}
+                >
+                  {optionsFor(side, i).map((p) => (
+                    <option key={p.id} value={p.id}>{p.display_name}</option>
+                  ))}
+                </Select>
+              ))
+            )}
+          </div>
+        ))}
+        {error && <Alert>{error}</Alert>}
+        {!confirming ? (
+          <div className="row">
+            <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
+            <Button type="button" disabled={!canContinue} onClick={() => setConfirming(true)}>Save changes</Button>
+          </div>
+        ) : (
+          <>
+            <p style={{ margin: 0 }}>Change player assignment?</p>
+            {changedSlots.map((s) => (
+              <p key={s.slot} className="muted" style={{ margin: 0 }}>
+                Team {s.slot}: {s.personIds.map((id) => personLabel(id, data.persons)).join(" / ")}
+                {" → "}
+                {selected[s.slot].map((id) => personLabel(id, data.persons)).join(" / ")}
+              </p>
+            ))}
+            <div className="row">
+              <Button type="button" variant="secondary" onClick={() => setConfirming(false)} disabled={busy}>Back</Button>
+              <Button type="button" disabled={busy} onClick={submit}>{busy ? "Saving…" : "Confirm change"}</Button>
+            </div>
+          </>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function MatchTable({ data, rows, busy, run, command, load }) {
+  const [editingPlayersId, setEditingPlayersId] = useState(null);
+  const editingPlayersMatch = editingPlayersId ? rows.find((m) => m.id === editingPlayersId) : null;
+  return (
+    <>
     <Table
       responsive
       columns={[
@@ -1444,15 +1669,38 @@ function MatchTable({ data, rows, busy, run }) {
             </Select>
           ) : (umpireFor(m, data)?.name || "—"),
         },
+        ...(command ? [{
+          key: "players",
+          header: "",
+          render: (m) => EDITABLE_PLAYERS_STATUSES.has(m.status) ? (
+            <Button variant="ghost" className="compact" onClick={() => setEditingPlayersId(m.id)}>
+              Edit players
+            </Button>
+          ) : (
+            <span className="muted" style={{ fontSize: "var(--text-xs)" }}>
+              {m.status === "in_progress" ? "Locked — match started" : "Locked — match completed"}
+            </span>
+          ),
+        }] : []),
       ]}
       rows={rows}
       rowProps={(m) => ({ "data-live": m.status === "in_progress" ? "true" : undefined })}
       empty={<EmptyState title="No matches">Generate a bracket from Divisions.</EmptyState>}
     />
+    {editingPlayersMatch && (
+      <EditPlayersModal
+        match={editingPlayersMatch}
+        data={data}
+        command={command}
+        onClose={() => setEditingPlayersId(null)}
+        onSaved={load}
+      />
+    )}
+    </>
   );
 }
 
-function MatchesPanel({ data, busy, run }) {
+function MatchesPanel({ data, busy, run, command, load }) {
   const [showCompleted, setShowCompleted] = useState(false);
   const rows = playableMatches(data.matches);
   const live = rows.filter((m) => m.status === "in_progress");
@@ -1472,7 +1720,7 @@ function MatchesPanel({ data, busy, run }) {
       {live.length > 0 && (
         <div>
           <div className="section-label" style={{ color: "var(--live)" }}>● Live now</div>
-          <LiveTiles data={data} matches={live} onOpenLiveWindow={(matchId) => openLiveMatchWindow(data.tournament.id, matchId)} />
+          <LiveTiles data={data} matches={live} onOpenLiveWindow={(matchId) => openLiveMatchWindow(data.tournament.id, matchId)} command={command} load={load} />
         </div>
       )}
 
@@ -1481,7 +1729,7 @@ function MatchesPanel({ data, busy, run }) {
         {upcoming.length === 0 ? (
           <EmptyState title="Nothing queued">Generate a bracket and assign courts and umpires to schedule matches.</EmptyState>
         ) : (
-          <MatchTable data={data} rows={upcoming.concat(other)} busy={busy} run={run} />
+          <MatchTable data={data} rows={upcoming.concat(other)} busy={busy} run={run} command={command} load={load} />
         )}
       </div>
 

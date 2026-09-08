@@ -135,23 +135,21 @@ export function createInitialScoreState(settings = {}) {
   };
 }
 
-// Same best-of-N / side-out rules as the original applyPoint.
-function applyPoint(st, team) {
-  const snap = { scoreA: st.scoreA, scoreB: st.scoreB, server: st.server, servingTeam: st.servingTeam };
-  let { scoreA, scoreB, server, servingTeam, isDoubles } = st;
-  const hist = [...st.history, snap];
-  if (team === servingTeam) { if (team === "A") scoreA++; else scoreB++; }
-  else if (isDoubles) { if (server === 1) server = 2; else { server = 1; servingTeam = servingTeam === "A" ? "B" : "A"; } }
-  else { servingTeam = servingTeam === "A" ? "B" : "A"; server = 1; }
-
+// The single authoritative implementation of "given a new current-game score,
+// determine game/match winner and advance state accordingly." Both normal
+// point-scoring (applyPoint) and a manual score correction (applyCorrection)
+// funnel through this so there is never a second, drifting copy of
+// winner/game/match settlement logic.
+function settleScore(st, scoreA, scoreB, server, servingTeam, hist, rallyDelta) {
   const gameWinner = checkGameWin(scoreA, scoreB, st.winTo, st.winBy);
   const bestOf = st.bestOf || 1;
+  const rally = st.rally + rallyDelta;
 
   if (!gameWinner) {
-    return { ...st, scoreA, scoreB, server, servingTeam, history: hist, winner: null, status: "in_progress", rally: st.rally + 1 };
+    return { ...st, scoreA, scoreB, server, servingTeam, history: hist, winner: null, status: "in_progress", rally };
   }
   if (bestOf <= 1) {
-    return { ...st, scoreA, scoreB, server, servingTeam, history: hist, winner: gameWinner, status: "completed", rally: st.rally + 1 };
+    return { ...st, scoreA, scoreB, server, servingTeam, history: hist, winner: gameWinner, status: "completed", rally };
   }
 
   const games = [...st.games, { scoreA, scoreB, winner: gameWinner, history: hist }];
@@ -161,10 +159,35 @@ function applyPoint(st, team) {
   const matchWinner = gamesWonA >= needed ? "A" : gamesWonB >= needed ? "B" : null;
   if (matchWinner) {
     return { ...st, scoreA, scoreB, server, servingTeam, history: hist, games, gamesWonA, gamesWonB,
-      winner: matchWinner, status: "completed", rally: st.rally + 1 };
+      winner: matchWinner, status: "completed", rally };
   }
   return { ...st, scoreA: 0, scoreB: 0, server: SECOND_SERVE, servingTeam: "A", history: [], games, gamesWonA, gamesWonB,
-    gameNumber: st.gameNumber + 1, winner: null, status: "in_progress", rally: st.rally + 1 };
+    gameNumber: st.gameNumber + 1, winner: null, status: "in_progress", rally };
+}
+
+// Same best-of-N / side-out rules as the original applyPoint.
+function applyPoint(st, team) {
+  const snap = { scoreA: st.scoreA, scoreB: st.scoreB, server: st.server, servingTeam: st.servingTeam };
+  let { scoreA, scoreB, server, servingTeam, isDoubles } = st;
+  const hist = [...st.history, snap];
+  if (team === servingTeam) { if (team === "A") scoreA++; else scoreB++; }
+  else if (isDoubles) { if (server === 1) server = 2; else { server = 1; servingTeam = servingTeam === "A" ? "B" : "A"; } }
+  else { servingTeam = servingTeam === "A" ? "B" : "A"; server = 1; }
+
+  return settleScore(st, scoreA, scoreB, server, servingTeam, hist, 1);
+}
+
+// A manual score correction: directly sets the current game's score (does not
+// increment rally count, and deliberately leaves server/servingTeam/courtSide
+// untouched — a corrected score jump doesn't imply any particular serve state,
+// so the umpire/organizer is responsible for confirming serve after a
+// correction if needed). Reuses settleScore so winner/game/match-completion
+// consistency is identical to normal point-scoring, not a second
+// implementation of the same rules.
+function applyCorrection(st, scoreA, scoreB) {
+  const snap = { scoreA: st.scoreA, scoreB: st.scoreB, server: st.server, servingTeam: st.servingTeam };
+  const hist = [...st.history, snap];
+  return settleScore(st, scoreA, scoreB, st.server, st.servingTeam, hist, 0);
 }
 
 function undoPoint(st) {
@@ -228,6 +251,13 @@ export function applyScoreEvent(state, event) {
     const team = normalizeTeam(payload.team);
     if (!team) return { state, applied: false };
     next = callTimeout(state, team, payload.calledAt);
+  } else if (event.type === "correction") {
+    const scoreA = payload.scoreA;
+    const scoreB = payload.scoreB;
+    if (!Number.isInteger(scoreA) || !Number.isInteger(scoreB) || scoreA < 0 || scoreB < 0) {
+      return { state, applied: false };
+    }
+    next = applyCorrection(state, scoreA, scoreB);
   } else if (event.type === "coin_toss") {
     if (state.coinToss != null && state.coinToss !== "") {
       return { state, applied: false, duplicate: true };

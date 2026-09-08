@@ -716,3 +716,352 @@ describe.skipIf(!live)("court station pairing", () => {
     expect(r.body.ok).toBe(false);
   }, 120_000);
 });
+
+async function setupCorrectionMatch(organizer, umpire, config) {
+  let r = await expectOk(organizer.token, "create_tournament", { name: `SC ${Date.now()}` });
+  const tournamentId = r.body.result.tournament.id;
+  await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+  r = await expectOk(organizer.token, "create_division", {
+    tournament_id: tournamentId,
+    name: "Correction",
+    format: "single_elim",
+    config,
+  });
+  const divisionId = r.body.result.division.id;
+  const persons = [];
+  for (const n of ["Ada / Al", "Bea / Bo", "Cia / Cy", "Dee / Di"]) {
+    r = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: n });
+    persons.push(r.body.result.person);
+  }
+  for (const [i, p] of persons.entries()) {
+    await expectOk(organizer.token, "register_participant", {
+      division_id: divisionId, kind: "doubles", display_name: p.display_name, seed: i + 1, person_ids: [p.id],
+    });
+  }
+  r = await expectOk(organizer.token, "create_court", { tournament_id: tournamentId, name: "Court 1" });
+  const courtId = r.body.result.court.id;
+  await expectOk(organizer.token, "add_member", { tournament_id: tournamentId, user_id: umpire.user.id, role: "umpire" });
+  await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration_closed" });
+  await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "ready" });
+  await expectOk(organizer.token, "generate_bracket", { division_id: divisionId });
+  const { data: matches } = await organizer.client.from("matches").select("*").eq("division_id", divisionId).eq("status", "scheduled");
+  const matchId = matches[0].id;
+  await expectOk(organizer.token, "assign_court", { match_id: matchId, court_id: courtId });
+  await expectOk(organizer.token, "assign_umpire", { match_id: matchId, user_id: umpire.user.id });
+  await expectOk(umpire.token, "start_match", { match_id: matchId });
+  await expectOk(umpire.token, "coin_toss", { match_id: matchId, event_id: crypto.randomUUID(), seq: 1, result: "A", serving_team: "A" });
+  return { tournamentId, divisionId, matchId };
+}
+
+let correctionSeq;
+function nextCorrectionSeq() { return ++correctionSeq; }
+
+describe.skipIf(!live)("live score correction path", () => {
+  let organizer;
+  let umpire;
+  let outsider;
+
+  beforeAll(async () => {
+    organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+    umpire = await signIn("umpire.dev@tournament.local", "dev-umpire-pass");
+    outsider = await signIn("outsider.dev@tournament.local", "dev-outsider-pass");
+  }, 30_000);
+
+  test("in-progress: correction sets the score directly, and normal scoring continues from the corrected value", async () => {
+    const { matchId } = await setupCorrectionMatch(organizer, umpire, { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true });
+    correctionSeq = 1;
+
+    let r = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(), type: "point", payload: { team: "A" },
+    });
+    expect(r.body.ok).toBe(true);
+    expect(r.body.result.match.score_state.scoreA).toBe(1);
+
+    r = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
+      type: "correction", payload: { scoreA: 8, scoreB: 6, reason: "Scoreboard was misread" },
+    });
+    expect(r.body.ok, JSON.stringify(r.body)).toBe(true);
+    expect(r.body.result.match.score_state.scoreA).toBe(8);
+    expect(r.body.result.match.score_state.scoreB).toBe(6);
+    expect(r.body.result.match.status).toBe("in_progress");
+
+    // CRITICAL: the next normal point must continue from the corrected score (9-6), not the pre-correction score (2-6 or 9-... ).
+    r = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(), type: "point", payload: { team: "A" },
+    });
+    expect(r.body.ok).toBe(true);
+    expect(r.body.result.match.score_state.scoreA).toBe(9);
+    expect(r.body.result.match.score_state.scoreB).toBe(6);
+  }, 60_000);
+
+  test("invalid correction values are rejected without changing the score", async () => {
+    const { matchId } = await setupCorrectionMatch(organizer, umpire, { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true });
+    correctionSeq = 1;
+    for (const bad of [{ scoreA: -1, scoreB: 6 }, { scoreA: 1.5, scoreB: 6 }, { scoreA: "abc", scoreB: 6 }, { scoreA: null, scoreB: 6 }, {}]) {
+      const r = await send(umpire.token, "score_event", {
+        match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(), type: "correction", payload: bad,
+      });
+      expect(r.body.ok, JSON.stringify(r.body)).toBe(false);
+    }
+  }, 60_000);
+
+  test("unauthorized user and paired station cannot issue a correction", async () => {
+    const { matchId } = await setupCorrectionMatch(organizer, umpire, { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true });
+    correctionSeq = 1;
+    const outsiderTry = await send(outsider.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(), type: "correction", payload: { scoreA: 8, scoreB: 6, reason: "x" },
+    });
+    expect(outsiderTry.body.ok).toBe(false);
+    expect(outsiderTry.status).toBe(403);
+  }, 60_000);
+
+  test("completed match: same-winner correction allowed with confirmation+reason; missing either is rejected; winner-changing correction is rejected", async () => {
+    const { matchId } = await setupCorrectionMatch(organizer, umpire, { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true });
+    correctionSeq = 1;
+    let r = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
+      type: "correction", payload: { scoreA: 11, scoreB: 9 },
+    });
+    expect(r.body.ok).toBe(true);
+    expect(r.body.result.match.status).toBe("completed");
+    expect(r.body.result.match.score_state.winner).toBe("A");
+    const { data: resultRow } = await organizer.client.from("match_results").select("*").eq("match_id", matchId).maybeSingle();
+    expect(resultRow.winner_slot).toBe("A");
+
+    const missingConfirm = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
+      type: "correction", payload: { scoreA: 11, scoreB: 7, reason: "Recount" },
+    });
+    expect(missingConfirm.body.ok).toBe(false);
+    expect(missingConfirm.body.error.code).toBe("CONFIRMATION_REQUIRED");
+
+    const missingReason = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
+      type: "correction", payload: { scoreA: 11, scoreB: 7, confirm_completed: true },
+    });
+    expect(missingReason.body.ok).toBe(false);
+    expect(missingReason.body.error.code).toBe("REASON_REQUIRED");
+
+    const winnerFlip = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
+      type: "correction", payload: { scoreA: 7, scoreB: 11, confirm_completed: true, reason: "Recount" },
+    });
+    expect(winnerFlip.body.ok).toBe(false);
+    expect(winnerFlip.body.error.code).toBe("WOULD_CHANGE_WINNER");
+
+    const allowedCommandId = crypto.randomUUID();
+    const allowed = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
+      type: "correction", payload: { scoreA: 11, scoreB: 7, confirm_completed: true, reason: "Recount confirmed same winner" },
+    }, allowedCommandId);
+    expect(allowed.body.ok, JSON.stringify(allowed.body)).toBe(true);
+    expect(allowed.body.result.match.status).toBe("completed");
+    expect(allowed.body.result.match.score_state.winner).toBe("A");
+    expect(allowed.body.result.match.score_state.scoreB).toBe(7);
+
+    const { data: updatedResult } = await organizer.client.from("match_results").select("*").eq("match_id", matchId).maybeSingle();
+    expect(updatedResult.winner_slot).toBe("A");
+    expect(updatedResult.score_b).toBe(7);
+
+    const { data: audit } = await organizer.client.from("audit_logs").select("*").eq("command_id", allowedCommandId).maybeSingle();
+    expect(audit).toBeTruthy();
+    expect(audit.detail?.correction?.next).toEqual({ scoreA: 11, scoreB: 7 });
+    expect(audit.detail?.correction?.reason).toBe("Recount confirmed same winner");
+
+    const { data: events } = await organizer.client.from("score_events").select("*").eq("match_id", matchId).order("seq");
+    expect(events.some((e) => e.type === "point" || e.type === "correction")).toBe(true);
+    expect(events.length).toBeGreaterThanOrEqual(2); // original completion + the accepted correction — history preserved, not overwritten
+  }, 60_000);
+
+  test("completed multi-game (bestOf > 1) match rejects correction", async () => {
+    const { matchId } = await setupCorrectionMatch(organizer, umpire, { winTo: 2, winBy: "none", bestOf: 3, isDoubles: true });
+    correctionSeq = 1;
+    let last;
+    for (let i = 0; i < 4; i++) {
+      last = await send(umpire.token, "score_event", {
+        match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(), type: "point", payload: { team: "A" },
+      });
+      expect(last.body.ok, JSON.stringify(last.body)).toBe(true);
+    }
+    expect(last.body.result.match.status).toBe("completed"); // two straight games, 2-0/2-0
+
+    const r = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
+      type: "correction", payload: { scoreA: 2, scoreB: 1, confirm_completed: true, reason: "Recount" },
+    });
+    expect(r.body.ok).toBe(false);
+    expect(r.body.error.code).toBe("CORRECTION_UNSUPPORTED");
+  }, 60_000);
+});
+
+describe.skipIf(!live)("update_match_participant (edit players / change partner)", () => {
+  let organizer;
+  let umpire;
+  let outsider;
+
+  beforeAll(async () => {
+    organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+    umpire = await signIn("umpire.dev@tournament.local", "dev-umpire-pass");
+    outsider = await signIn("outsider.dev@tournament.local", "dev-outsider-pass");
+  }, 30_000);
+
+  test("swaps a doubles partner on a scheduled match; rejects duplicate/unknown/foreign/already-assigned players; locks once the match starts or completes; leaves master records and the old pairing untouched; writes an audit entry", async () => {
+    let r = await expectOk(organizer.token, "create_tournament", { name: `MP ${Date.now()}` });
+    const tournamentId = r.body.result.tournament.id;
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+
+    r = await expectOk(organizer.token, "create_division", {
+      tournament_id: tournamentId,
+      name: "Doubles MP",
+      format: "single_elim",
+      config: { winTo: 2, winBy: "none", bestOf: 1, isDoubles: true },
+    });
+    const divisionId = r.body.result.division.id;
+
+    // Four real 2-person pairs, so there's an actual "duplicate within one side" case to reject.
+    const pairNames = [
+      ["Juan Dela Cruz", "Pedro Santos"],
+      ["Mike Cruz", "John Smith"],
+      ["Cy One", "Cy Two"],
+      ["Di One", "Di Two"],
+    ];
+    const personIdsByPair = [];
+    for (const pair of pairNames) {
+      const ids = [];
+      for (const name of pair) {
+        const pr = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: name });
+        ids.push(pr.body.result.person.id);
+      }
+      personIdsByPair.push(ids);
+    }
+    const markR = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: "Mark Reyes" });
+    const markId = markR.body.result.person.id;
+
+    const otherTournamentR = await expectOk(organizer.token, "create_tournament", { name: `MP-other ${Date.now()}` });
+    const otherPersonR = await expectOk(organizer.token, "add_person", {
+      tournament_id: otherTournamentR.body.result.tournament.id,
+      display_name: "Outside Person",
+    });
+    const outsidePersonId = otherPersonR.body.result.person.id;
+
+    for (const [i, ids] of personIdsByPair.entries()) {
+      await expectOk(organizer.token, "register_participant", {
+        division_id: divisionId,
+        kind: "doubles",
+        display_name: pairNames[i].join(" / "),
+        seed: i + 1,
+        person_ids: ids,
+      });
+    }
+
+    const courtR = await expectOk(organizer.token, "create_court", { tournament_id: tournamentId, name: "MP Court" });
+    const courtId = courtR.body.result.court.id;
+    await expectOk(organizer.token, "add_member", { tournament_id: tournamentId, user_id: umpire.user.id, role: "umpire" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration_closed" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "ready" });
+    await expectOk(organizer.token, "generate_bracket", { division_id: divisionId });
+
+    const { data: matches } = await organizer.client.from("matches").select("*").eq("division_id", divisionId).eq("status", "scheduled");
+    expect(matches.length).toBeGreaterThan(0);
+    const matchId = matches[0].id;
+    await expectOk(organizer.token, "assign_court", { match_id: matchId, court_id: courtId });
+    await expectOk(organizer.token, "assign_umpire", { match_id: matchId, user_id: umpire.user.id });
+
+    const { data: mpRow } = await organizer.client.from("match_participants").select("*").eq("match_id", matchId).eq("slot", "A").maybeSingle();
+    const oldParticipantId = mpRow.participant_id;
+    const { data: oldMembers } = await organizer.client.from("participant_members").select("*").eq("participant_id", oldParticipantId).order("slot");
+    const [keepPersonId, swappedOutPersonId] = oldMembers.map((m) => m.person_id);
+
+    // Test 5 (outside the tournament) — also doubles as the authorization check's target payload shape.
+    const outsiderTry = await send(outsider.token, "update_match_participant", { match_id: matchId, slot: "A", person_ids: [keepPersonId, markId] });
+    expect(outsiderTry.body.ok).toBe(false);
+    expect(outsiderTry.status).toBe(403);
+
+    // Test 3 — duplicate player within the same side.
+    const dupTry = await send(organizer.token, "update_match_participant", { match_id: matchId, slot: "A", person_ids: [keepPersonId, keepPersonId] });
+    expect(dupTry.body.ok).toBe(false);
+    expect(dupTry.body.error.code).toBe("DUPLICATE_PLAYER_IN_PAIR");
+
+    // Test 4 — unknown participant id.
+    const unknownTry = await send(organizer.token, "update_match_participant", { match_id: matchId, slot: "A", person_ids: [keepPersonId, crypto.randomUUID()] });
+    expect(unknownTry.body.ok).toBe(false);
+    expect(unknownTry.body.error.code).toBe("INVALID_PLAYER");
+
+    // Test 5 — player registered under a different tournament entirely.
+    const crossTry = await send(organizer.token, "update_match_participant", { match_id: matchId, slot: "A", person_ids: [keepPersonId, outsidePersonId] });
+    expect(crossTry.body.ok).toBe(false);
+    expect(crossTry.body.error.code).toBe("INVALID_PLAYER");
+
+    // Already playing elsewhere in this division — the existing double-booking rule, reused as-is.
+    const alreadyAssignedTry = await send(organizer.token, "update_match_participant", {
+      match_id: matchId, slot: "A", person_ids: [keepPersonId, personIdsByPair[1][0]],
+    });
+    expect(alreadyAssignedTry.body.ok).toBe(false);
+    expect(alreadyAssignedTry.body.error.code).toBe("PLAYER_ALREADY_ASSIGNED");
+
+    // Test 1 — the real swap: Pedro Santos -> Mark Reyes.
+    const swapR = await expectOk(organizer.token, "update_match_participant", { match_id: matchId, slot: "A", person_ids: [keepPersonId, markId] });
+    const newParticipantId = swapR.body.result.participant.id;
+    expect(newParticipantId).not.toBe(oldParticipantId);
+
+    const { data: mpAfter } = await organizer.client.from("match_participants").select("*").eq("match_id", matchId).eq("slot", "A").maybeSingle();
+    expect(mpAfter.participant_id).toBe(newParticipantId);
+    const { data: newMembers } = await organizer.client.from("participant_members").select("*").eq("participant_id", newParticipantId).order("slot");
+    expect(newMembers.map((m) => m.person_id)).toEqual([keepPersonId, markId]);
+
+    // The old participant/pairing is untouched, not deleted or mutated — it's simply no longer referenced by this match.
+    const { data: oldParticipantAfter } = await organizer.client.from("participants").select("*").eq("id", oldParticipantId).maybeSingle();
+    expect(oldParticipantAfter).toBeTruthy();
+    const { data: oldMembersAfter } = await organizer.client.from("participant_members").select("*").eq("participant_id", oldParticipantId);
+    expect(oldMembersAfter.map((m) => m.person_id).sort()).toEqual([keepPersonId, swappedOutPersonId].sort());
+
+    // Test 2 — master player records for everyone involved are unchanged.
+    const { data: swappedOutPersonAfter } = await organizer.client.from("persons").select("*").eq("id", swappedOutPersonId).maybeSingle();
+    expect(swappedOutPersonAfter.display_name).toBe("Pedro Santos");
+    const { data: markAfter } = await organizer.client.from("persons").select("*").eq("id", markId).maybeSingle();
+    expect(markAfter.display_name).toBe("Mark Reyes");
+
+    // Test 8 — audit entry recorded with old/new player identity.
+    const { data: auditRows } = await organizer.client
+      .from("audit_logs")
+      .select("*")
+      .eq("match_id", matchId)
+      .eq("command_type", "update_match_participant")
+      .order("created_at", { ascending: false })
+      .limit(1);
+    expect(auditRows?.length).toBe(1);
+    expect(auditRows[0].detail?.participant_change?.old?.participant_id).toBe(oldParticipantId);
+    expect(auditRows[0].detail?.participant_change?.new?.participant_id).toBe(newParticipantId);
+    expect(auditRows[0].detail?.participant_change?.new?.players?.map((p) => p.name)).toEqual(["Juan Dela Cruz", "Mark Reyes"]);
+
+    // Re-submitting the exact same pairing is a no-op, not a fresh "change".
+    const noopTry = await send(organizer.token, "update_match_participant", { match_id: matchId, slot: "A", person_ids: [keepPersonId, markId] });
+    expect(noopTry.body.ok).toBe(false);
+    expect(noopTry.body.error.code).toBe("INVALID_COMMAND");
+
+    // Test 6 — once the match is live, editing is locked.
+    await expectOk(umpire.token, "start_match", { match_id: matchId });
+    const liveEditTry = await send(organizer.token, "update_match_participant", {
+      match_id: matchId, slot: "B", person_ids: [personIdsByPair[1][0], markId],
+    });
+    expect(liveEditTry.body.ok).toBe(false);
+    expect(liveEditTry.body.error.code).toBe("MATCH_NOT_EDITABLE");
+
+    // Drive the match to completion (this also regression-covers Test 10: normal + correction
+    // scoring on a match that has been through a participant swap works exactly as elsewhere).
+    await expectOk(umpire.token, "coin_toss", { match_id: matchId, event_id: crypto.randomUUID(), seq: 1, result: "A", serving_team: "A" });
+    await expectOk(umpire.token, "score_event", { match_id: matchId, event_id: crypto.randomUUID(), seq: 2, type: "point", payload: { team: "A" } });
+    const finishR = await expectOk(umpire.token, "score_event", { match_id: matchId, event_id: crypto.randomUUID(), seq: 3, type: "point", payload: { team: "A" } });
+    expect(finishR.body.result.match.status).toBe("completed");
+
+    // Test 7 — completed matches are locked too, and the historical result is untouched.
+    const completedEditTry = await send(organizer.token, "update_match_participant", {
+      match_id: matchId, slot: "A", person_ids: [keepPersonId, swappedOutPersonId],
+    });
+    expect(completedEditTry.body.ok).toBe(false);
+    expect(completedEditTry.body.error.code).toBe("MATCH_NOT_EDITABLE");
+    const { data: resultAfter } = await organizer.client.from("match_results").select("*").eq("match_id", matchId).maybeSingle();
+    expect(resultAfter.winner_slot).toBe("A");
+  }, 90_000);
+});
