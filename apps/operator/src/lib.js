@@ -180,6 +180,23 @@ export function personLabel(personId, persons = []) {
   return persons.find((p) => p.id === personId)?.display_name || personId;
 }
 
+export function normalizePersonName(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+// Resolves one typed replacement string (Matches → Edit Players) against the
+// tournament's existing persons — case-insensitive, whitespace-trimmed, same
+// convention as the Excel importers. Returns null for a blank/untouched field
+// ("no change"), otherwise { text, existingPerson } where existingPerson is
+// null when the typed name doesn't match anyone yet (a new player is created
+// for it at save time via the existing add_person command).
+export function resolvePersonByName(text, persons = []) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return null;
+  const existingPerson = persons.find((p) => normalizePersonName(p.display_name) === normalizePersonName(trimmed)) || null;
+  return { text: trimmed, existingPerson };
+}
+
 // Round-robin qualification standings for a team_elimination division — the single
 // source of truth reused by the Brackets tab, the Results tab, and the Excel export
 // (packages/engine's rankIndividualPairsForSemifinals does the actual ranking; this

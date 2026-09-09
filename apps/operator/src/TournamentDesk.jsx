@@ -60,6 +60,8 @@ import {
   labelStatus,
   memberName,
   membersOfParticipant,
+  normalizePersonName,
+  resolvePersonByName,
   pairingQrText,
   personLabel,
   placementsForDivision,
@@ -1509,50 +1511,89 @@ const EDITABLE_PLAYERS_STATUSES = new Set(["scheduled", "ready", "assigned", "po
 // not-yet-started match via update_match_participant (see
 // packages/api/src/handleCommand.js). This never edits the master `persons`
 // record and never mutates the existing participant/pairing in place — the
-// server creates a fresh pairing and repoints only this match's assignment,
-// so any other match that already used the old pairing (e.g. an earlier
-// completed round) is left untouched.
+// server creates a fresh pairing (preserving the old one's kind/team_id/seed,
+// so the replacement lands in the same team/participant context automatically)
+// and repoints only this match's assignment, so any other match that already
+// used the old pairing (e.g. an earlier completed round) is left untouched.
+//
+// State is deliberately split in two: `side.players[i].name` is the CURRENT
+// assignment (display-only, never written into an input's value), while
+// `replacementText[slot][i]` is a separate, independently-blank string per
+// row — typing in one never touches the other. A blank replacement means
+// "no change" for that player; only rows with typed text are sent.
 function EditPlayersModal({ match, data, command, onClose, onSaved }) {
   const sides = ["A", "B"].map((slot) => {
     const side = sideOf(match.id, slot, data);
     const members = side.participant ? membersOfParticipant(side.participant.id, data.participantMembers) : [];
-    return { slot, participant: side.participant, name: side.name, personIds: members.map((m) => m.person_id) };
+    return {
+      slot,
+      participant: side.participant,
+      players: members.map((m) => ({ personId: m.person_id, name: personLabel(m.person_id, data.persons) })),
+    };
   });
 
-  const [selected, setSelected] = useState(() =>
-    Object.fromEntries(sides.map((s) => [s.slot, [...s.personIds]]))
+  const [replacementText, setReplacementText] = useState(() =>
+    Object.fromEntries(sides.map((s) => [s.slot, s.players.map(() => "")]))
   );
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  function optionsFor(side, slotIndex) {
-    if (!side.participant) return [];
-    const assigned = assignedPersonIdsInDivision(data, match.division_id, { exceptParticipantId: side.participant.id });
-    const others = selected[side.slot].filter((_, i) => i !== slotIndex);
-    return data.persons.filter((p) => !assigned.has(p.id) && !others.includes(p.id));
-  }
-
-  function setPlayer(slot, index, personId) {
-    setSelected((prev) => {
+  function setText(slot, index, value) {
+    setReplacementText((prev) => {
       const next = [...prev[slot]];
-      next[index] = personId;
+      next[index] = value;
       return { ...prev, [slot]: next };
     });
     setError("");
   }
 
-  const changedSlots = sides.filter((s) => s.participant && selected[s.slot].some((id, i) => id !== s.personIds[i]));
-  const allValid = sides.every((s) => !s.participant || selected[s.slot].every(Boolean));
-  const noDuplicates = sides.every((s) => new Set(selected[s.slot]).size === selected[s.slot].length);
-  const canContinue = allValid && noDuplicates && changedSlots.length > 0 && !busy;
+  function suggestionsFor(text) {
+    const q = normalizePersonName(text);
+    if (!q) return [];
+    return data.persons.filter((p) => normalizePersonName(p.display_name).includes(q)).slice(0, 5);
+  }
+
+  // One entry per row that actually has typed text — the only rows that will
+  // change. Everything else keeps its current player untouched.
+  const changedRows = [];
+  for (const side of sides) {
+    side.players.forEach((player, i) => {
+      const resolved = resolvePersonByName(replacementText[side.slot][i], data.persons);
+      if (resolved) changedRows.push({ slot: side.slot, index: i, currentName: player.name, resolved });
+    });
+  }
+
+  // Light, client-side guard: don't let this one edit resolve two different
+  // rows to the identical target (existing person or same new name) — a real
+  // cross-side/duplicate-in-division check is already enforced server-side by
+  // update_match_participant itself, and its message is surfaced on failure.
+  const targetKeys = changedRows.map((r) => normalizePersonName(r.resolved.existingPerson?.display_name || r.resolved.text));
+  const hasInternalDuplicate = new Set(targetKeys).size !== targetKeys.length;
+  const canContinue = changedRows.length > 0 && !hasInternalDuplicate && !busy;
 
   async function submit() {
     setBusy(true);
     setError("");
     try {
-      for (const s of changedSlots) {
-        await command("update_match_participant", { match_id: match.id, slot: s.slot, person_ids: selected[s.slot] });
+      for (const side of sides) {
+        const texts = replacementText[side.slot];
+        if (!texts.some((t) => t.trim())) continue; // nothing typed on this side — skip entirely
+        const personIds = [];
+        for (let i = 0; i < side.players.length; i++) {
+          const resolved = resolvePersonByName(texts[i], data.persons);
+          if (!resolved) {
+            personIds.push(side.players[i].personId); // blank — keep the current player in this slot
+            continue;
+          }
+          if (resolved.existingPerson) {
+            personIds.push(resolved.existingPerson.id);
+          } else {
+            const out = await command("add_person", { tournament_id: data.tournament.id, display_name: resolved.text });
+            personIds.push(out.result.person.id);
+          }
+        }
+        await command("update_match_participant", { match_id: match.id, slot: side.slot, person_ids: personIds });
       }
       await onSaved?.();
       onClose();
@@ -1567,27 +1608,56 @@ function EditPlayersModal({ match, data, command, onClose, onSaved }) {
     <Modal title="Edit players" onClose={() => !busy && onClose()}>
       <div className="stack">
         {sides.map((side) => (
-          <div key={side.slot} className="stack" style={{ gap: 6 }}>
-            <h3 style={{ margin: 0 }}>Team {side.slot}</h3>
+          <div key={side.slot} className="stack" style={{ gap: 10 }}>
+            <h3 style={{ margin: 0 }}>Side {side.slot}</h3>
             {!side.participant ? (
               <p className="muted" style={{ margin: 0 }}>Not assigned yet.</p>
             ) : (
-              side.personIds.map((personId, i) => (
-                <Select
-                  key={i}
-                  label={`Player ${i + 1}`}
-                  value={selected[side.slot][i]}
-                  disabled={busy}
-                  onChange={(e) => setPlayer(side.slot, i, e.target.value)}
-                >
-                  {optionsFor(side, i).map((p) => (
-                    <option key={p.id} value={p.id}>{p.display_name}</option>
-                  ))}
-                </Select>
-              ))
+              side.players.map((player, i) => {
+                const text = replacementText[side.slot][i];
+                const resolved = resolvePersonByName(text, data.persons);
+                const suggestions = suggestionsFor(text).filter((p) => normalizePersonName(p.display_name) !== normalizePersonName(text));
+                return (
+                  <div key={player.personId} className="stack" style={{ gap: 4 }}>
+                    <div>
+                      <div className="muted" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Current player</div>
+                      <div>{player.name}</div>
+                    </div>
+                    <Input
+                      label="Replace player"
+                      value={text}
+                      disabled={busy}
+                      placeholder="Enter player name…"
+                      onChange={(e) => setText(side.slot, i, e.target.value)}
+                    />
+                    {resolved && (
+                      resolved.existingPerson
+                        ? <div className="muted" style={{ fontSize: "var(--text-sm)" }}>✓ Matches existing player {resolved.existingPerson.display_name}</div>
+                        : <div className="muted" style={{ fontSize: "var(--text-sm)" }}>+ Add "{resolved.text}" as new player</div>
+                    )}
+                    {suggestions.length > 0 && (
+                      <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                        {suggestions.map((p) => (
+                          <Button
+                            key={p.id}
+                            type="button"
+                            variant="ghost"
+                            className="compact"
+                            disabled={busy}
+                            onClick={() => setText(side.slot, i, p.display_name)}
+                          >
+                            {p.display_name}
+                          </Button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
             )}
           </div>
         ))}
+        {hasInternalDuplicate && <Alert>The same replacement player is entered more than once.</Alert>}
         {error && <Alert>{error}</Alert>}
         {!confirming ? (
           <div className="row">
@@ -1597,11 +1667,9 @@ function EditPlayersModal({ match, data, command, onClose, onSaved }) {
         ) : (
           <>
             <p style={{ margin: 0 }}>Change player assignment?</p>
-            {changedSlots.map((s) => (
-              <p key={s.slot} className="muted" style={{ margin: 0 }}>
-                Team {s.slot}: {s.personIds.map((id) => personLabel(id, data.persons)).join(" / ")}
-                {" → "}
-                {selected[s.slot].map((id) => personLabel(id, data.persons)).join(" / ")}
+            {changedRows.map((r) => (
+              <p key={`${r.slot}-${r.index}`} className="muted" style={{ margin: 0 }}>
+                Side {r.slot}: {r.currentName} → {r.resolved.existingPerson?.display_name || r.resolved.text}
               </p>
             ))}
             <div className="row">
