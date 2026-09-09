@@ -3,10 +3,14 @@ import assert from "node:assert/strict";
 import * as XLSX from "xlsx";
 import {
   PLAYER_COLUMNS,
+  BRACKET_COLUMNS,
   analyzePlayerRows,
+  analyzeBracketRows,
+  buildBracketExportRows,
   buildPlayerTemplateWorkbook,
   buildPlayersExportRows,
   buildTournamentReportWorkbook,
+  parseBracketWorkbook,
   parsePlayerWorkbook,
   planPlayerImportActions,
   splitPairName,
@@ -17,6 +21,18 @@ function workbookBuffer(rows) {
   const ws = XLSX.utils.aoa_to_sheet(rows);
   XLSX.utils.book_append_sheet(wb, ws, "Players");
   return XLSX.write(wb, { bookType: "xlsx", type: "array" });
+}
+
+function bracketWorkbookBuffer(rows) {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  XLSX.utils.book_append_sheet(wb, ws, "Bracket");
+  return XLSX.write(wb, { bookType: "xlsx", type: "array" });
+}
+
+function exportBufferFor(data) {
+  const rows = buildBracketExportRows(data);
+  return bracketWorkbookBuffer([BRACKET_COLUMNS, ...rows.map((r) => BRACKET_COLUMNS.map((c) => r[c]))]);
 }
 
 function baseTournamentData(overrides = {}) {
@@ -686,4 +702,321 @@ test("Excel round trip: export then re-import preserves Entry Type", () => {
   const { rows: analyzed } = analyzePlayerRows(rows, data, { hasEntryTypeColumn });
   assert.equal(analyzed[0].entryType, "Individual");
   assert.equal(analyzed[0].errors.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Bracket export / import
+// ---------------------------------------------------------------------------
+
+// A single-elimination bracket: round 1 has two decided matches (m1, m2),
+// round 2 is the final (m3) whose slots are still empty, waiting on round 1 —
+// exactly the shape a freshly-generated bracket has.
+function singleElimBracketData(overrides = {}) {
+  return baseTournamentData({
+    divisions: [{ id: "d1", tournament_id: "t1", name: "Open", format: "single_elim" }],
+    persons: [
+      { id: "p1", tournament_id: "t1", display_name: "Ada" },
+      { id: "p2", tournament_id: "t1", display_name: "Bea" },
+      { id: "p3", tournament_id: "t1", display_name: "Cy" },
+      { id: "p4", tournament_id: "t1", display_name: "Dee" },
+    ],
+    participants: [
+      { id: "pt1", tournament_id: "t1", division_id: "d1", kind: "singles", team_id: null, seed: 1, display_name: "Ada" },
+      { id: "pt2", tournament_id: "t1", division_id: "d1", kind: "singles", team_id: null, seed: 4, display_name: "Bea" },
+      { id: "pt3", tournament_id: "t1", division_id: "d1", kind: "singles", team_id: null, seed: 2, display_name: "Cy" },
+      { id: "pt4", tournament_id: "t1", division_id: "d1", kind: "singles", team_id: null, seed: 3, display_name: "Dee" },
+    ],
+    participantMembers: [
+      { id: "pm1", participant_id: "pt1", person_id: "p1", slot: 1 },
+      { id: "pm2", participant_id: "pt2", person_id: "p2", slot: 1 },
+      { id: "pm3", participant_id: "pt3", person_id: "p3", slot: 1 },
+      { id: "pm4", participant_id: "pt4", person_id: "p4", slot: 1 },
+    ],
+    matches: [
+      { id: "m1", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 1, bracket_position: 0, status: "scheduled", winner: null, next_match_id: "m3", next_match_slot: "A" },
+      { id: "m2", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 1, bracket_position: 1, status: "scheduled", winner: null, next_match_id: "m3", next_match_slot: "B" },
+      { id: "m3", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 2, bracket_position: 0, status: "scheduled", winner: null, next_match_id: null },
+    ],
+    matchParticipants: [
+      { id: "mp1", match_id: "m1", slot: "A", participant_id: "pt1", team_id: null },
+      { id: "mp2", match_id: "m1", slot: "B", participant_id: "pt2", team_id: null },
+      { id: "mp3", match_id: "m2", slot: "A", participant_id: "pt3", team_id: null },
+      { id: "mp4", match_id: "m2", slot: "B", participant_id: "pt4", team_id: null },
+    ],
+    ...overrides,
+  });
+}
+
+test("buildBracketExportRows: one row per playable match, Match ID is the stable matches.id", () => {
+  const data = singleElimBracketData();
+  const rows = buildBracketExportRows(data);
+  assert.equal(rows.length, 3);
+  const m1 = rows.find((r) => r["Match ID"] === "m1");
+  assert.equal(m1["Side A"], "Ada");
+  assert.equal(m1["Side B"], "Bea");
+  assert.equal(m1["Side A Seed"], 1);
+  assert.equal(m1.Division, "Open");
+  assert.equal(m1.Round, 1);
+  const final = rows.find((r) => r["Match ID"] === "m3");
+  assert.equal(final["Side A"], "Side A"); // no participant assigned yet
+});
+
+test("Bracket round trip: export then re-import with no edits produces zero changes", () => {
+  const data = singleElimBracketData();
+  const buf = exportBufferFor(data);
+  const { headerErrors, rows } = parseBracketWorkbook(buf);
+  assert.deepEqual(headerErrors, []);
+  const analysis = analyzeBracketRows(rows, data);
+  assert.equal(analysis.summary.changesReady, 0);
+  assert.equal(analysis.summary.blockedCount, 0);
+});
+
+test("Bracket import: changing an individual player resolves against an existing person", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m2" ? { ...r, sideA: "Ada" } : r // swap m2's Side A from Cy to the already-existing Ada
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const row = analysis.rows.find((r) => r.matchId === "m2");
+  assert.equal(row.errors.length, 0);
+  const change = row.changes.find((c) => c.slot === "A");
+  assert.equal(change.oldName, "Cy");
+  assert.equal(change.newName, "Ada");
+  assert.equal(change.players[0].existingPerson.id, "p1");
+});
+
+test("Bracket import: changing a doubles pair preserves the '/' convention and resolves both halves", () => {
+  const data = singleElimBracketData({
+    participants: [
+      { id: "pt1", tournament_id: "t1", division_id: "d1", kind: "doubles", team_id: null, seed: 1, display_name: "Rem / Jeff" },
+      { id: "pt2", tournament_id: "t1", division_id: "d1", kind: "doubles", team_id: null, seed: 2, display_name: "John / Mark" },
+    ],
+    persons: [
+      { id: "p1", tournament_id: "t1", display_name: "Rem" },
+      { id: "p2", tournament_id: "t1", display_name: "Jeff" },
+      { id: "p3", tournament_id: "t1", display_name: "John" },
+      { id: "p4", tournament_id: "t1", display_name: "Mark" },
+      { id: "p5", tournament_id: "t1", display_name: "Carlos" },
+    ],
+    participantMembers: [
+      { id: "pm1", participant_id: "pt1", person_id: "p1", slot: 1 },
+      { id: "pm2", participant_id: "pt1", person_id: "p2", slot: 2 },
+      { id: "pm3", participant_id: "pt2", person_id: "p3", slot: 1 },
+      { id: "pm4", participant_id: "pt2", person_id: "p4", slot: 2 },
+    ],
+    matches: [{ id: "m1", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 1, bracket_position: 0, status: "scheduled", winner: null, next_match_id: null }],
+    matchParticipants: [
+      { id: "mp1", match_id: "m1", slot: "A", participant_id: "pt1", team_id: null },
+      { id: "mp2", match_id: "m1", slot: "B", participant_id: "pt2", team_id: null },
+    ],
+  });
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) => ({ ...r, sideA: "Carlos / Mike" }));
+  const analysis = analyzeBracketRows(rows, data);
+  const row = analysis.rows[0];
+  const change = row.changes.find((c) => c.slot === "A");
+  assert.equal(change.error, undefined);
+  assert.equal(change.players.length, 2);
+  assert.equal(change.players[0].name, "Carlos");
+  assert.equal(change.players[0].existingPerson.id, "p5");
+  assert.equal(change.players[1].name, "Mike");
+  assert.equal(change.players[1].existingPerson, null); // new player — created at apply time
+  assert.equal(analysis.summary.newPersonCount, 1);
+});
+
+test("Bracket import: existing player resolution is case-insensitive and whitespace-normalized", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m2" ? { ...r, sideA: "  aDA  " } : r
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const change = analysis.rows.find((r) => r.matchId === "m2").changes.find((c) => c.slot === "A");
+  assert.equal(change.players[0].existingPerson.id, "p1");
+});
+
+test("Bracket import: pair parser accepts '/', '&', and 'and' — same parser as Players import", () => {
+  for (const [text, expected] of [["Carlos/Mike", ["Carlos", "Mike"]], ["Carlos & Mike", ["Carlos", "Mike"]], ["Carlos and Mike", ["Carlos", "Mike"]]]) {
+    assert.deepEqual(splitPairName(text).names, expected);
+  }
+});
+
+test("Bracket import: unchanged rows produce no change entries, even with different casing/whitespace", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m1" ? { ...r, sideA: " ada " } : r
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const row = analysis.rows.find((r) => r.matchId === "m1");
+  assert.equal(row.changes.length, 0);
+});
+
+test("Bracket import: team resolution — a team-elimination pair match reports its Team column and preserves team_id on change", () => {
+  const data = baseTournamentData({
+    divisions: [{ id: "d1", tournament_id: "t1", name: "Team Open", format: "team_elimination" }],
+    teams: [{ id: "team1", tournament_id: "t1", division_id: "d1", name: "Falcons" }],
+    persons: [
+      { id: "p1", tournament_id: "t1", display_name: "Rem" },
+      { id: "p2", tournament_id: "t1", display_name: "Jeff" },
+      { id: "p3", tournament_id: "t1", display_name: "Carlos" },
+    ],
+    participants: [
+      { id: "pt1", tournament_id: "t1", division_id: "d1", kind: "doubles", team_id: "team1", seed: null, display_name: "Rem / Jeff" },
+    ],
+    participantMembers: [
+      { id: "pm1", participant_id: "pt1", person_id: "p1", slot: 1 },
+      { id: "pm2", participant_id: "pt1", person_id: "p2", slot: 2 },
+    ],
+    matches: [
+      { id: "rr1", tournament_id: "t1", division_id: "d1", parent_match_id: null, stage_label: "round_robin", status: "scheduled" },
+      { id: "m1", tournament_id: "t1", division_id: "d1", parent_match_id: "rr1", round: 1, bracket_position: 0, status: "scheduled", winner: null },
+    ],
+    matchParticipants: [
+      { id: "mp1", match_id: "m1", slot: "A", participant_id: "pt1", team_id: "team1" },
+    ],
+  });
+  const rows = buildBracketExportRows(data);
+  const m1Row = rows.find((r) => r["Match ID"] === "m1");
+  assert.equal(m1Row.Team, "Falcons");
+  assert.equal(m1Row.Stage, "Qualification");
+});
+
+test("Bracket import: unknown player name is not an error at analysis time — it is treated as a new player, exactly like Players import", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m1" ? { ...r, sideA: "Zed" } : r
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const change = analysis.rows.find((r) => r.matchId === "m1").changes.find((c) => c.slot === "A");
+  assert.equal(change.error, undefined);
+  assert.equal(change.players[0].existingPerson, null);
+});
+
+test("Bracket import: invalid/unknown Match ID is a row-level error, never silently matched by row order", () => {
+  const data = singleElimBracketData();
+  const rows = [{ rowNumber: 2, matchId: "does-not-exist", sideA: "Zed", sideB: "" }];
+  const analysis = analyzeBracketRows(rows, data);
+  assert.equal(analysis.rows[0].errors.length, 1);
+  assert.match(analysis.rows[0].errors[0], /Unknown Match ID/);
+  assert.equal(analysis.summary.changesReady, 0);
+});
+
+test("Bracket import: a slot with no player assigned yet (waiting on a previous round) cannot be set directly", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m3" ? { ...r, sideA: "Ada" } : r
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const change = analysis.rows.find((r) => r.matchId === "m3").changes.find((c) => c.slot === "A");
+  assert.match(change.error, /no player assigned yet/);
+});
+
+test("Bracket import: duplicate participant across two rows in the same file is rejected", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) => {
+    if (r.matchId === "m1") return { ...r, sideA: "Zed" };
+    if (r.matchId === "m2") return { ...r, sideA: "Zed" };
+    return r;
+  });
+  const analysis = analyzeBracketRows(rows, data);
+  const c1 = analysis.rows.find((r) => r.matchId === "m1").changes.find((c) => c.slot === "A");
+  const c2 = analysis.rows.find((r) => r.matchId === "m2").changes.find((c) => c.slot === "A");
+  assert.ok(c1.error || c2.error, "one of the two duplicate assignments must be flagged");
+});
+
+test("Bracket import: a completed match is protected — cannot be changed from Excel", () => {
+  const data = singleElimBracketData({
+    matches: [
+      { id: "m1", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 1, bracket_position: 0, status: "completed", winner: "A", next_match_id: "m3", next_match_slot: "A" },
+      { id: "m2", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 1, bracket_position: 1, status: "scheduled", winner: null, next_match_id: "m3", next_match_slot: "B" },
+      { id: "m3", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 2, bracket_position: 0, status: "scheduled", winner: null, next_match_id: null },
+    ],
+  });
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m1" ? { ...r, sideA: "Zed" } : r
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const change = analysis.rows.find((r) => r.matchId === "m1").changes.find((c) => c.slot === "A");
+  assert.match(change.error, /already completed/);
+  assert.equal(analysis.summary.blockedCount, 1);
+});
+
+test("Bracket import: an in-progress match is protected — cannot be changed from Excel", () => {
+  const data = singleElimBracketData({
+    matches: [
+      { id: "m1", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 1, bracket_position: 0, status: "in_progress", winner: null, next_match_id: "m3", next_match_slot: "A" },
+      { id: "m2", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 1, bracket_position: 1, status: "scheduled", winner: null, next_match_id: "m3", next_match_slot: "B" },
+      { id: "m3", tournament_id: "t1", division_id: "d1", parent_match_id: null, round: 2, bracket_position: 0, status: "scheduled", winner: null, next_match_id: null },
+    ],
+  });
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m1" ? { ...r, sideA: "Zed" } : r
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const change = analysis.rows.find((r) => r.matchId === "m1").changes.find((c) => c.slot === "A");
+  assert.match(change.error, /players can only be changed before the match starts/);
+});
+
+test("Bracket import: replacing a pair with a single name (or vice versa) is rejected — kind cannot change via bracket import", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m1" ? { ...r, sideA: "Zed / Ned" } : r // m1 Side A is a singles (1-player) entry
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const change = analysis.rows.find((r) => r.matchId === "m1").changes.find((c) => c.slot === "A");
+  assert.match(change.error, /individual entry/);
+});
+
+test("Bracket import: downstream advancement fields (next_match_id/round/bracket_position) are never part of the editable diff", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m1" ? { ...r, sideA: "Zed" } : r
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const row = analysis.rows.find((r) => r.matchId === "m1");
+  // The change is scoped to the side identity only — nothing in analyzeBracketRows
+  // ever reads or writes next_match_id/round/bracket_position, so the original
+  // match objects (and therefore downstream bracket structure) are untouched.
+  const m1 = data.matches.find((m) => m.id === "m1");
+  assert.equal(m1.next_match_id, "m3");
+  assert.equal(m1.next_match_slot, "A");
+  assert.equal(row.changes.some((c) => c.slot === "A" && !c.error), true);
+});
+
+test("Bracket import: analyzing a file never mutates the input data (cancel leaves the bracket unchanged)", () => {
+  const data = singleElimBracketData();
+  const snapshot = JSON.parse(JSON.stringify(data));
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m1" ? { ...r, sideA: "Zed" } : r
+  );
+  analyzeBracketRows(rows, data);
+  assert.deepEqual(data, snapshot);
+});
+
+test("Bracket import: preview summary counts match the actual resolvable changes", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m1" ? { ...r, sideA: "Zed" } : r
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  assert.equal(analysis.summary.changesReady, 1);
+  assert.equal(analysis.summary.matchesChanged, 1);
+  assert.equal(analysis.summary.newPersonCount, 1);
+});
+
+test("parseBracketWorkbook: missing Match ID / Side A / Side B columns are header errors", () => {
+  const buf = bracketWorkbookBuffer([["Division", "Round"], ["Open", 1]]);
+  const { headerErrors } = parseBracketWorkbook(buf);
+  assert.ok(headerErrors.some((e) => /Match ID/.test(e)));
+  assert.ok(headerErrors.some((e) => /Side A/.test(e)));
+  assert.ok(headerErrors.some((e) => /Side B/.test(e)));
+});
+
+test("Existing Player Excel import is unaffected by the Bracket additions", () => {
+  const data = baseTournamentData({
+    persons: [{ id: "p1", tournament_id: "t1", display_name: "Ada" }],
+  });
+  const buf = workbookBuffer([["Player Name"], ["Ada"], ["Bea"]]);
+  const { rows } = parsePlayerWorkbook(buf);
+  const { rows: analyzed } = analyzePlayerRows(rows, data, { hasEntryTypeColumn: false });
+  assert.equal(analyzed[0].isDuplicate, true);
+  assert.equal(analyzed[1].isDuplicate, false);
 });

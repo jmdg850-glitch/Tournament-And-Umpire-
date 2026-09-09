@@ -392,6 +392,232 @@ export function planPlayerImportActions(analyzedRows, mode, tournamentId) {
 }
 
 // ---------------------------------------------------------------------------
+// Bracket — export / import.
+//
+// Round-trip identity is `matches.id` (the "Match ID" column) — rows are
+// matched to matches by this stable id only, never by row position. Only
+// Side A / Side B (who occupies each slot) is editable; every other column
+// is context. Applying a change reuses the existing update_match_participant
+// command (packages/api/src/handleCommand.js) — the same command the
+// operator desk's "Edit players" action already calls — so all of its
+// existing guarantees apply for free: organizer-only, locked once a match is
+// no longer in scheduled/ready/assigned/postponed, rejects duplicate/unknown
+// persons, and cannot change a side's player COUNT (a doubles pair can only
+// be replaced by another pair, an individual only by another individual).
+// This module never writes to match_participants directly.
+// ---------------------------------------------------------------------------
+
+export const BRACKET_COLUMNS = [
+  "Match ID", "Division", "Stage", "Round", "Position", "Team",
+  "Side A", "Side A Seed", "Side B", "Side B Seed",
+  "Court", "Umpire", "Status", "Winner", "Score",
+];
+
+// Matches editable through update_match_participant — kept in sync with
+// MATCH_PARTICIPANT_EDITABLE_STATUSES in packages/api/src/handleCommand.js.
+// This is a client-side preview mirror only; the server re-checks match
+// status itself and is the actual authority.
+export const BRACKET_EDITABLE_STATUSES = new Set(["scheduled", "ready", "assigned", "postponed"]);
+
+// Team-elimination's playable unit is always a child pair-match
+// (parent_match_id set); its own stage_label is null, so the real stage
+// (round robin / semifinal / bronze / final) lives on the parent shell.
+// Single-elim never sets stage_label at all except via bracket_side="bronze".
+export function bracketStageLabel(match, data) {
+  if (match.parent_match_id) {
+    const parent = data.matches.find((m) => m.id === match.parent_match_id);
+    if (parent?.stage_label) return stageTitle(parent.stage_label);
+    if (parent?.bracket_side === "bronze") return "Bronze";
+  }
+  if (match.stage_label) return stageTitle(match.stage_label);
+  if (match.bracket_side === "bronze") return "Bronze";
+  return `Round ${match.round ?? "?"}`;
+}
+
+function bracketTeamName(match, data) {
+  const mps = (data.matchParticipants || []).filter((p) => p.match_id === match.id);
+  const teamId = mps.find((p) => p.team_id)?.team_id;
+  return teamId ? (data.teams.find((t) => t.id === teamId)?.name || "") : "";
+}
+
+export function buildBracketExportRows(data) {
+  const matches = playableMatches(data.matches)
+    .slice()
+    .sort((a, b) => (a.division_id || "").localeCompare(b.division_id || "") || (a.round ?? 0) - (b.round ?? 0) || (a.bracket_position ?? 0) - (b.bracket_position ?? 0));
+  return matches.map((m) => {
+    const division = data.divisions.find((d) => d.id === m.division_id);
+    const a = sideOf(m.id, "A", data);
+    const b = sideOf(m.id, "B", data);
+    const result = resultFor(m, data.results);
+    const court = courtFor(m, data);
+    const ump = umpireFor(m, data);
+    return {
+      "Match ID": m.id,
+      "Division": division?.name || "",
+      "Stage": bracketStageLabel(m, data),
+      "Round": m.round ?? "",
+      "Position": m.bracket_position ?? "",
+      "Team": bracketTeamName(m, data),
+      "Side A": a.name,
+      "Side A Seed": a.participant?.seed ?? "",
+      "Side B": b.name,
+      "Side B Seed": b.participant?.seed ?? "",
+      "Court": court?.name || "",
+      "Umpire": ump?.name || "",
+      "Status": m.status,
+      "Winner": m.winner ? sideOf(m.id, m.winner, data).name : "",
+      "Score": scoreLine(m, result),
+    };
+  });
+}
+
+export function buildBracketExportWorkbook(data) {
+  const rows = buildBracketExportRows(data);
+  const ws = sheetFromRows(rows, BRACKET_COLUMNS);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Bracket");
+  return wb;
+}
+
+const BRACKET_KNOWN_HEADERS = new Set(BRACKET_COLUMNS.map(normKey));
+
+export function parseBracketWorkbook(arrayBuffer) {
+  const wb = XLSX.read(arrayBuffer, { type: "array" });
+  const sheetName = wb.SheetNames.find((n) => normKey(n) === "bracket") || wb.SheetNames[0];
+  if (!sheetName) return { headerErrors: ["Workbook has no sheets"], rows: [] };
+  const ws = wb.Sheets[sheetName];
+  const table = XLSX.utils.sheet_to_json(ws, { defval: "", raw: false });
+  if (!table.length) return { headerErrors: [], rows: [] };
+
+  const headers = Object.keys(table[0]);
+  const headerErrors = [];
+  if (!headers.some((h) => normKey(h) === "match id")) headerErrors.push('Missing required column "Match ID"');
+  if (!headers.some((h) => normKey(h) === "side a")) headerErrors.push('Missing required column "Side A"');
+  if (!headers.some((h) => normKey(h) === "side b")) headerErrors.push('Missing required column "Side B"');
+  const unsupported = headers.filter((h) => !BRACKET_KNOWN_HEADERS.has(normKey(h)));
+  if (unsupported.length) headerErrors.push(`Unsupported column(s): ${unsupported.join(", ")}`);
+
+  const findCol = (label) => headers.find((h) => normKey(h) === normKey(label));
+  const idCol = findCol("Match ID");
+  const sideACol = findCol("Side A");
+  const sideBCol = findCol("Side B");
+
+  const rows = table.map((raw, i) => ({
+    rowNumber: i + 2, // header is row 1 in the spreadsheet
+    matchId: normalizeName(idCol ? raw[idCol] : ""),
+    sideA: normalizeName(sideACol ? raw[sideACol] : ""),
+    sideB: normalizeName(sideBCol ? raw[sideBCol] : ""),
+  }));
+
+  return { headerErrors, rows };
+}
+
+// Resolves one slot's new Excel value against the slot's current player
+// count (a pair can only be replaced by a pair, an individual only by
+// another individual — the same constraint update_match_participant itself
+// enforces server-side; this mirrors it for the preview). Reuses
+// splitPairName exactly as the Players importer does — no second pair parser.
+function resolveBracketSide({ newName, oldParticipant, data }) {
+  const expectedCount = oldParticipant ? membersOfParticipant(oldParticipant.id, data.participantMembers).length || 1 : null;
+  const split = splitPairName(newName);
+  if (split?.tooMany) {
+    return { error: `Could not read player names from "${newName}" — use the format "Name 1 / Name 2"` };
+  }
+  const names = split?.names || (newName ? [newName] : []);
+  if (!names.length) return { error: "New player/pair name cannot be blank" };
+  if (expectedCount != null && names.length !== expectedCount) {
+    return {
+      error: expectedCount === 1
+        ? `This side is an individual entry — cannot replace it with a pair ("${newName}")`
+        : `This side is a pair (${expectedCount} players) — "${newName}" only names one player`,
+    };
+  }
+  const existingByName = new Map(data.persons.map((p) => [normKey(p.display_name), p]));
+  const players = names.map((name) => ({ name, existingPerson: existingByName.get(normKey(name)) || null }));
+  const uniqueKeys = new Set(names.map(normKey));
+  if (uniqueKeys.size !== names.length) return { error: "The same player cannot appear twice on one side" };
+  return { players };
+}
+
+// Validates a parsed bracket sheet against the live tournament: resolves
+// Match ID to a real match (never by row order), determines which sides
+// actually changed, and resolves each changed side's new player(s) — without
+// mutating anything. Returns one entry per data row with either a list of
+// per-slot changes ready to apply, or a row-level error explaining why not.
+export function analyzeBracketRows(rows, data) {
+  const matchById = new Map(data.matches.map((m) => [m.id, m]));
+  const usedPersonKeys = new Map(); // normKey(name) -> "row N, Side X" for cross-row duplicate detection
+
+  const analyzed = rows.map((row) => {
+    const isEmptyRow = !row.matchId && !row.sideA && !row.sideB;
+    if (isEmptyRow) return { ...row, isEmptyRow, errors: [], changes: [] };
+
+    const errors = [];
+    if (!row.matchId) errors.push("Match ID is required");
+    const match = row.matchId ? matchById.get(row.matchId) : null;
+    if (row.matchId && !match) errors.push(`Unknown Match ID "${row.matchId}" — this row does not match any match in this tournament`);
+
+    const changes = [];
+    if (match) {
+      for (const [slot, newName] of [["A", row.sideA], ["B", row.sideB]]) {
+        if (!newName) continue;
+        const current = sideOf(match.id, slot, data);
+        if (normKey(current.name) === normKey(newName)) continue; // unchanged
+        const entry = { slot, oldName: current.name, newName };
+        if (!BRACKET_EDITABLE_STATUSES.has(match.status)) {
+          entry.error = match.status === "completed" || match.status === "bye"
+            ? "Match is already completed — cannot change players from Excel"
+            : `Match is ${match.status} — players can only be changed before the match starts`;
+        } else if (!current.participant) {
+          entry.error = "This slot has no player assigned yet (waiting on a previous round) — cannot set it directly";
+        } else {
+          const resolved = resolveBracketSide({ newName, oldParticipant: current.participant, data });
+          if (resolved.error) {
+            entry.error = resolved.error;
+          } else {
+            entry.players = resolved.players;
+            for (const p of resolved.players) {
+              const key = normKey(p.name);
+              const dupAt = usedPersonKeys.get(key);
+              if (dupAt && dupAt !== `row ${row.rowNumber}`) {
+                entry.error = `"${p.name}" is also assigned elsewhere in this import (${dupAt})`;
+              } else {
+                usedPersonKeys.set(key, `row ${row.rowNumber}`);
+              }
+            }
+          }
+        }
+        changes.push(entry);
+      }
+    }
+
+    const divisionName = match ? (data.divisions.find((d) => d.id === match.division_id)?.name || "") : "";
+    const stageLabel = match ? bracketStageLabel(match, data) : "";
+    return { ...row, isEmptyRow: false, match, errors, changes, divisionName, stageLabel };
+  });
+
+  const usable = analyzed.filter((r) => !r.isEmptyRow);
+  const withChanges = usable.filter((r) => r.errors.length === 0 && r.changes.length > 0);
+  const applicable = withChanges.flatMap((r) => r.changes.filter((c) => !c.error));
+  const blocked = usable.flatMap((r) => (r.errors.length ? [{ row: r.rowNumber, message: r.errors.join("; ") }] : r.changes.filter((c) => c.error).map((c) => ({ row: r.rowNumber, message: `${c.oldName} (Side ${c.slot}): ${c.error}` }))));
+  const newPersonCount = new Set(
+    applicable.flatMap((c) => c.players).filter((p) => !p.existingPerson).map((p) => normKey(p.name))
+  ).size;
+
+  return {
+    rows: analyzed,
+    summary: {
+      totalRows: usable.length,
+      matchesChanged: withChanges.length,
+      changesReady: applicable.length,
+      blockedCount: blocked.length,
+      newPersonCount,
+    },
+    blocked,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Tournament Report — six worksheets, all derived from persisted data.
 // ---------------------------------------------------------------------------
 

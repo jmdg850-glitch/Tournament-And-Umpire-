@@ -373,7 +373,7 @@ export default function TournamentDesk({ supabase, session, command, tournamentI
             />
           )}
           {tab === "live" && <LivePanel data={data} live={live} upcoming={upcoming} tournamentId={t.id} command={command} load={load} />}
-          {tab === "brackets" && <BracketsPanel data={data} />}
+          {tab === "brackets" && <BracketsPanel data={data} command={command} load={load} />}
           {tab === "settings" && <SettingsPanel t={t} busy={busy} run={run} />}
           {tab === "divisions" && <DivisionsPanel data={data} busy={busy} run={run} />}
           {tab === "players" && <PlayersPanel data={data} busy={busy} run={run} command={command} load={load} />}

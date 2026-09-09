@@ -1,5 +1,7 @@
-import { Badge, Card, EmptyState, StandingsTable, StatusBadge } from "@tournament/ui";
+import { useRef, useState } from "react";
+import { Alert, Badge, Button, Card, EmptyState, StandingsTable, StatusBadge, useToast } from "@tournament/ui";
 import { courtFor, isTeamMatchup, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor } from "./lib.js";
+import BracketImportModal from "./BracketImportModal.jsx";
 
 function MatchChip({ match, data }) {
   const a = sideOf(match.id, "A", data);
@@ -142,12 +144,78 @@ function SingleElimBoard({ division, data }) {
   );
 }
 
-export function BracketsPanel({ data }) {
+export function BracketsPanel({ data, command, load }) {
+  const fileInputRef = useRef(null);
+  const [importAnalysis, setImportAnalysis] = useState(null);
+  const [importError, setImportError] = useState("");
+  const toast = useToast();
+
+  async function exportBracket() {
+    const { buildBracketExportWorkbook, downloadWorkbook, safeFileNamePart } = await import("./excelImportExport.js");
+    const wb = buildBracketExportWorkbook(data);
+    downloadWorkbook(wb, `${safeFileNamePart(data.tournament?.name)}_Bracket.xlsx`);
+  }
+
+  async function handleImportFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setImportError("");
+    try {
+      const buffer = await file.arrayBuffer();
+      const { parseBracketWorkbook, analyzeBracketRows } = await import("./excelImportExport.js");
+      const { headerErrors, rows } = parseBracketWorkbook(buffer);
+      if (headerErrors.length) {
+        setImportError(headerErrors.join("; "));
+        return;
+      }
+      if (!rows.length) {
+        setImportError("The file has no data rows.");
+        return;
+      }
+      setImportAnalysis(analyzeBracketRows(rows, data));
+    } catch (err) {
+      setImportError(`Could not read this file: ${err.message || err}`);
+    }
+  }
+
   if (!data.divisions.length) {
     return <EmptyState title="No divisions">Create a division before generating a bracket.</EmptyState>;
   }
   return (
     <div className="stack">
+      {command && (
+        <div className="panel-toolbar">
+          <div>
+            <h1 className="panel-toolbar-title">Brackets</h1>
+            <p className="muted panel-toolbar-sub">Export to Excel, edit players manually, then import the changes back.</p>
+          </div>
+          <div className="panel-toolbar-actions">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,.xls"
+              style={{ display: "none" }}
+              onChange={handleImportFile}
+            />
+            <Button type="button" variant="secondary" onClick={exportBracket}>Export Bracket</Button>
+            <Button type="button" variant="secondary" onClick={() => fileInputRef.current?.click()}>Import Bracket</Button>
+          </div>
+        </div>
+      )}
+      {importError && <Alert>{importError}</Alert>}
+      {importAnalysis && (
+        <BracketImportModal
+          analysis={importAnalysis}
+          command={command}
+          tournamentId={data.tournament?.id}
+          onClose={() => setImportAnalysis(null)}
+          onImported={async () => {
+            await load();
+            toast("Bracket import applied");
+          }}
+        />
+      )}
       {data.divisions.map((d) => (
         <Card className="stack" key={d.id}>
           <div className="row" style={{ justifyContent: "space-between" }}>

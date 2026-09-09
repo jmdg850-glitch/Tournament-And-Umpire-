@@ -65,3 +65,11 @@ test("App.jsx never renders a JSX component that isn't imported/declared", () =>
 test("TournamentDesk.jsx never renders a JSX component that isn't imported/declared", () => {
   assertNoUndeclaredJsxTags(resolve(dir, "TournamentDesk.jsx"));
 });
+
+test("brackets.jsx never renders a JSX component that isn't imported/declared", () => {
+  assertNoUndeclaredJsxTags(resolve(dir, "brackets.jsx"));
+});
+
+test("BracketImportModal.jsx never renders a JSX component that isn't imported/declared", () => {
+  assertNoUndeclaredJsxTags(resolve(dir, "BracketImportModal.jsx"));
+});

@@ -2158,11 +2158,17 @@ async function handleUpdateMatchParticipant(admin, actor, payload, envelope) {
   }
   const division = await getDivision(admin, match.division_id);
   const snapshot = await loadDivisionAssignment(admin, division.id);
+  const { data: divisionMatches } = await admin.from("matches").select("id").eq("division_id", division.id);
+  const { data: placedRows } = (divisionMatches || []).length ? await admin.from("match_participants").select("participant_id").in("match_id", divisionMatches.map((m) => m.id)) : { data: [] };
+  const placedParticipantIds = new Set((placedRows || []).map((r) => r.participant_id).filter(Boolean));
+  const liveParticipants = snapshot.participants.filter((p) => placedParticipantIds.has(p.id));
+  const liveParticipantIds = new Set(liveParticipants.map((p) => p.id));
+  const liveParticipantMembers = snapshot.participantMembers.filter((m) => liveParticipantIds.has(m.participant_id));
   const assigned = assignedPersonIds({
     divisionTeams: snapshot.teams,
     teamMembers: snapshot.teamMembers,
-    divisionParticipants: snapshot.participants,
-    participantMembers: snapshot.participantMembers,
+    divisionParticipants: liveParticipants,
+    participantMembers: liveParticipantMembers,
     exceptParticipantId: oldParticipant.id,
     exceptParticipantTeamId: oldParticipant.team_id || null
   });
