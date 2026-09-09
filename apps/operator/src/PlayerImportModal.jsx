@@ -29,6 +29,44 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
 
     for (const row of usable) {
       try {
+        if (row.pairNames) {
+          // "Rem / Jeff" style row: resolve/create both halves, then
+          // register them together as one doubles participant. Mode applies
+          // to the whole pair exactly as it would to a single duplicate row
+          // (add_new/skip_existing skip the row entirely if either half
+          // already exists; update_existing renames whichever half changed).
+          if (row.isDuplicate && (mode === "add_new" || mode === "skip_existing")) {
+            results.skipped++;
+            continue;
+          }
+          const personIds = [];
+          for (const half of row.pairPersons) {
+            if (!half.existingPerson) {
+              const out = await command("add_person", { tournament_id: tournamentId, display_name: half.name });
+              personIds.push(out.result.person.id);
+              results.created++;
+            } else if (mode === "update_existing" && half.existingPerson.display_name !== half.name) {
+              const out = await command("update_person", { person_id: half.existingPerson.id, display_name: half.name });
+              personIds.push(out.result.person.id);
+              results.updated++;
+            } else {
+              personIds.push(half.existingPerson.id);
+            }
+          }
+          if (row.division) {
+            await command("register_participant", {
+              division_id: row.division.id,
+              display_name: row.playerName,
+              kind: "doubles",
+              team_id: row.team?.id || null,
+              seed: row.seed || null,
+              person_ids: personIds,
+            });
+            results.registered++;
+          }
+          continue;
+        }
+
         let personId = null;
         if (!row.isDuplicate) {
           const out = await command("add_person", { tournament_id: tournamentId, display_name: row.playerName });
@@ -53,9 +91,10 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
 
         if (row.division && personId) {
           if (row.entryType === "Pair") {
-            // A Pair entry needs a partner, which a single Excel row can't supply —
-            // the player and their division/team are recorded, but registration is
-            // left for the existing "Register pair" flow so no partner is guessed.
+            // A single-name Pair row (no separator) still can't supply a
+            // partner on its own — the player and their division/team are
+            // recorded, but registration is left for the existing
+            // "Register pair" flow so no partner is guessed.
             results.needsPairing++;
           } else {
             await command("register_participant", {
@@ -121,7 +160,17 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
                     { key: "entryType", header: "Entry Type" },
                     { key: "division", header: "Division", render: (r) => r.division?.name || "—" },
                     { key: "team", header: "Team", render: (r) => r.team?.name || "—" },
-                    { key: "status", header: "Status", render: (r) => (r.isDuplicate ? "Existing" : "New") },
+                    {
+                      key: "status",
+                      header: "Status",
+                      render: (r) => {
+                        if (r.pairNames) {
+                          const label = `Pair: ${r.pairNames.join(" / ")}`;
+                          return r.isDuplicate ? `${label} (existing)` : `${label} (new)`;
+                        }
+                        return r.isDuplicate ? "Existing" : "New";
+                      },
+                    },
                   ]}
                   rows={validRows.map((r) => ({ id: r.rowNumber, ...r }))}
                 />

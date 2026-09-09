@@ -86,10 +86,47 @@ function normalizeEntryType(value) {
   return null;
 }
 
+// A "Pair" row's Player Name may name both partners in one cell — this is
+// the same "Name / Name" convention the app already uses everywhere else a
+// pair is displayed (TournamentDesk's manual "Register pair" flow builds
+// `${a} / ${b}`, and the Tournament Report's Participants sheet joins pair
+// members with " / "), so the template's own example row uses it too and
+// the importer must be able to read it back.
+// Tried in order; the first separator that actually appears in the string
+// wins, so a name never gets accidentally split by more than one pattern.
+const PAIR_NAME_SEPARATORS = [
+  /\s*\/\s*/, // "Rem / Jeff", "Rem/Jeff"
+  /\s*&\s*/, // "Rem & Jeff", "Rem&Jeff"
+  /\s+and\s+/i, // "Rem and Jeff" — requires real whitespace around "and" so it
+  // can't fire inside an ordinary name like "Sandra" or "Anderson".
+];
+
+// Returns { names: [a, b] } if `raw` contains exactly one recognized pair
+// separator splitting it into two non-empty names, { tooMany: true } if a
+// separator was found but it split into something other than two names
+// (e.g. a trailing separator, or three names), or null if no pair separator
+// appears at all (an ordinary single name, including the existing
+// single-name "Pair" row format that still needs manual partner selection).
+export function splitPairName(raw) {
+  const trimmed = normalizeName(raw);
+  for (const pattern of PAIR_NAME_SEPARATORS) {
+    if (!pattern.test(trimmed)) continue;
+    // Check the raw segment count (not the empty-filtered count) so a
+    // trailing/doubled separator ("Rem /", "Rem // Jeff") is correctly
+    // rejected as malformed rather than silently treated as a clean pair.
+    const parts = trimmed.split(pattern).map(normalizeName);
+    if (parts.length === 2 && parts[0] && parts[1]) return { names: parts };
+    return { tooMany: true };
+  }
+  return null;
+}
+
 export function buildPlayerTemplateWorkbook() {
   const rows = [
     { "Player ID": "", "Player Name": "Jane Doe", "Entry Type": "Individual", "Division": "", "Team": "", "Seed": "" },
-    { "Player ID": "", "Player Name": "Juan Dela Cruz", "Entry Type": "Pair", "Division": "", "Team": "", "Seed": "" },
+    // Demonstrates the pairing format the importer reads back: both partner
+    // names in one cell, separated by " / " (also accepts "/", "&", "and").
+    { "Player ID": "", "Player Name": "Juan Dela Cruz / Pedro Santos", "Entry Type": "Pair", "Division": "", "Team": "", "Seed": "" },
   ];
   const ws = sheetFromRows(rows, PLAYER_COLUMNS);
   const wb = XLSX.utils.book_new();
@@ -211,23 +248,55 @@ export function analyzePlayerRows(rows, data, { hasEntryTypeColumn = false } = {
       if (!entryType) errors.push(`Entry Type "${row.entryTypeRaw}" is not valid — use Individual or Pair`);
     }
 
-    if (row.playerId) {
-      const dup = seenIdsInFile.get(row.playerId);
-      if (dup) errors.push(`Duplicate Player ID within file (also row ${dup})`);
-      seenIdsInFile.set(row.playerId, row.rowNumber);
-      if (!existingById.has(row.playerId)) errors.push("Player ID does not match any existing player in this tournament");
+    // A "Pair" row's Player Name may combine both partners in one cell
+    // ("Rem / Jeff", "Rem & Jeff", "Rem and Jeff") — see splitPairName.
+    // A bare single name (the pre-existing format) is left as pairNames=null
+    // and falls through to the unchanged single-person "needs manual partner"
+    // path below, so nothing about that existing format changes.
+    let pairNames = null;
+    let pairPersons = null;
+    if (entryType === "Pair" && row.playerName) {
+      const split = splitPairName(row.playerName);
+      if (split?.tooMany) {
+        errors.push(`Could not read two player names from "${row.playerName}" — use the format "Name 1 / Name 2"`);
+      } else if (split?.names) {
+        const [n1, n2] = split.names;
+        if (normKey(n1) === normKey(n2)) {
+          errors.push("The same player cannot be selected twice in one pair");
+        } else {
+          pairNames = [n1, n2];
+        }
+      }
     }
 
-    let existingPerson = row.playerId ? existingById.get(row.playerId) || null : null;
-    if (!existingPerson && row.playerName) {
-      const byName = existingByName.get(normKey(row.playerName));
-      if (byName) existingPerson = byName;
+    let existingPerson = null;
+    if (pairNames) {
+      // Each half is resolved exactly like an ordinary single-name row would
+      // be (case-insensitive match against existing players; unmatched
+      // names are simply new players, not errors).
+      pairPersons = pairNames.map((name) => ({ name, existingPerson: existingByName.get(normKey(name)) || null }));
+    } else {
+      if (row.playerId) {
+        const dup = seenIdsInFile.get(row.playerId);
+        if (dup) errors.push(`Duplicate Player ID within file (also row ${dup})`);
+        seenIdsInFile.set(row.playerId, row.rowNumber);
+        if (!existingById.has(row.playerId)) errors.push("Player ID does not match any existing player in this tournament");
+      }
+      existingPerson = row.playerId ? existingById.get(row.playerId) || null : null;
+      if (!existingPerson && row.playerName) {
+        const byName = existingByName.get(normKey(row.playerName));
+        if (byName) existingPerson = byName;
+      }
     }
 
-    if (row.playerName) {
-      const nameKey = normKey(row.playerName);
+    // Duplicate-within-file detection covers both plain names and each half
+    // of a pair, in the same map, so "Rem" as its own row and "Rem" as half
+    // of a later pair row are still caught as the same person.
+    const namesToTrack = pairNames || (row.playerName ? [row.playerName] : []);
+    for (const name of namesToTrack) {
+      const nameKey = normKey(name);
       const dupRow = seenNamesInFile.get(nameKey);
-      if (dupRow && dupRow !== row.rowNumber) errors.push(`Duplicate player name within file (also row ${dupRow})`);
+      if (dupRow && dupRow !== row.rowNumber) errors.push(`Duplicate player name within file (also row ${dupRow}): "${name}"`);
       if (!dupRow) seenNamesInFile.set(nameKey, row.rowNumber);
     }
 
@@ -259,7 +328,12 @@ export function analyzePlayerRows(rows, data, { hasEntryTypeColumn = false } = {
       errors,
       isEmptyRow: false,
       existingPerson,
-      isDuplicate: Boolean(existingPerson),
+      pairNames,
+      pairPersons,
+      // For a pair, "duplicate" means at least one half already exists —
+      // that's still meaningful for the summary counts and for the
+      // add/skip/update mode picker, without needing separate per-half UI.
+      isDuplicate: pairPersons ? pairPersons.some((p) => p.existingPerson) : Boolean(existingPerson),
       entryType,
       division,
       team,

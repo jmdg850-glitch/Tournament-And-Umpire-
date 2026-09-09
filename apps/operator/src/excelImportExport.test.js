@@ -9,6 +9,7 @@ import {
   buildTournamentReportWorkbook,
   parsePlayerWorkbook,
   planPlayerImportActions,
+  splitPairName,
 } from "./excelImportExport.js";
 
 function workbookBuffer(rows) {
@@ -484,6 +485,191 @@ test("buildPlayersExportRows: Entry Type reflects the participant's real kind (r
   const rows = buildPlayersExportRows(data);
   assert.equal(rows.find((r) => r["Player Name"] === "Ada")["Entry Type"], "Individual");
   assert.equal(rows.find((r) => r["Player Name"] === "Bea")["Entry Type"], "Pair");
+});
+
+// ---------------------------------------------------------------------------
+// Pair-name parsing ("Rem / Jeff") — Excel import pair bug
+// ---------------------------------------------------------------------------
+
+test("splitPairName: recognizes the app's own template format 'Name / Name'", () => {
+  assert.deepEqual(splitPairName("Rem / Jeff"), { names: ["Rem", "Jeff"] });
+});
+
+test("splitPairName: recognizes 'Name/Name' with no spaces", () => {
+  assert.deepEqual(splitPairName("Rem/Jeff"), { names: ["Rem", "Jeff"] });
+});
+
+test("splitPairName: recognizes 'Name & Name'", () => {
+  assert.deepEqual(splitPairName("Rem & Jeff"), { names: ["Rem", "Jeff"] });
+});
+
+test("splitPairName: recognizes 'Name and Name'", () => {
+  assert.deepEqual(splitPairName("Rem and Jeff"), { names: ["Rem", "Jeff"] });
+});
+
+test("splitPairName: trims and normalizes surrounding/internal whitespace", () => {
+  assert.deepEqual(splitPairName("  Rem   /   Jeff  "), { names: ["Rem", "Jeff"] });
+});
+
+test("splitPairName: 'and' inside an ordinary name is not mistaken for a separator", () => {
+  assert.equal(splitPairName("Sandra Anderson"), null);
+});
+
+test("splitPairName: a bare single name (legacy Pair format) returns null, not an error", () => {
+  assert.equal(splitPairName("Rem"), null);
+});
+
+test("splitPairName: malformed/trailing separator is reported as tooMany, not silently split", () => {
+  assert.deepEqual(splitPairName("Rem /"), { tooMany: true });
+  assert.deepEqual(splitPairName("Rem / Jeff / Bob"), { tooMany: true });
+});
+
+test("analyzePlayerRows: 1. individual row import is unaffected by pair parsing", () => {
+  const data = baseTournamentData();
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "Ada", entryTypeRaw: "Individual" })],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.equal(rows[0].errors.length, 0);
+  assert.equal(rows[0].pairNames, null);
+  assert.equal(rows[0].entryType, "Individual");
+});
+
+test("analyzePlayerRows: 2. 'Rem / Jeff' pair row is split and both names resolved as new players", () => {
+  const data = baseTournamentData();
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "Rem / Jeff", entryTypeRaw: "Pair" })],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.equal(rows[0].errors.length, 0);
+  assert.deepEqual(rows[0].pairNames, ["Rem", "Jeff"]);
+  assert.equal(rows[0].pairPersons.length, 2);
+  assert.equal(rows[0].pairPersons[0].existingPerson, null);
+  assert.equal(rows[0].pairPersons[1].existingPerson, null);
+});
+
+test("analyzePlayerRows: 3. 'Rem/Jeff' (no spaces) is also recognized as a pair", () => {
+  const data = baseTournamentData();
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "Rem/Jeff", entryTypeRaw: "Pair" })],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.equal(rows[0].errors.length, 0);
+  assert.deepEqual(rows[0].pairNames, ["Rem", "Jeff"]);
+});
+
+test("analyzePlayerRows: 4. 'Rem & Jeff' is also recognized as a pair", () => {
+  const data = baseTournamentData();
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "Rem & Jeff", entryTypeRaw: "Pair" })],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.equal(rows[0].errors.length, 0);
+  assert.deepEqual(rows[0].pairNames, ["Rem", "Jeff"]);
+});
+
+test("analyzePlayerRows: 5. extra whitespace around pair names is normalized", () => {
+  const data = baseTournamentData();
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "  Rem   /   Jeff  ", entryTypeRaw: "Pair" })],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.equal(rows[0].errors.length, 0);
+  assert.deepEqual(rows[0].pairNames, ["Rem", "Jeff"]);
+});
+
+test("analyzePlayerRows: 6. each pair half matches an existing player case-insensitively", () => {
+  const data = baseTournamentData({
+    persons: [
+      { id: "p1", tournament_id: "t1", display_name: "Rem Cruz" },
+      { id: "p2", tournament_id: "t1", display_name: "Jeff Santos" },
+    ],
+  });
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "rem cruz / JEFF SANTOS", entryTypeRaw: "Pair" })],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.equal(rows[0].errors.length, 0);
+  assert.equal(rows[0].pairPersons[0].existingPerson.id, "p1");
+  assert.equal(rows[0].pairPersons[1].existingPerson.id, "p2");
+  assert.equal(rows[0].isDuplicate, true);
+});
+
+test("analyzePlayerRows: 7. a pair name that can't be split into two names is a validation error, not silently dropped", () => {
+  const data = baseTournamentData();
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "Rem / Jeff / Bob", entryTypeRaw: "Pair" })],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.ok(rows[0].errors.some((e) => /Could not read two player names/.test(e)));
+  assert.equal(rows[0].pairNames, null);
+});
+
+test("analyzePlayerRows: 7b. the same name on both sides of the separator is a validation error", () => {
+  const data = baseTournamentData();
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "Rem / rem", entryTypeRaw: "Pair" })],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.ok(rows[0].errors.some((e) => /cannot be selected twice/.test(e)));
+});
+
+test("analyzePlayerRows: 8. duplicate-in-file detection catches a pair half reused elsewhere in the file", () => {
+  const data = baseTournamentData();
+  const { rows } = analyzePlayerRows(
+    [
+      row({ rowNumber: 2, playerName: "Rem", entryTypeRaw: "Individual" }),
+      row({ rowNumber: 3, playerName: "Rem / Jeff", entryTypeRaw: "Pair" }),
+    ],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.ok(rows[1].errors.some((e) => /Duplicate player name/.test(e) && /Rem/.test(e)));
+});
+
+test("analyzePlayerRows: 9. export template round-trips 'Rem / Jeff' back into a recognized pair", () => {
+  const data = baseTournamentData();
+  const buf = workbookBuffer([
+    PLAYER_COLUMNS,
+    ["", "Rem / Jeff", "Pair", "", "", ""],
+  ]);
+  const { rows, hasEntryTypeColumn } = parsePlayerWorkbook(buf);
+  const { rows: analyzed } = analyzePlayerRows(rows, data, { hasEntryTypeColumn });
+  assert.equal(analyzed[0].errors.length, 0);
+  assert.deepEqual(analyzed[0].pairNames, ["Rem", "Jeff"]);
+});
+
+test("analyzePlayerRows: 10. existing single-name Pair format (no separator) still falls back to manual pairing, unchanged", () => {
+  const data = baseTournamentData();
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "Rem", entryTypeRaw: "Pair" })],
+    data,
+    { hasEntryTypeColumn: true }
+  );
+  assert.equal(rows[0].errors.length, 0);
+  assert.equal(rows[0].pairNames, null);
+  assert.equal(rows[0].pairPersons, null);
+  assert.equal(rows[0].entryType, "Pair");
+});
+
+test("buildPlayerTemplateWorkbook: the app's own generated template pair example round-trips through the importer", () => {
+  const wb = buildPlayerTemplateWorkbook();
+  const buf = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const { rows, hasEntryTypeColumn } = parsePlayerWorkbook(buf);
+  const data = baseTournamentData();
+  const { rows: analyzed } = analyzePlayerRows(rows, data, { hasEntryTypeColumn });
+  const pairRow = analyzed.find((r) => r.entryType === "Pair");
+  assert.ok(pairRow, "template must include a Pair example row");
+  assert.equal(pairRow.errors.length, 0);
+  assert.equal(pairRow.pairNames.length, 2);
 });
 
 test("Excel round trip: export then re-import preserves Entry Type", () => {
