@@ -4,6 +4,7 @@ import { parseLiveHash } from "@tournament/engine";
 import {
   Alert,
   Button,
+  Card,
   ConfirmDialog,
   EmptyState,
   Input,

@@ -8,7 +8,7 @@
   --panel: #ffffff;
   --ink: #101828;
   --text: #101828;
-  --muted: #64748b;
+  --muted: #55617a;
   --line: #e3e8f0;
   --border: #e3e8f0;
   --tape: #2563eb;
@@ -29,6 +29,13 @@
   --gradient-brand: linear-gradient(135deg, #2563eb 0%, #0ea5a4 100%);
 }
 body { background: var(--bg); }
+
+/* packages/ui's .shell reads its background from --shell-bg, which must stay
+   dark globally (the live-window/scoreboard "always dark stadium" components
+   deliberately key off that same token). Override .shell itself here instead
+   of the variable, so the workspace area is actually the light --bg this
+   theme intends, without touching those always-dark components. */
+.shell { background: var(--bg); }
 
 /* The sidebar stays deliberately dark regardless of the light workspace. */
 .shell-rail {
