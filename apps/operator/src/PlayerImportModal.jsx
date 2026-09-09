@@ -91,38 +91,43 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
             <Badge tone="muted">Existing (duplicates): {summary.duplicateCount}</Badge>
           </div>
 
-          {invalidRows.length > 0 && (
-            <div>
-              <h3>Row errors ({invalidRows.length})</h3>
-              <Table
-                responsive
-                columns={[
-                  { key: "rowNumber", header: "Row" },
-                  { key: "playerName", header: "Player Name", render: (r) => r.playerName || "(blank)" },
-                  { key: "errors", header: "Errors", render: (r) => r.errors.join("; ") },
-                ]}
-                rows={invalidRows.map((r) => ({ id: r.rowNumber, ...r }))}
-              />
-            </div>
-          )}
+          {/* Bounded + scrollable so a large import (many rows) can't push the
+              summary/mode/actions below off-screen — only this preview area
+              scrolls, the rest of the modal stays put. */}
+          <div className="import-preview-scroll stack">
+            {invalidRows.length > 0 && (
+              <div>
+                <h3>Row errors ({invalidRows.length})</h3>
+                <Table
+                  responsive
+                  columns={[
+                    { key: "rowNumber", header: "Row" },
+                    { key: "playerName", header: "Player Name", render: (r) => r.playerName || "(blank)" },
+                    { key: "errors", header: "Errors", render: (r) => r.errors.join("; ") },
+                  ]}
+                  rows={invalidRows.map((r) => ({ id: r.rowNumber, ...r }))}
+                />
+              </div>
+            )}
 
-          {validRows.length > 0 && (
-            <div>
-              <h3>Preview ({validRows.length} valid row{validRows.length === 1 ? "" : "s"})</h3>
-              <Table
-                responsive
-                columns={[
-                  { key: "rowNumber", header: "Row" },
-                  { key: "playerName", header: "Player Name" },
-                  { key: "entryType", header: "Entry Type" },
-                  { key: "division", header: "Division", render: (r) => r.division?.name || "—" },
-                  { key: "team", header: "Team", render: (r) => r.team?.name || "—" },
-                  { key: "status", header: "Status", render: (r) => (r.isDuplicate ? "Existing" : "New") },
-                ]}
-                rows={validRows.map((r) => ({ id: r.rowNumber, ...r }))}
-              />
-            </div>
-          )}
+            {validRows.length > 0 && (
+              <div>
+                <h3>Preview ({validRows.length} valid row{validRows.length === 1 ? "" : "s"})</h3>
+                <Table
+                  responsive
+                  columns={[
+                    { key: "rowNumber", header: "Row" },
+                    { key: "playerName", header: "Player Name" },
+                    { key: "entryType", header: "Entry Type" },
+                    { key: "division", header: "Division", render: (r) => r.division?.name || "—" },
+                    { key: "team", header: "Team", render: (r) => r.team?.name || "—" },
+                    { key: "status", header: "Status", render: (r) => (r.isDuplicate ? "Existing" : "New") },
+                  ]}
+                  rows={validRows.map((r) => ({ id: r.rowNumber, ...r }))}
+                />
+              </div>
+            )}
+          </div>
 
           {summary.duplicateCount > 0 && (
             <Select label="How should existing players be handled?" value={mode} onChange={(e) => setMode(e.target.value)}>

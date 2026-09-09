@@ -1,7 +1,7 @@
 {
   "name": "@tournament/operator",
   "private": true,
-  "version": "1.2.7",
+  "version": "1.2.8",
   "type": "module",
   "description": "Tournament operator desktop application",
   "author": "Tournament",

@@ -385,6 +385,11 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
   animation: rise 180ms var(--ease-out);
+  /* Safety net: no existing modal is this tall, so this is a no-op for all
+     of them today — it only kicks in if a modal's content ever exceeds the
+     viewport, so the modal itself scrolls instead of extending off-screen. */
+  max-height: 90vh;
+  overflow-y: auto;
 }
 .modal h2 { font-size: var(--text-lg); }
 

@@ -106,6 +106,16 @@ input, select, textarea { background: #fff; }
 .activity-dot.live { background: var(--live); box-shadow: 0 0 0 3px color-mix(in srgb, var(--live) 25%, transparent); }
 .activity-time { font-size: var(--text-xs); }
 
+/* Excel import preview (PlayerImportModal): bounded + independently
+   scrollable so a large import can't push the summary/mode-select/action
+   buttons off-screen. Only this region scrolls — everything else in the
+   modal stays in normal flow above/below it. */
+.import-preview-scroll {
+  max-height: min(46vh, 420px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
 .section-label {
   font-size: var(--text-xs);
   letter-spacing: 0.14em;
