@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createBrowserClient, envConfig, sendCommand, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
+import { createBrowserClient, envConfig, sendCommand, sendCommandDurable, defaultStore, drainQueue, queueSize, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
 import { parseLiveHash } from "@tournament/engine";
 import {
   Alert,
@@ -65,15 +65,70 @@ export default function App() {
     return () => sub.subscription.unsubscribe();
   }, [supabase]);
 
-  async function command(type, payload) {
+  const outboxRef = useRef(null);
+  if (!outboxRef.current) outboxRef.current = defaultStore("tournament-operator-outbox");
+  const [pendingSync, setPendingSync] = useState(0);
+
+  const refreshPendingSync = useCallback(async () => {
+    setPendingSync(await queueSize(outboxRef.current));
+  }, []);
+
+  const drain = useCallback(async () => {
+    if (!session?.access_token) return;
+    // A command the server actively rejects on replay (not a network retry)
+    // is left in the outbox rather than dropped — the "N unsynced" badge
+    // stays visible as the honest signal that something needs attention.
+    await drainQueue({
+      store: outboxRef.current,
+      getAccessToken: async () => session?.access_token,
+      publishableKey: cfg.publishableKey,
+      onEach: (entry, result, err) => {
+        if (err) console.error(`[offline-queue] queued ${entry.type} could not be synced:`, err.message);
+      },
+    });
+    await refreshPendingSync();
+  }, [session, cfg, refreshPendingSync]);
+
+  useEffect(() => {
+    refreshPendingSync();
+    drain();
+    function onOnline() { drain(); }
+    window.addEventListener("online", onOnline);
+    const interval = setInterval(drain, 20000);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      clearInterval(interval);
+    };
+  }, [drain, refreshPendingSync]);
+
+  async function command(type, payload, opts) {
     if (!session?.access_token) throw new Error("Not signed in");
-    return sendCommand({
+    // Durable queueing is opt-in per call site: a handful of TournamentDesk
+    // flows chain a command's result straight into a second command (e.g.
+    // Edit Players creating a new person, then assigning them) and cannot
+    // safely proceed on a queued-but-not-yet-applied result — those keep the
+    // original throw-on-failure behavior unchanged. Single, self-contained
+    // mutations (score corrections, hold/override/resume, remove player) opt
+    // in with { durable: true } so they survive a real connectivity gap.
+    if (!opts?.durable) {
+      return sendCommand({
+        commandUrl: cfg.commandUrl,
+        accessToken: session.access_token,
+        publishableKey: cfg.publishableKey,
+        type,
+        payload,
+      });
+    }
+    const body = await sendCommandDurable({
+      store: outboxRef.current,
       commandUrl: cfg.commandUrl,
       accessToken: session.access_token,
       publishableKey: cfg.publishableKey,
       type,
       payload,
     });
+    if (body.queued) await refreshPendingSync();
+    return body;
   }
 
   if (session === undefined) {
@@ -123,6 +178,7 @@ export default function App() {
         supabase={supabase}
         session={session}
         command={command}
+        pendingSync={pendingSync}
         onSignOut={() => supabase.auth.signOut({ scope: "local" })}
       />
     </ToastProvider>
@@ -239,7 +295,7 @@ function RecoveryScreen({ supabase, title, onDone, onSignOut }) {
   );
 }
 
-function SignedIn({ supabase, session, command, onSignOut }) {
+function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
   const toast = useToast();
   const [tournaments, setTournaments] = useState(null);
   const [metrics, setMetrics] = useState(null);
@@ -385,6 +441,7 @@ function SignedIn({ supabase, session, command, onSignOut }) {
         supabase={supabase}
         session={session}
         command={command}
+        pendingSync={pendingSync}
         tournamentId={selectedId}
         onBack={() => { setSelectedId(null); reloadList(); }}
         onSignOut={onSignOut}
@@ -404,6 +461,7 @@ function SignedIn({ supabase, session, command, onSignOut }) {
       foot={
         <>
           <div>{session.user.email}</div>
+          {pendingSync > 0 && <div className="app-pending-sync">{pendingSync} unsynced — will send when back online</div>}
           <Button variant="ghost" onClick={onSignOut}><LogOut size={15} aria-hidden="true" /> Sign out</Button>
           <div className="app-version">Version {APP_VERSION}</div>
         </>

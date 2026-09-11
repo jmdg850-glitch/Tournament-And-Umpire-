@@ -97,7 +97,7 @@ const NAV_SECTIONS = [
   { label: null, ids: ["settings"] },
 ];
 
-export default function TournamentDesk({ supabase, session, command, tournamentId, onBack, onSignOut }) {
+export default function TournamentDesk({ supabase, session, command, pendingSync, tournamentId, onBack, onSignOut }) {
   const toast = useToast();
   const [tab, setTab] = useState("overview");
   const [data, setData] = useState(null);
@@ -107,56 +107,77 @@ export default function TournamentDesk({ supabase, session, command, tournamentI
   const attemptedPlayoffs = useRef(new Set());
 
   const load = useCallback(async () => {
-    const queries = await Promise.all([
+    // Two phases: the tournament-scoped primary tables first (they carry
+    // their own tournament_id filter), then the dependent tables — which
+    // have no tournament_id column of their own — scoped by the resulting
+    // match/team/participant/division IDs via .in(). This used to fetch
+    // match_participants/participant_members/match_results/court_assignments/
+    // umpire_assignments/team_members/stages completely unfiltered (every row
+    // in the whole Supabase project) and filter client-side, which silently
+    // truncated at PostgREST's default response cap once the project
+    // accumulated enough tournaments — matches would show as "Side A vs Side
+    // B" instead of real names with no error at all. Scoping the query itself
+    // (the same .in() pattern already used server-side, e.g.
+    // packages/api/src/handleCommand.js's loadDivisionAssignment) fixes this
+    // for good, not just for the current row count.
+    const primary = await Promise.all([
       supabase.from("tournaments").select("*").eq("id", tournamentId).maybeSingle(),
       supabase.from("divisions").select("*").eq("tournament_id", tournamentId),
       supabase.from("persons").select("*").eq("tournament_id", tournamentId).order("display_name"),
       supabase.from("teams").select("*").eq("tournament_id", tournamentId).order("name"),
-      supabase.from("team_members").select("*"),
       supabase.from("participants").select("*").eq("tournament_id", tournamentId),
       supabase.from("courts").select("*").eq("tournament_id", tournamentId).order("sort_order"),
       supabase.from("tournament_members").select("*").eq("tournament_id", tournamentId),
       supabase.from("matches").select("*").eq("tournament_id", tournamentId).order("round"),
-      supabase.from("match_results").select("*"),
-      supabase.from("court_assignments").select("*"),
-      supabase.from("umpire_assignments").select("*"),
       supabase.from("court_devices").select("*").eq("tournament_id", tournamentId),
-      supabase.from("match_participants").select("*"),
-      supabase.from("participant_members").select("*"),
-      supabase.from("stages").select("*"),
       supabase.from("profiles").select("id, display_name"),
     ]);
-    const err = firstQueryError(queries);
-    if (err) {
-      setError(err.message);
+    const primaryErr = firstQueryError(primary);
+    if (primaryErr) {
+      setError(primaryErr.message);
       return;
     }
-    const [
-      t, divisions, persons, teams, teamMembers, participants, courts, members,
-      matches, results, courtsA, umpiresA, courtDevices, matchParticipants, participantMembers, stages, profiles,
-    ] = queries;
-    const matchIds = new Set((matches.data || []).map((m) => m.id));
-    const teamIds = new Set((teams.data || []).map((x) => x.id));
-    const participantIds = new Set((participants.data || []).map((x) => x.id));
-    const divisionIds = new Set((divisions.data || []).map((x) => x.id));
+    const [t, divisions, persons, teams, participants, courts, members, matches, courtDevices, profiles] = primary;
+    const matchIds = (matches.data || []).map((m) => m.id);
+    const teamIds = (teams.data || []).map((x) => x.id);
+    const participantIds = (participants.data || []).map((x) => x.id);
+    const divisionIds = (divisions.data || []).map((x) => x.id);
+
+    const empty = Promise.resolve({ data: [] });
+    const dependent = await Promise.all([
+      teamIds.length ? supabase.from("team_members").select("*").in("team_id", teamIds) : empty,
+      matchIds.length ? supabase.from("match_results").select("*").in("match_id", matchIds) : empty,
+      matchIds.length ? supabase.from("court_assignments").select("*").in("match_id", matchIds) : empty,
+      matchIds.length ? supabase.from("umpire_assignments").select("*").in("match_id", matchIds) : empty,
+      matchIds.length ? supabase.from("match_participants").select("*").in("match_id", matchIds) : empty,
+      participantIds.length ? supabase.from("participant_members").select("*").in("participant_id", participantIds) : empty,
+      divisionIds.length ? supabase.from("stages").select("*").in("division_id", divisionIds) : empty,
+    ]);
+    const dependentErr = firstQueryError(dependent);
+    if (dependentErr) {
+      setError(dependentErr.message);
+      return;
+    }
+    const [teamMembers, results, courtsA, umpiresA, matchParticipants, participantMembers, stages] = dependent;
+
     setError("");
     setData({
       tournament: t.data,
       divisions: divisions.data || [],
       persons: persons.data || [],
       teams: teams.data || [],
-      teamMembers: (teamMembers.data || []).filter((m) => teamIds.has(m.team_id)),
+      teamMembers: teamMembers.data || [],
       participants: participants.data || [],
-      participantMembers: (participantMembers.data || []).filter((m) => participantIds.has(m.participant_id)),
-      stages: (stages.data || []).filter((s) => divisionIds.has(s.division_id)),
+      participantMembers: participantMembers.data || [],
+      stages: stages.data || [],
       courts: courts.data || [],
       members: members.data || [],
       matches: matches.data || [],
-      results: (results.data || []).filter((r) => matchIds.has(r.match_id)),
-      courtAssignments: (courtsA.data || []).filter((r) => matchIds.has(r.match_id)),
-      umpireAssignments: (umpiresA.data || []).filter((r) => matchIds.has(r.match_id)),
+      results: results.data || [],
+      courtAssignments: courtsA.data || [],
+      umpireAssignments: umpiresA.data || [],
       courtDevices: courtDevices.data || [],
-      matchParticipants: (matchParticipants.data || []).filter((r) => matchIds.has(r.match_id)),
+      matchParticipants: matchParticipants.data || [],
       profiles: profiles.data || [],
     });
   }, [supabase, tournamentId]);
@@ -238,9 +259,13 @@ export default function TournamentDesk({ supabase, session, command, tournamentI
     setBusy(label);
     setError("");
     try {
-      const out = await command(type, payload);
-      await load();
-      toast(label);
+      const out = await command(type, payload, { durable: true });
+      if (out?.queued) {
+        toast(`${label} — queued, will sync when back online`);
+      } else {
+        await load();
+        toast(label);
+      }
       return out;
     } catch (err) {
       setError(err.message);
@@ -321,6 +346,7 @@ export default function TournamentDesk({ supabase, session, command, tournamentI
       foot={
         <>
           <div>{session.user.email}</div>
+          {pendingSync > 0 && <div className="app-pending-sync">{pendingSync} unsynced — will send when back online</div>}
           <Button variant="ghost" onClick={onSignOut}>Sign out</Button>
           <div className="app-version">Version {APP_VERSION}</div>
         </>
@@ -509,7 +535,7 @@ function EditScoreModal({ match, nameA, nameB, command, onClose, onSaved }) {
         seq: (state.lastSeq || 0) + 1,
         type: "correction",
         payload: { scoreA: nextA, scoreB: nextB, reason: reason.trim() || undefined },
-      });
+      }, { durable: true });
       await onSaved?.();
       onClose();
     } catch (err) {
@@ -570,6 +596,7 @@ function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
         const b = sideOf(m.id, "B", data);
         const court = courtFor(m, data);
         const ump = umpireFor(m, data);
+        const division = data.divisions.find((d) => d.id === m.division_id);
         const sa = m.score_state?.scoreA ?? 0;
         const sb = m.score_state?.scoreB ?? 0;
         return (
@@ -578,6 +605,7 @@ function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
             <div className="live-tile-status">LIVE</div>
             <div className="pts">{sa} – {sb}</div>
             <div className="live-tile-names">{a.name} vs {b.name}</div>
+            {division && <div className="muted live-tile-division">{division.name}</div>}
             <div className="muted live-tile-meta">
               Game {m.score_state?.gameNumber || 1}
               {ump ? ` · ${ump.name}` : ""}
@@ -850,7 +878,7 @@ function PlayersPanel({ data, busy, run, command, load }) {
       let skipped = 0;
       for (const p of targets) {
         try {
-          await command("remove_person", { person_id: p.id });
+          await command("remove_person", { person_id: p.id }, { durable: true });
           removed++;
         } catch {
           skipped++;
@@ -1683,14 +1711,84 @@ function EditPlayersModal({ match, data, command, onClose, onSaved }) {
   );
 }
 
+const OVERRIDE_START_REASONS = [
+  "Umpire device unavailable",
+  "Manual tournament desk intervention",
+  "Umpire connection failure",
+];
+
+// Operator-only emergency control — starts a match the normal umpire-starts-
+// their-own-match flow can't reach right now. Reuses the existing start_match
+// command exactly as the umpire app does (packages/api/src/handleCommand.js
+// already treats an organizer starting a match they aren't assigned to as an
+// override and requires/records the reason there); this modal just makes that
+// explicit and requires a reason before sending it.
+function OverrideStartModal({ match, data, command, onClose, onSaved }) {
+  const a = sideOf(match.id, "A", data);
+  const b = sideOf(match.id, "B", data);
+  const [reasonChoice, setReasonChoice] = useState("");
+  const [customReason, setCustomReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const reason = (reasonChoice === "Other" ? customReason : reasonChoice).trim();
+
+  async function submit() {
+    if (!reason) {
+      setError("A reason is required.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await command("start_match", { match_id: match.id, override: true, reason }, { durable: true });
+      await onSaved?.();
+      onClose();
+    } catch (err) {
+      setError(err.message || "Could not start this match");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="Override start match?" onClose={() => !busy && onClose()}>
+      <div className="stack">
+        <Alert>This bypasses the normal umpire start flow. Use only when the umpire cannot start the match.</Alert>
+        <p className="muted" style={{ margin: 0 }}>{a.name} vs {b.name}</p>
+        <Select label="Reason" value={reasonChoice} onChange={(e) => setReasonChoice(e.target.value)} disabled={busy}>
+          <option value="">Select a reason…</option>
+          {OVERRIDE_START_REASONS.map((r) => <option key={r} value={r}>{r}</option>)}
+          <option value="Other">Other</option>
+        </Select>
+        {reasonChoice === "Other" && (
+          <Input label="Describe the reason" value={customReason} onChange={(e) => setCustomReason(e.target.value)} disabled={busy} />
+        )}
+        {error && <Alert>{error}</Alert>}
+        <div className="row">
+          <Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button variant="danger" disabled={busy || !reason} onClick={submit}>{busy ? "Starting…" : "Override start"}</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function MatchTable({ data, rows, busy, run, command, load }) {
   const [editingPlayersId, setEditingPlayersId] = useState(null);
   const editingPlayersMatch = editingPlayersId ? rows.find((m) => m.id === editingPlayersId) : null;
+  const [overrideStartId, setOverrideStartId] = useState(null);
+  const overrideStartMatch = overrideStartId ? rows.find((m) => m.id === overrideStartId) : null;
   return (
     <>
     <Table
       responsive
       columns={[
+        {
+          key: "division",
+          header: "Division",
+          render: (m) => data.divisions.find((d) => d.id === m.division_id)?.name || "—",
+        },
         {
           key: "match",
           header: "Match",
@@ -1738,16 +1836,35 @@ function MatchTable({ data, rows, busy, run, command, load }) {
           ) : (umpireFor(m, data)?.name || "—"),
         },
         ...(command ? [{
-          key: "players",
+          key: "actions",
           header: "",
-          render: (m) => EDITABLE_PLAYERS_STATUSES.has(m.status) ? (
-            <Button variant="ghost" className="compact" onClick={() => setEditingPlayersId(m.id)}>
-              Edit players
-            </Button>
-          ) : (
-            <span className="muted" style={{ fontSize: "var(--text-xs)" }}>
-              {m.status === "in_progress" ? "Locked — match started" : "Locked — match completed"}
-            </span>
+          render: (m) => (
+            <div className="stack" style={{ gap: 4 }}>
+              {EDITABLE_PLAYERS_STATUSES.has(m.status) ? (
+                <Button variant="ghost" className="compact" onClick={() => setEditingPlayersId(m.id)}>
+                  Edit players
+                </Button>
+              ) : (
+                <span className="muted" style={{ fontSize: "var(--text-xs)" }}>
+                  {m.status === "in_progress" ? "Locked — match started" : "Locked — match completed"}
+                </span>
+              )}
+              {["ready", "assigned"].includes(m.status) && (
+                <Button variant="ghost" className="compact" onClick={() => setOverrideStartId(m.id)}>
+                  Override start
+                </Button>
+              )}
+              {m.status === "postponed" && (
+                <Button
+                  variant="ghost"
+                  className="compact"
+                  disabled={!!busy}
+                  onClick={() => run("Resume match", "transition_match", { match_id: m.id, status: "ready" })}
+                >
+                  Resume match
+                </Button>
+              )}
+            </div>
           ),
         }] : []),
       ]}
@@ -1761,6 +1878,15 @@ function MatchTable({ data, rows, busy, run, command, load }) {
         data={data}
         command={command}
         onClose={() => setEditingPlayersId(null)}
+        onSaved={load}
+      />
+    )}
+    {overrideStartMatch && (
+      <OverrideStartModal
+        match={overrideStartMatch}
+        data={data}
+        command={command}
+        onClose={() => setOverrideStartId(null)}
         onSaved={load}
       />
     )}
@@ -1794,7 +1920,7 @@ function MatchesPanel({ data, busy, run, command, load }) {
 
       <div>
         <div className="section-label">Upcoming</div>
-        {upcoming.length === 0 ? (
+        {upcoming.length + other.length === 0 ? (
           <EmptyState title="Nothing queued">Generate a bracket and assign courts and umpires to schedule matches.</EmptyState>
         ) : (
           <MatchTable data={data} rows={upcoming.concat(other)} busy={busy} run={run} command={command} load={load} />

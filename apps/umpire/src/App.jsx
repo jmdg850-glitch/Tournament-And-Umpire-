@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createBrowserClient, envConfig, sendCommand, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
+import { createBrowserClient, envConfig, sendCommand, sendCommandDurable, defaultStore, drainQueue, queueSize, isNetworkError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
 import { applyOptimisticScore, mergeMatchFromResult, reconcileAuthoritativeScore, isCoinTossCommitted } from "@tournament/engine";
 import { clearStation, parsePairingInput, readStation, writeStation } from "./stationSession.js";
 import PairingScanner from "./PairingScanner.jsx";
@@ -18,7 +18,7 @@ import {
   Scoreboard,
   StatusBadge,
 } from "@tournament/ui";
-import { ArrowLeft, LogOut, QrCode, RefreshCw } from "lucide-react";
+import { ArrowLeft, LogOut, PauseCircle, QrCode, RefreshCw } from "lucide-react";
 import { version as APP_VERSION } from "../package.json";
 
 function isStationInactiveError(err) {
@@ -652,10 +652,16 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   const [confirmComplete, setConfirmComplete] = useState(false);
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [showEditScore, setShowEditScore] = useState(false);
+  const [showHold, setShowHold] = useState(false);
+  const [holdReason, setHoldReason] = useState("");
+  const [holding, setHolding] = useState(false);
+  const [pendingSync, setPendingSync] = useState(0);
   const matchRef = useRef(null);
   const seqRef = useRef(0);
   const epochRef = useRef(0);
   const pendingRef = useRef(0);
+  const outboxRef = useRef(null);
+  if (!outboxRef.current) outboxRef.current = defaultStore("tournament-umpire-outbox");
   matchRef.current = match;
 
   const load = useCallback(async () => {
@@ -728,6 +734,36 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
     };
   }, [load]);
 
+  const refreshPendingSync = useCallback(async () => {
+    setPendingSync(await queueSize(outboxRef.current));
+  }, []);
+
+  const drain = useCallback(async () => {
+    const outcome = await drainQueue({
+      store: outboxRef.current,
+      getAccessToken: async () => session?.access_token,
+      publishableKey: cfg.publishableKey,
+      onEach: (entry, result, err) => {
+        if (result) applyResult(result);
+        else if (err && !isNetworkError(err)) setError(`A queued action could not be synced: ${err.message}`);
+      },
+    });
+    if (outcome.drained > 0) await load();
+    await refreshPendingSync();
+  }, [session, cfg, refreshPendingSync, load]);
+
+  useEffect(() => {
+    refreshPendingSync();
+    drain();
+    function onOnline() { drain(); }
+    window.addEventListener("online", onOnline);
+    const interval = setInterval(drain, 20000);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      clearInterval(interval);
+    };
+  }, [drain, refreshPendingSync]);
+
   function applyResult(result) {
     const current = matchRef.current;
     if (!current) return;
@@ -742,14 +778,16 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
     setBusy(true);
     setError("");
     try {
-      const body = await sendCommand({
+      const body = await sendCommandDurable({
+        store: outboxRef.current,
         commandUrl: cfg.commandUrl,
         accessToken: session.access_token,
         publishableKey: cfg.publishableKey,
         type,
         payload,
       });
-      if (body.result) applyResult(body.result);
+      if (body.queued) await refreshPendingSync();
+      else if (body.result) applyResult(body.result);
       else await load();
     } catch (err) {
       setError(err.message);
@@ -759,25 +797,40 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
     }
   }
 
+  async function confirmHold() {
+    setHolding(true);
+    try {
+      await command("transition_match", { match_id: match.id, status: "postponed", reason: holdReason.trim() || undefined });
+      setShowHold(false);
+      setHoldReason("");
+    } finally {
+      setHolding(false);
+    }
+  }
+
   async function sendCorrection(correctionPayload) {
     const current = matchRef.current;
     if (!current) return;
     setBusy(true);
     setError("");
+    const event_id = crypto.randomUUID();
     try {
-      const body = await sendCommand({
+      const body = await sendCommandDurable({
+        store: outboxRef.current,
         commandUrl: cfg.commandUrl,
         accessToken: session.access_token,
         publishableKey: cfg.publishableKey,
         type: "score_event",
+        commandId: event_id,
         payload: {
           match_id: current.id,
-          event_id: crypto.randomUUID(),
+          event_id,
           seq: seqRef.current + 1,
           type: "correction",
           payload: correctionPayload,
         },
       });
+      if (body.queued) { await refreshPendingSync(); return null; }
       if (body.result) applyResult(body.result);
       return body.result;
     } catch (err) {
@@ -813,16 +866,23 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
       return next;
     });
     try {
-      const body = await sendCommand({
+      const body = await sendCommandDurable({
+        store: outboxRef.current,
         commandUrl: cfg.commandUrl,
         accessToken: session.access_token,
         publishableKey: cfg.publishableKey,
         type: "score_event",
+        commandId: event_id,
         payload: { match_id: current.id, event_id, seq, type, payload: extra },
       });
       if (epochRef.current !== epoch) return;
+      if (body.queued) { await refreshPendingSync(); return; }
       if (body.result) applyResult(body.result);
     } catch (err) {
+      // A real server rejection (not a network failure — sendCommandDurable
+      // already queued and returned normally for those) means this point is
+      // genuinely invalid against the authoritative match state, so the
+      // optimistic tap must be rolled back rather than left showing.
       epochRef.current += 1;
       seqRef.current = snapshotSeq;
       setMatch(snapshot);
@@ -883,6 +943,11 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
       <header className="ump-top">
         <Button variant="secondary" onClick={onBack}><ArrowLeft size={15} aria-hidden="true" /> {station ? "Court" : "My matches"}</Button>
         <div className="row ump-top-actions">
+          {scoring && !station && (
+            <Button variant="secondary" className="ump-hold-btn" onClick={() => setShowHold(true)} disabled={busy}>
+              <PauseCircle size={15} aria-hidden="true" /> Hold
+            </Button>
+          )}
           <Button variant="secondary" onClick={load} disabled={busy}><RefreshCw size={15} aria-hidden="true" /> Reload</Button>
           <Button variant="ghost" onClick={onSignOut}><LogOut size={15} aria-hidden="true" /> Sign out</Button>
         </div>
@@ -907,6 +972,11 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
               <div className="game">Game {score.gameNumber || 1}</div>
               <StatusBadge status={match.status} />
               {pending > 0 ? <div className="ump-sync"><span className="ump-sync-dot" aria-hidden="true" /> Saving…</div> : null}
+              {pendingSync > 0 ? (
+                <div className="ump-sync ump-sync-offline">
+                  <span className="ump-sync-dot" aria-hidden="true" /> {pendingSync} unsynced — will send when back online
+                </div>
+              ) : null}
             </>
           )}
         />
@@ -1007,6 +1077,28 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
           sendCorrection={sendCorrection}
           onClose={() => setShowEditScore(false)}
         />
+      )}
+
+      {showHold && (
+        <Modal title="Hold this match?" onClose={() => !holding && setShowHold(false)}>
+          <div className="stack">
+            <p style={{ margin: 0 }}>
+              The match is put on hold — the current score and history are kept exactly as they are. The organizer can resume it from the desk when play continues.
+            </p>
+            <Input
+              label="Reason (optional)"
+              value={holdReason}
+              onChange={(e) => setHoldReason(e.target.value)}
+              placeholder="e.g. injury timeout, court issue"
+              disabled={holding}
+            />
+            {error && <Alert>{error}</Alert>}
+            <div className="row">
+              <Button variant="secondary" onClick={() => setShowHold(false)} disabled={holding}>Cancel</Button>
+              <Button onClick={confirmHold} disabled={holding}>{holding ? "Holding…" : "Hold match"}</Button>
+            </div>
+          </div>
+        </Modal>
       )}
 
       {confirmComplete && (

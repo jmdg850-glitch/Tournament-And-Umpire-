@@ -1065,3 +1065,231 @@ describe.skipIf(!live)("update_match_participant (edit players / change partner)
     expect(resultAfter.winner_slot).toBe("A");
   }, 90_000);
 });
+
+describe.skipIf(!live)("Umpire Cancel/Hold (transition_match: in_progress -> postponed)", () => {
+  let organizer;
+  let umpire;
+  let outsider;
+
+  beforeAll(async () => {
+    organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+    umpire = await signIn("umpire.dev@tournament.local", "dev-umpire-pass");
+    outsider = await signIn("outsider.dev@tournament.local", "dev-outsider-pass");
+  }, 30_000);
+
+  test("the assigned umpire can hold their own live match; score/court/umpire/round are preserved; an outsider cannot; the umpire cannot make any other transition", async () => {
+    const { matchId } = await setupCorrectionMatch(organizer, umpire, { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true });
+    await expectOk(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: 2, type: "point", payload: { team: "A" },
+    });
+    const { data: before } = await organizer.client.from("matches").select("*").eq("id", matchId).maybeSingle();
+    expect(before.status).toBe("in_progress");
+    expect(before.score_state.scoreA).toBe(1);
+
+    const outsiderTry = await send(outsider.token, "transition_match", { match_id: matchId, status: "postponed", reason: "x" });
+    expect(outsiderTry.body.ok).toBe(false);
+    expect(outsiderTry.status).toBe(403);
+
+    const wrongTransitionTry = await send(umpire.token, "transition_match", { match_id: matchId, status: "cancelled" });
+    expect(wrongTransitionTry.body.ok).toBe(false);
+    expect(wrongTransitionTry.body.error.code).toBe("FORBIDDEN");
+
+    const holdR = await expectOk(umpire.token, "transition_match", { match_id: matchId, status: "postponed", reason: "Injury timeout" });
+    expect(holdR.body.result.match.status).toBe("postponed");
+
+    const { data: after } = await organizer.client.from("matches").select("*").eq("id", matchId).maybeSingle();
+    expect(after.status).toBe("postponed");
+    expect(after.score_state.scoreA).toBe(1); // score preserved, not reset
+    expect(after.round).toBe(before.round);
+    const { data: courtAfter } = await organizer.client.from("court_assignments").select("*").eq("match_id", matchId).maybeSingle();
+    expect(courtAfter).toBeTruthy(); // court assignment untouched
+    const { data: umpAfter } = await organizer.client.from("umpire_assignments").select("*").eq("match_id", matchId).maybeSingle();
+    expect(umpAfter?.user_id).toBe(umpire.user.id); // umpire assignment untouched
+
+    const { data: auditRows } = await organizer.client
+      .from("audit_logs")
+      .select("*")
+      .eq("match_id", matchId)
+      .eq("command_type", "transition_match")
+      .order("created_at", { ascending: false })
+      .limit(1);
+    expect(auditRows[0].detail?.transition?.to).toBe("postponed");
+    expect(auditRows[0].detail?.transition?.reason).toBe("Injury timeout");
+
+    // Organizer still has full transition_match authority, unchanged — resume via the existing Operator "Resume match" path.
+    const resumeR = await expectOk(organizer.token, "transition_match", { match_id: matchId, status: "ready" });
+    expect(resumeR.body.result.match.status).toBe("ready");
+  }, 90_000);
+});
+
+describe.skipIf(!live)("Operator Override Start (start_match by organizer, not the assigned umpire)", () => {
+  let organizer;
+  let umpire;
+
+  beforeAll(async () => {
+    organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+    umpire = await signIn("umpire.dev@tournament.local", "dev-umpire-pass");
+  }, 30_000);
+
+  test("requires a reason, records a distinct override_start audit entry, and actually starts the match", async () => {
+    let r = await expectOk(organizer.token, "create_tournament", { name: `OS ${Date.now()}` });
+    const tournamentId = r.body.result.tournament.id;
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+    r = await expectOk(organizer.token, "create_division", {
+      tournament_id: tournamentId, name: "Override", format: "single_elim",
+      config: { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true },
+    });
+    const divisionId = r.body.result.division.id;
+    const persons = [];
+    for (const n of ["OS Ada", "OS Bea", "OS Cy", "OS Dee"]) {
+      r = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: n });
+      persons.push(r.body.result.person);
+    }
+    for (const [i, p] of persons.entries()) {
+      await expectOk(organizer.token, "register_participant", {
+        division_id: divisionId, kind: "doubles", display_name: p.display_name, seed: i + 1, person_ids: [p.id],
+      });
+    }
+    await expectOk(organizer.token, "add_member", { tournament_id: tournamentId, user_id: umpire.user.id, role: "umpire" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration_closed" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "ready" });
+    await expectOk(organizer.token, "generate_bracket", { division_id: divisionId });
+    const { data: matches } = await organizer.client.from("matches").select("*").eq("division_id", divisionId).eq("status", "scheduled");
+    const matchId = matches[0].id;
+    const courtR = await expectOk(organizer.token, "create_court", { tournament_id: tournamentId, name: "OS Court" });
+    await expectOk(organizer.token, "assign_court", { match_id: matchId, court_id: courtR.body.result.court.id });
+    // Deliberately no assign_umpire — simulates "umpire device unavailable".
+
+    // A plain organizer start (the pre-existing, unrelated capability every
+    // organizer has always had) must NOT require a reason — only the
+    // explicit override:true path does.
+    const plainStart = await send(organizer.token, "start_match", { match_id: matchId });
+    expect(plainStart.body.ok).toBe(true);
+    await expectOk(organizer.token, "transition_match", { match_id: matchId, status: "postponed" });
+    await expectOk(organizer.token, "transition_match", { match_id: matchId, status: "ready" });
+
+    const missingReasonTry = await send(organizer.token, "start_match", { match_id: matchId, override: true });
+    expect(missingReasonTry.body.ok).toBe(false);
+    expect(missingReasonTry.body.error.code).toBe("REASON_REQUIRED");
+
+    const okR = await expectOk(organizer.token, "start_match", { match_id: matchId, override: true, reason: "Umpire device unavailable" });
+    expect(okR.body.result.match.status).toBe("in_progress");
+
+    const { data: auditRows } = await organizer.client
+      .from("audit_logs")
+      .select("*")
+      .eq("match_id", matchId)
+      .eq("command_type", "start_match")
+      .order("created_at", { ascending: false })
+      .limit(1);
+    expect(auditRows[0].detail?.override_start?.reason).toBe("Umpire device unavailable");
+
+    // Regression: the umpire's own normal start (no override flag) still needs no reason.
+    const { data: matches2 } = await organizer.client.from("matches").select("*").eq("division_id", divisionId).eq("status", "scheduled");
+    if (matches2.length) {
+      const matchId2 = matches2[0].id;
+      await expectOk(organizer.token, "assign_umpire", { match_id: matchId2, user_id: umpire.user.id });
+      const normalStart = await expectOk(umpire.token, "start_match", { match_id: matchId2 });
+      expect(normalStart.body.result.match.status).toBe("in_progress");
+    }
+  }, 90_000);
+});
+
+describe.skipIf(!live)("Match integrity: self-match and cross-team protection (update_match_participant)", () => {
+  let organizer;
+
+  beforeAll(async () => {
+    organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+  }, 30_000);
+
+  test("Edit Players cannot set one side to the same player already on the opposing side of the same match (self-match protection)", async () => {
+    let r = await expectOk(organizer.token, "create_tournament", { name: `SM ${Date.now()}` });
+    const tournamentId = r.body.result.tournament.id;
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+    r = await expectOk(organizer.token, "create_division", {
+      tournament_id: tournamentId, name: "SelfMatch", format: "single_elim",
+      config: { winTo: 11, winBy: "two", bestOf: 1, isDoubles: false },
+    });
+    const divisionId = r.body.result.division.id;
+    const names = ["SM Ada", "SM Bea", "SM Cy", "SM Dee"];
+    const persons = [];
+    for (const n of names) {
+      r = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: n });
+      persons.push(r.body.result.person);
+    }
+    for (const [i, p] of persons.entries()) {
+      await expectOk(organizer.token, "register_participant", {
+        division_id: divisionId, kind: "singles", display_name: p.display_name, seed: i + 1, person_ids: [p.id],
+      });
+    }
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration_closed" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "ready" });
+    await expectOk(organizer.token, "generate_bracket", { division_id: divisionId });
+    const { data: matches } = await organizer.client.from("matches").select("*").eq("division_id", divisionId).eq("status", "scheduled");
+    const matchId = matches[0].id;
+    const { data: sideB } = await organizer.client.from("match_participants").select("*").eq("match_id", matchId).eq("slot", "B").maybeSingle();
+    const { data: sideBMembers } = await organizer.client.from("participant_members").select("*").eq("participant_id", sideB.participant_id);
+
+    const selfMatchTry = await send(organizer.token, "update_match_participant", {
+      match_id: matchId, slot: "A", person_ids: [sideBMembers[0].person_id],
+    });
+    expect(selfMatchTry.body.ok).toBe(false);
+    expect(selfMatchTry.body.error.code).toBe("PLAYER_ALREADY_ASSIGNED");
+  }, 60_000);
+
+  test("Edit Players on a team-elimination side rejects a player with no team affiliation at all in this division (the residual gap assignedPersonIds' team_members/participant_members scans don't cover)", async () => {
+    let r = await expectOk(organizer.token, "create_tournament", { name: `TB ${Date.now()}` });
+    const tournamentId = r.body.result.tournament.id;
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+    r = await expectOk(organizer.token, "create_division", {
+      tournament_id: tournamentId, name: "TeamBoundary", format: "team_elimination",
+      config: { winTo: 1, winBy: "none", bestOf: 1, isDoubles: true, qualifierMode: "top_x", qualifierCount: 4 },
+    });
+    const divisionId = r.body.result.division.id;
+    r = await expectOk(organizer.token, "create_team", { tournament_id: tournamentId, division_id: divisionId, name: "TB Falcons" });
+    const teamA = r.body.result.team.id;
+    r = await expectOk(organizer.token, "create_team", { tournament_id: tournamentId, division_id: divisionId, name: "TB Hawks" });
+    const teamB = r.body.result.team.id;
+
+    async function makePair(teamId, label) {
+      const p1 = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: `${label} One` });
+      const p2 = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: `${label} Two` });
+      const ids = [p1.body.result.person.id, p2.body.result.person.id];
+      await expectOk(organizer.token, "register_participant", {
+        division_id: divisionId, kind: "doubles", display_name: `${label} Pair`, team_id: teamId, person_ids: ids,
+      });
+      return ids;
+    }
+    await makePair(teamA, "FalconsA");
+    await makePair(teamA, "FalconsB");
+    await makePair(teamB, "HawksA");
+    await makePair(teamB, "HawksB");
+
+    // A person with NO team roster affiliation at all in this division (not
+    // Falcons, not Hawks) and never registered as a participant either — the
+    // pre-existing "already assigned" check (which scans every OTHER team's
+    // team_members, plus every placed participant) has nothing to catch
+    // here since this person appears in neither scan; only the new
+    // team-membership check can reject this.
+    const outsider = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: "Unaffiliated Player" });
+
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration_closed" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "ready" });
+    await expectOk(organizer.token, "generate_team_elimination", { division_id: divisionId });
+    const { data: pairMatches } = await organizer.client.from("matches").select("*").eq("division_id", divisionId).not("parent_match_id", "is", null);
+    const matchId = pairMatches[0].id;
+    const { data: mpA } = await organizer.client.from("match_participants").select("*").eq("match_id", matchId).eq("slot", "A").maybeSingle();
+    // Target whichever slot is actually the Falcons side in this generated
+    // schedule, so the Hawks outsider is always the wrong team for it.
+    const falconsSlot = mpA.team_id === teamA ? "A" : "B";
+    const { data: mpFalcons } = await organizer.client.from("match_participants").select("*").eq("match_id", matchId).eq("slot", falconsSlot).maybeSingle();
+    const { data: falconsMembers } = await organizer.client.from("participant_members").select("*").eq("participant_id", mpFalcons.participant_id).order("slot");
+
+    // Keep one of the Falcons side's real current players, swap the other for the Hawks outsider.
+    const crossTeamTry = await send(organizer.token, "update_match_participant", {
+      match_id: matchId, slot: falconsSlot, person_ids: [falconsMembers[0].person_id, outsider.body.result.person.id],
+    });
+    expect(crossTeamTry.body.ok).toBe(false);
+    expect(crossTeamTry.body.error.code).toBe("PLAYER_NOT_ON_TEAM");
+  }, 60_000);
+});

@@ -576,13 +576,22 @@ export function analyzeBracketRows(rows, data) {
             entry.error = resolved.error;
           } else {
             entry.players = resolved.players;
+            // Keyed by row+slot (not just row) so a name reused on the OTHER
+            // side of the very same match — a self-match, e.g. Side A and
+            // Side B both becoming "Carlos" — is caught here too, not just a
+            // genuine cross-row double-booking. Within one side's own pair,
+            // resolveBracketSide already rejects the same name appearing
+            // twice, so this loop only ever sees each side once.
+            const here = `row ${row.rowNumber} side ${slot}`;
             for (const p of resolved.players) {
               const key = normKey(p.name);
               const dupAt = usedPersonKeys.get(key);
-              if (dupAt && dupAt !== `row ${row.rowNumber}`) {
-                entry.error = `"${p.name}" is also assigned elsewhere in this import (${dupAt})`;
+              if (dupAt && dupAt !== here) {
+                entry.error = dupAt.startsWith(`row ${row.rowNumber} side`)
+                  ? `"${p.name}" cannot be on both sides of the same match`
+                  : `"${p.name}" is also assigned elsewhere in this import (${dupAt})`;
               } else {
-                usedPersonKeys.set(key, `row ${row.rowNumber}`);
+                usedPersonKeys.set(key, here);
               }
             }
           }

@@ -106,21 +106,26 @@ export default function CoinTossPanel({
         </Button>
       )}
 
-      {face && (
+      {face && spinning && (
         <>
           <Coin face={face} spinning={spinning} />
-          <p className="coin-flip-label">{spinning ? "COIN FLIP" : faceLabel}</p>
-          {!spinning && !committed && (
-            <div className="coin-result" aria-live="polite">
-              <div className="coin-face-word">{faceLabel}</div>
-              <p className="coin-award">Ask the players who won the toss.</p>
-            </div>
-          )}
+          <p className="coin-flip-label">COIN FLIP</p>
         </>
+      )}
+
+      {/* Once the coin lands, the result becomes a small, secondary badge —
+          the scoring-relevant decision (who serves first) is what the umpire
+          needs to focus on next, not a restated giant HEADS/TAILS. */}
+      {face && !spinning && !committed && (
+        <div className="coin-result-chip" aria-live="polite">
+          <span className="coin-result-chip-icon" aria-hidden="true">🪙</span>
+          <span className="coin-result-chip-label">{faceLabel}</span>
+        </div>
       )}
 
       {face && !spinning && !committed && (
         <div className="ump-toss-setup stack">
+          <p className="muted" style={{ margin: 0 }}>Select who serves first</p>
           <div>
             <div className="section-label">First server</div>
             <div className="ump-choice-row">

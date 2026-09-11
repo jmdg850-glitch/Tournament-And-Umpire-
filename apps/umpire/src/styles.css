@@ -34,6 +34,10 @@
   flex-shrink: 0;
 }
 .ump-top-actions { flex-shrink: 0; }
+.ump-hold-btn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+}
 .ump-list { padding: 14px; display: grid; gap: 10px; }
 .ump-context-bar {
   display: flex;
@@ -101,6 +105,13 @@
   border-radius: 50%;
   background: var(--tape);
   animation: ump-sync-pulse 1s ease-in-out infinite;
+}
+.ump-sync-offline {
+  background: color-mix(in srgb, var(--warn) 20%, transparent);
+  color: var(--warn);
+}
+.ump-sync-offline .ump-sync-dot {
+  background: var(--warn);
 }
 @keyframes ump-sync-pulse {
   0%, 100% { opacity: 1; }
@@ -291,12 +302,21 @@ html, body, #root {
   gap: 4px;
   margin-top: 8px;
 }
-.coin-face-word {
+.coin-result-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px auto 0;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--gold-accent) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--gold-accent) 45%, transparent);
   font-family: "Barlow Condensed", sans-serif;
-  font-size: clamp(2rem, 8vw, 3.2rem);
-  letter-spacing: 0.12em;
-  line-height: 0.95;
+  font-size: 1.1rem;
+  letter-spacing: 0.1em;
+  color: var(--gold-accent);
 }
+.coin-result-chip-icon { font-size: 1rem; }
 .coin-winner-name {
   font-size: 1.05rem;
   overflow-wrap: anywhere;

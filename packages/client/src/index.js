@@ -1,5 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 
+export { isNetworkError, createMemoryStore, createIndexedDBStore, defaultStore, sendCommandDurable, drainQueue, queueSize } from "./offlineQueue.js";
+
 export function createBrowserClient(url, publishableKey) {
   const httpOrigin = typeof window !== "undefined" && /^https?:$/.test(window.location.protocol);
   return createClient(url, publishableKey, {

@@ -6,10 +6,13 @@
     ".": "./src/index.js"
   },
   "scripts": {
-    "test": "echo skip",
+    "test": "vitest run",
     "lint": "node -e \"process.exit(0)\""
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.1"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
   }
 }

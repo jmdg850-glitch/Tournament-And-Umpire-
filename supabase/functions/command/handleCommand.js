@@ -2169,11 +2169,25 @@ async function handleUpdateMatchParticipant(admin, actor, payload, envelope) {
     teamMembers: snapshot.teamMembers,
     divisionParticipants: liveParticipants,
     participantMembers: liveParticipantMembers,
+    // exceptTeamId matches exceptParticipantTeamId below (both scope to the
+    // side's own team) — without it, assignedPersonIds' team_members scan has
+    // no exception at all and flags this side's OWN currently-kept player as
+    // "already assigned" purely for being on their own team's roster.
+    exceptTeamId: oldParticipant.team_id || null,
     exceptParticipantId: oldParticipant.id,
     exceptParticipantTeamId: oldParticipant.team_id || null
   });
   const check = validatePersonIdsForAssignment(personIds, assigned);
   if (!check.ok) throw httpError(409, check.code, check.message);
+  if (oldParticipant.team_id) {
+    const teamMemberIds = new Set(
+      snapshot.teamMembers.filter((tm) => tm.team_id === oldParticipant.team_id).map((tm) => tm.person_id)
+    );
+    const outsiders = personIds.filter((id) => !teamMemberIds.has(id));
+    if (outsiders.length) {
+      throw httpError(409, "PLAYER_NOT_ON_TEAM", "Every player on this side must be a registered member of the team this side represents");
+    }
+  }
   const unchanged = personIds.length === oldPersonIds.length && personIds.every((id, i) => id === oldPersonIds[i]);
   if (unchanged) throw httpError(400, "INVALID_COMMAND", "No player change to save");
   const nameFor = (id) => personById.get(id)?.display_name || id;
@@ -2552,12 +2566,20 @@ async function handleAssignUmpire(admin, actor, payload, envelope) {
 async function handleTransitionMatch(admin, actor, payload, envelope) {
   const match = await getMatch(admin, payload.match_id);
   const member = await loadMember(admin, match.tournament_id, actor.id);
-  requireOrganizer(member);
+  const isOrganizer = Boolean(member) && ["organizer", "admin"].includes(member.role);
+  if (!isOrganizer) {
+    if (payload.status !== "postponed" || match.status !== "in_progress") {
+      requireOrganizer(member);
+    }
+    const ump = await matchUmpire(admin, match.id);
+    requireScoreAccess(member, ump?.user_id, actor.id);
+  }
   try {
     assertTransitionMatch(match.status, payload.status);
   } catch (err) {
     throw httpError(409, err.code || "ILLEGAL_TRANSITION", err.message);
   }
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
   const batch = createBatch();
   persistMatch(batch, { ...match, status: payload.status });
   return commit(admin, batch, {
@@ -2565,12 +2587,21 @@ async function handleTransitionMatch(admin, actor, payload, envelope) {
     actorId: actor.id,
     tournamentId: match.tournament_id,
     matchId: match.id,
-    result: { match: { ...match, status: payload.status } }
+    result: { match: { ...match, status: payload.status } },
+    detail: reason ? { ok: true, transition: { match_id: match.id, from: match.status, to: payload.status, reason } } : void 0
   });
 }
 async function handleStartMatch(admin, actor, payload, envelope) {
   const match = await getMatch(admin, payload.match_id);
-  await authorizeMatchOperation(admin, actor, match);
+  const { member } = await authorizeMatchOperation(admin, actor, match);
+  const isOverride = payload.override === true;
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  if (isOverride) {
+    if (!member || !["organizer", "admin"].includes(member.role)) {
+      throw httpError(403, "FORBIDDEN", "Only an organizer can override-start a match");
+    }
+    if (!reason) throw httpError(400, "REASON_REQUIRED", "A reason is required to override-start a match");
+  }
   try {
     assertTransitionMatch(match.status, "in_progress");
   } catch (err) {
@@ -2586,7 +2617,8 @@ async function handleStartMatch(admin, actor, payload, envelope) {
     ...actorCommit(actor),
     tournamentId: match.tournament_id,
     matchId: match.id,
-    result: { match: next }
+    result: { match: next },
+    detail: isOverride ? { ok: true, override_start: { match_id: match.id, reason } } : void 0
   });
 }
 function coinTossResult(match, extra = {}) {
@@ -2683,7 +2715,7 @@ async function handleCoinToss(admin, actor, payload, envelope) {
 }
 async function handleScoreEvent(admin, actor, payload, envelope) {
   const match = await getMatch(admin, payload.match_id);
-  await authorizeMatchOperation(admin, actor, match);
+  const { member: scoringMember } = await authorizeMatchOperation(admin, actor, match);
   try {
     assertAllowedScoreEventType(payload.type, actor);
   } catch (err) {
@@ -2757,6 +2789,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
   let completed = null;
   let detail;
   if (isCorrection) {
+    const actorRole = scoringMember && ["organizer", "admin"].includes(scoringMember.role) ? "operator" : scoringMember?.role || actor.kind;
     detail = {
       ok: true,
       correction: {
@@ -2764,7 +2797,8 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
         game: state.gameNumber,
         previous: { scoreA: base.scoreA ?? null, scoreB: base.scoreB ?? null },
         next: { scoreA: state.scoreA, scoreB: state.scoreB },
-        reason: eventPayload.reason || null
+        reason: eventPayload.reason || null,
+        actor_role: actorRole
       }
     };
   }

@@ -178,6 +178,13 @@ input, select, textarea { background: #fff; }
 .live-tile-names {
   overflow-wrap: anywhere;
 }
+.live-tile-division {
+  color: #9099a8;
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+}
 .live-tile-meta {
   color: #9099a8;
 }
@@ -218,3 +225,8 @@ input, select, textarea { background: #fff; }
   flex-wrap: wrap;
 }
 .update-banner .btn.secondary { color: #eef1f4; border-color: #2c3340; }
+.app-pending-sync {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--warn);
+}

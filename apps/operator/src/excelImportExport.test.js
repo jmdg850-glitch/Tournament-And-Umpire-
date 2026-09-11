@@ -922,6 +922,19 @@ test("Bracket import: duplicate participant across two rows in the same file is 
   assert.ok(c1.error || c2.error, "one of the two duplicate assignments must be flagged");
 });
 
+test("Bracket import: self-match — setting Side A and Side B of the SAME match to the same player is rejected", () => {
+  const data = singleElimBracketData();
+  const rows = parseBracketWorkbook(exportBufferFor(data)).rows.map((r) =>
+    r.matchId === "m1" ? { ...r, sideA: "Zed", sideB: "Zed" } : r
+  );
+  const analysis = analyzeBracketRows(rows, data);
+  const row = analysis.rows.find((r) => r.matchId === "m1");
+  const cA = row.changes.find((c) => c.slot === "A");
+  const cB = row.changes.find((c) => c.slot === "B");
+  assert.ok(cA.error || cB.error, "putting the same player on both sides of one match must be flagged");
+  assert.match((cA.error || cB.error), /both sides of the same match/);
+});
+
 test("Bracket import: a completed match is protected — cannot be changed from Excel", () => {
   const data = singleElimBracketData({
     matches: [

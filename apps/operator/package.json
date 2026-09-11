@@ -1,7 +1,7 @@
 {
   "name": "@tournament/operator",
   "private": true,
-  "version": "1.2.11",
+  "version": "1.2.13",
   "type": "module",
   "description": "Tournament operator desktop application",
   "author": "Tournament",
@@ -12,7 +12,7 @@
     "preview": "vite preview --port 4174",
     "lint": "node -e \"process.exit(0)\"",
     "clean:desktop": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\"",
-    "build:desktop": "npm run clean:desktop && cross-env VITE_ELECTRON=1 vite build && electron-builder --win nsis --publish never",
+    "build:desktop": "npm run clean:desktop && cross-env VITE_ELECTRON=1 vite build && node ../../scripts/build-desktop-win.mjs",
     "pack:desktop": "cross-env VITE_ELECTRON=1 vite build && electron-builder --win dir --publish never",
     "publish:desktop": "node ../../scripts/publish-desktop-update.mjs",
     "publish:desktop:check": "node ../../scripts/publish-desktop-update.mjs --check",
