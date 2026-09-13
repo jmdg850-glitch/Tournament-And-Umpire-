@@ -74,10 +74,30 @@ function releaseUnlock() {
 process.on("exit", releaseUnlock);
 process.on("SIGINT", () => { releaseUnlock(); process.exit(130); });
 
+// On Windows, spawnSync/execFileSync with shell:true hands the whole command
+// line to cmd.exe as a raw string — cmd.exe tokenizes on whitespace before
+// anything else, and (unlike a shell:false spawn, which goes through
+// CreateProcess's own argv escaping) Node does NOT quote `cmd` or any `args`
+// element for you. An absolute path containing a space (this repo's own
+// directory, "TOURNAMENT FINAL", included) therefore gets split apart and
+// treated as two separate words — confirmed here twice, once as the `cmd`
+// itself (gradlew.bat) and once as an argument (a script path passed to
+// `node`). Quoting is safe to apply unconditionally to anything containing a
+// space; things that never contain one (bare command names, flags like -w)
+// are returned unchanged.
+function quoteForWindowsShell(value) {
+  if (process.platform !== "win32") return value;
+  if (!/\s/.test(value)) return value;
+  if (/^".*"$/.test(value)) return value;
+  return `"${value}"`;
+}
+
 function run(cmd, args, opts = {}) {
   // shell:true on Windows is required for `npm` (it's npm.cmd, not an .exe) —
-  // applied uniformly here so every call behaves the same way.
-  const res = spawnSync(cmd, args, { stdio: "inherit", shell: process.platform === "win32", ...opts });
+  // applied uniformly here so every call behaves the same way. Every arg is
+  // quoted too (see quoteForWindowsShell) since the same cmd.exe tokenizing
+  // hazard applies to arguments, not just the command itself.
+  const res = spawnSync(quoteForWindowsShell(cmd), (args || []).map(quoteForWindowsShell), { stdio: "inherit", shell: process.platform === "win32", ...opts });
   if (res.error) throw res.error;
   return res.status ?? 1;
 }
@@ -272,7 +292,7 @@ if (appIdMatch?.[1] !== "app.tournament.umpire") fail("Verify Android build", `U
 if (versionCodeOut?.[1] !== String(nextVersionCode)) fail("Verify Android build", `APK versionCode ${versionCodeOut?.[1]} does not match expected ${nextVersionCode}`);
 if (versionNameOut?.[1] !== nextUmpireVersion) fail("Verify Android build", `APK versionName ${versionNameOut?.[1]} does not match expected ${nextUmpireVersion}`);
 
-const sig = tryCapture(resolve(buildTools, "apksigner.bat"), ["verify", "--print-certs", apkPath], {
+const sig = tryCapture(quoteForWindowsShell(resolve(buildTools, "apksigner.bat")), ["verify", "--print-certs", apkPath].map(quoteForWindowsShell), {
   env: { ...process.env, JAVA_HOME: javaHome },
   shell: process.platform === "win32", // apksigner.bat is a batch file, not a .exe
 });

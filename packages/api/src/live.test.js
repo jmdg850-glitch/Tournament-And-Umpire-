@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { createApp } from "./src/server.js";
-import { describe, expect, test, beforeAll } from "vitest";
+import { describe, expect, test, beforeAll, vi } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -287,6 +287,80 @@ async function assignAndPlay(token, matchId, courtId, umpireId, winner = "A") {
     type: "point",
     payload: { team: winner },
   });
+}
+
+async function setupTeamEliminationQualifiers(organizer, umpire, divisionConfig) {
+  const createId = crypto.randomUUID();
+  let r = await expectOk(organizer.token, "create_tournament", { name: `TE ${Date.now()}` }, createId);
+  const tournamentId = r.body.result.tournament.id;
+  await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+
+  r = await expectOk(organizer.token, "create_division", {
+    tournament_id: tournamentId,
+    name: "Team Elim",
+    format: "team_elimination",
+    config: { winTo: 1, winBy: "none", bestOf: 1, isDoubles: true, ...divisionConfig },
+  });
+  const divisionId = r.body.result.division.id;
+
+  const teamIds = [];
+  for (const name of ["Alpha", "Bravo", "Charlie", "Delta"]) {
+    r = await expectOk(organizer.token, "create_team", { tournament_id: tournamentId, division_id: divisionId, name });
+    teamIds.push(r.body.result.team.id);
+  }
+
+  const personIds = [];
+  for (let t = 0; t < 4; t++) {
+    for (let p = 0; p < 4; p++) {
+      r = await expectOk(organizer.token, "add_person", {
+        tournament_id: tournamentId,
+        display_name: `DS-T${t + 1}P${p + 1}`,
+      });
+      personIds.push(r.body.result.person.id);
+    }
+  }
+
+  for (let t = 0; t < 4; t++) {
+    for (let p = 0; p < 4; p++) {
+      await expectOk(organizer.token, "add_team_member", { team_id: teamIds[t], person_id: personIds[t * 4 + p] });
+    }
+  }
+
+  for (let t = 0; t < 4; t++) {
+    for (let pair = 0; pair < 2; pair++) {
+      const a = personIds[t * 4 + pair * 2];
+      const b = personIds[t * 4 + pair * 2 + 1];
+      await expectOk(organizer.token, "register_participant", {
+        division_id: divisionId,
+        kind: "doubles",
+        display_name: `DS Team ${t + 1} Pair ${pair + 1}`,
+        team_id: teamIds[t],
+        seed: t * 2 + pair + 1,
+        person_ids: [a, b],
+      });
+    }
+  }
+
+  r = await expectOk(organizer.token, "create_court", { tournament_id: tournamentId, name: "Court DS" });
+  const courtId = r.body.result.court.id;
+  await expectOk(organizer.token, "add_member", { tournament_id: tournamentId, user_id: umpire.user.id, role: "umpire" });
+  await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration_closed" });
+  await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "ready" });
+  await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "in_progress" });
+
+  await expectOk(organizer.token, "generate_team_elimination", { division_id: divisionId });
+
+  const { data: rrPairs } = await organizer.client
+    .from("matches")
+    .select("*")
+    .eq("division_id", divisionId)
+    .eq("bracket_side", "pair")
+    .eq("status", "scheduled");
+  for (const m of rrPairs) {
+    await assignAndPlay(organizer.token, m.id, courtId, umpire.user.id, "A");
+  }
+
+  return { tournamentId, divisionId, courtId };
 }
 
 describe.skipIf(!live)("live team elimination path", () => {
@@ -580,6 +654,179 @@ describe.skipIf(!live)("live team elimination path", () => {
     const { data: tournament } = await organizer.client.from("tournaments").select("*").eq("id", tournamentId).maybeSingle();
     expect(tournament.status).toBe("completed");
   }, 240_000);
+
+  test("Direct Semifinals: exactly 4 qualifiers skip straight to semifinal/bronze/final with no intermediate playoff round", async () => {
+    const { divisionId } = await setupTeamEliminationQualifiers(organizer, umpire, {
+      progressionMode: "direct_semifinals",
+      qualifierMode: "top_x",
+      qualifierCount: 4,
+    });
+
+    const r = await expectOk(organizer.token, "generate_team_playoffs", { division_id: divisionId });
+    expect(r.body.result.qualifiers).toHaveLength(4);
+
+    const { data: knockoutMatches } = await organizer.client
+      .from("matches")
+      .select("*")
+      .eq("division_id", divisionId)
+      .is("parent_match_id", null)
+      .not("stage_label", "eq", "round_robin");
+    const labels = knockoutMatches.map((m) => m.stage_label).sort();
+    expect(labels).toEqual(["bronze", "final", "semifinal", "semifinal"]);
+
+    const { data: stages } = await organizer.client.from("stages").select("*").eq("division_id", divisionId).eq("kind", "team_knockout");
+    expect(stages).toHaveLength(1);
+    expect(stages[0].config.progressionMode).toBe("direct_semifinals");
+  }, 240_000);
+
+  test("Direct Semifinals: a qualifier count that does not resolve to exactly 4 is rejected with a clear error and generates no bracket", async () => {
+    const { divisionId } = await setupTeamEliminationQualifiers(organizer, umpire, {
+      progressionMode: "direct_semifinals",
+      qualifierMode: "top_x",
+      qualifierCount: 8,
+    });
+
+    const r = await send(organizer.token, "generate_team_playoffs", { division_id: divisionId });
+    expect(r.body.ok).toBe(false);
+    expect(r.body.error.code).toBe("DIRECT_SEMIS_INVALID_COUNT");
+
+    const { data: stages } = await organizer.client.from("stages").select("*").eq("division_id", divisionId).eq("kind", "team_knockout");
+    expect(stages).toHaveLength(0);
+  }, 240_000);
+});
+
+// Live, DB-verified proof of the offline-sync fix's server-side assumptions:
+// a lost-response retry never creates a second score_events row, a
+// sequential backlog (what a drained offline queue looks like from the
+// server's point of view) converges matches.score_state correctly, and the
+// existing Realtime pipeline the Operator relies on actually delivers the
+// final synced score. These don't need a real offline device — they prove
+// the server contract the client-side offlineQueue.js/App.jsx fix depends
+// on; the client-side mechanics themselves are covered by
+// packages/client/src/offlineScoringLifecycle.test.js.
+describe.skipIf(!live)("offline sync — live DB and Realtime verification", () => {
+  let organizer;
+  let umpire;
+
+  beforeAll(async () => {
+    organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+    umpire = await signIn("umpire.dev@tournament.local", "dev-umpire-pass");
+  }, 30_000);
+
+  test("lost-response retry, sequential backlog convergence, and Realtime delivery all hold against the real server", async () => {
+    let r = await expectOk(organizer.token, "create_tournament", { name: `OFFSYNC ${Date.now()}` });
+    const tournamentId = r.body.result.tournament.id;
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+
+    r = await expectOk(organizer.token, "create_division", {
+      tournament_id: tournamentId,
+      name: "Offline Sync",
+      format: "single_elim",
+      config: { winTo: 11, winBy: "two", bestOf: 1, isDoubles: false },
+    });
+    const divisionId = r.body.result.division.id;
+
+    const personIds = [];
+    for (const name of ["OS Player A", "OS Player B"]) {
+      r = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: name });
+      personIds.push(r.body.result.person.id);
+    }
+    for (const [i, personId] of personIds.entries()) {
+      await expectOk(organizer.token, "register_participant", {
+        division_id: divisionId, kind: "singles", display_name: `OS ${i + 1}`, seed: i + 1, person_ids: [personId],
+      });
+    }
+
+    r = await expectOk(organizer.token, "create_court", { tournament_id: tournamentId, name: "Court OS" });
+    const courtId = r.body.result.court.id;
+    await expectOk(organizer.token, "add_member", { tournament_id: tournamentId, user_id: umpire.user.id, role: "umpire" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration_closed" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "ready" });
+    await expectOk(organizer.token, "generate_bracket", { division_id: divisionId });
+
+    const { data: matches } = await organizer.client.from("matches").select("*").eq("division_id", divisionId).eq("status", "scheduled");
+    const matchId = matches[0].id;
+    await expectOk(organizer.token, "assign_court", { match_id: matchId, court_id: courtId });
+    await expectOk(organizer.token, "assign_umpire", { match_id: matchId, user_id: umpire.user.id });
+    await expectOk(umpire.token, "start_match", { match_id: matchId });
+    await expectOk(umpire.token, "coin_toss", { match_id: matchId, event_id: crypto.randomUUID(), seq: 1, result: "A", serving_team: "A" });
+    let nextSeq = 2;
+
+    // --- Lost response / retry: resubmitting the identical command_id AND
+    // the same event_id/seq inside the payload — exactly what a real
+    // offline-queue replay (or drainQueue's own retry) does, since it never
+    // mints a new id on retry — must never create a second score_events row.
+    const retryEventId = crypto.randomUUID();
+    const retrySeq = nextSeq++;
+    const retryPayload = { match_id: matchId, event_id: retryEventId, seq: retrySeq, type: "point", payload: { team: "A" } };
+    const first = await expectOk(umpire.token, "score_event", retryPayload, retryEventId);
+    expect(first.body.idempotent).toBe(false);
+    const second = await send(umpire.token, "score_event", retryPayload, retryEventId);
+    expect(second.body.ok).toBe(true);
+    expect(second.body.idempotent).toBe(true);
+    const { data: dupRows, error: dupErr } = await organizer.client.from("score_events").select("*").eq("match_id", matchId).eq("id", retryEventId);
+    expect(dupErr).toBeNull();
+    expect(dupRows).toHaveLength(1);
+
+    // --- Sequential backlog convergence: an in-order run of score events —
+    // what a drained offline queue looks like from the server's point of
+    // view — must land correctly in matches.score_state.
+    for (let i = 0; i < 3; i++) {
+      await expectOk(umpire.token, "score_event", {
+        match_id: matchId, event_id: crypto.randomUUID(), seq: nextSeq++, type: "point", payload: { team: "A" },
+      });
+    }
+    const { data: afterBacklog, error: rowErr } = await organizer.client.from("matches").select("*").eq("id", matchId).maybeSingle();
+    expect(rowErr).toBeNull();
+    expect(afterBacklog.score_state.lastSeq).toBe(nextSeq - 1);
+    // Every event after the coin toss (seq 1) scored a point for A — the
+    // retry event plus this backlog — so scoreA tracks lastSeq - 1 exactly.
+    expect(afterBacklog.score_state.scoreA).toBe(afterBacklog.score_state.lastSeq - 1);
+
+    // --- Realtime: the Operator's existing postgres_changes subscription on
+    // this match must actually receive the final synced score, proving the
+    // "Operator receives the score via existing Realtime flow" requirement
+    // without needing a second app instance.
+    const received = [];
+    let subscribeStatusSeen = null;
+    const channel = organizer.client
+      .channel(`live-match-test:${matchId}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "matches", filter: `id=eq.${matchId}` }, (payload) => received.push(payload));
+    await new Promise((resolve, reject) => {
+      channel.subscribe((status, err) => {
+        subscribeStatusSeen = status;
+        if (status === "SUBSCRIBED") resolve();
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          reject(new Error(`realtime subscribe failed: ${status} ${err?.message || ""}`));
+        }
+      });
+    });
+    // A "SUBSCRIBED" callback can fire fractionally before the server-side
+    // listener is fully attached (a known supabase-js/Realtime timing quirk,
+    // more likely to surface deep in a long-lived process) — a short settle
+    // delay before triggering the change is the standard mitigation.
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      const realtimeSeq = nextSeq++;
+      await expectOk(umpire.token, "score_event", {
+        match_id: matchId, event_id: crypto.randomUUID(), seq: realtimeSeq, type: "point", payload: { team: "A" },
+      });
+      try {
+        await vi.waitFor(
+          () => {
+            expect(received.some((p) => p.new?.score_state?.lastSeq === realtimeSeq)).toBe(true);
+          },
+          { timeout: 30_000, interval: 250 },
+        );
+      } catch (waitErr) {
+        console.error("[realtime debug] subscribeStatus:", subscribeStatusSeen, "received count:", received.length,
+          "received lastSeqs:", received.map((p) => p.new?.score_state?.lastSeq), "eventTypes:", received.map((p) => p.eventType));
+        throw waitErr;
+      }
+    } finally {
+      await organizer.client.removeChannel(channel);
+    }
+  }, 120_000);
 });
 
 function pairStationUrl() {

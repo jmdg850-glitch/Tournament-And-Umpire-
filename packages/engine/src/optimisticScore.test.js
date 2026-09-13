@@ -56,6 +56,20 @@ describe("optimistic scoring", () => {
     expect(merged.id).toBe("m1");
   });
 
+  test("mergeMatchFromResult ignores a result for a DIFFERENT match — a drained backlog for a previously-opened match must never bleed onto the match currently on screen", () => {
+    const current = { id: "m2", status: "in_progress", score_state: { lastSeq: 3, scoreA: 3, scoreB: 1 } };
+    const merged = mergeMatchFromResult(current, { match: { id: "m1", status: "completed", score_state: { lastSeq: 9, scoreA: 11, scoreB: 4 }, winner: "A" } });
+    expect(merged).toBe(current);
+    expect(merged.score_state.scoreA).toBe(3);
+    expect(merged.status).toBe("in_progress");
+  });
+
+  test("mergeMatchFromResult still merges when the result carries no match id at all (unchanged legacy shape)", () => {
+    const current = { id: "m1", status: "in_progress", score_state: { lastSeq: 0, scoreA: 0, scoreB: 0 } };
+    const merged = mergeMatchFromResult(current, { score_state: { lastSeq: 1, scoreA: 1, scoreB: 0 } });
+    expect(merged.score_state.scoreA).toBe(1);
+  });
+
   test("empty score_state still produces an initial optimistic board", () => {
     const st = scoreStateForOptimistic({ score_state: {} }, settings);
     expect(st.lastSeq).toBe(0);

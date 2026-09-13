@@ -60,6 +60,21 @@ describe("sendCommandDurable", () => {
     expect(queued).toHaveLength(1);
     expect(queued[0].command_id).toBe(result.command_id);
   });
+
+  it("forceQueue skips the network attempt entirely and queues immediately, even when send would succeed", async () => {
+    const send = vi.fn().mockResolvedValue({ ok: true, result: {} });
+    const store = createMemoryStore();
+    const result = await sendCommandDurable({ store, send, type: "score_event", payload: { match_id: "m1", seq: 3 }, commandId: "c3", forceQueue: true });
+    expect(result).toEqual({ ok: true, queued: true, command_id: "c3" });
+    expect(send).not.toHaveBeenCalled();
+    expect(await queueSize(store)).toBe(1);
+  });
+
+  it("forceQueue without a store throws rather than silently sending live", async () => {
+    const send = vi.fn().mockResolvedValue({ ok: true, result: {} });
+    await expect(sendCommandDurable({ send, type: "score_event", payload: {}, forceQueue: true })).rejects.toThrow();
+    expect(send).not.toHaveBeenCalled();
+  });
 });
 
 describe("drainQueue", () => {

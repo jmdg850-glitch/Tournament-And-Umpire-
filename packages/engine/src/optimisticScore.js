@@ -51,6 +51,12 @@ export function mergeMatchFromResult(current, result) {
   if (!current) return result?.match || current;
   if (!result || typeof result !== "object") return current;
   const row = result.match && typeof result.match === "object" ? result.match : null;
+  // A drained/replayed command's result can belong to a DIFFERENT match than
+  // the one currently on screen (e.g. the umpire backed out of match A with
+  // still-queued commands, opened match B, and A's backlog then drains) —
+  // never let that stale result's fields bleed onto the wrong match.
+  const resultMatchId = row?.id ?? result.match_id;
+  if (resultMatchId != null && current.id != null && resultMatchId !== current.id) return current;
   const next = { ...current };
   const src = row || result;
   if (src.status) next.status = src.status;

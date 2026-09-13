@@ -100,8 +100,25 @@ export function defaultStore(dbName) {
 // operator commands) can keep that update on screen instead of rolling it
 // back. Any error that reached the server (auth, validation, lifecycle,
 // conflict) is rethrown unchanged — existing error handling is untouched.
-export async function sendCommandDurable({ store, send = sendCommand, commandUrl, accessToken, publishableKey, type, payload, commandId }) {
+//
+// `forceQueue: true` skips the live-send attempt entirely and queues
+// immediately. Callers must pass this whenever an earlier command for the
+// same resource (e.g. the same match's score_events) is still sitting
+// undrained in `store`: on a flaky ("network flapping") connection, a later
+// command can otherwise slip through live while an earlier one is still
+// queued, creating a gap in a strictly-ordered sequence (like score_event's
+// seq) — the server's OUT_OF_ORDER check only rejects seq <= lastSeq, not a
+// skipped seq, so a gap isn't caught until the earlier, now-stale queued
+// command is finally replayed and permanently rejected. Forcing every
+// command behind an already-nonempty per-resource queue to also queue keeps
+// replay strictly FIFO and gap-free.
+export async function sendCommandDurable({ store, send = sendCommand, commandUrl, accessToken, publishableKey, type, payload, commandId, forceQueue = false }) {
   const command_id = commandId || crypto.randomUUID();
+  if (forceQueue) {
+    if (!store) throw new Error("sendCommandDurable: forceQueue requires a store");
+    await store.put({ command_id, type, payload, commandUrl, publishableKey, queuedAt: Date.now() });
+    return { ok: true, queued: true, command_id };
+  }
   try {
     return await send({ commandUrl, accessToken, publishableKey, type, payload, commandId: command_id });
   } catch (err) {

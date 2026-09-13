@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createBrowserClient, envConfig, sendCommand, sendCommandDurable, defaultStore, drainQueue, queueSize, isNetworkError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
+import { createBrowserClient, envConfig, sendCommand, sendCommandDurable, defaultStore, drainQueue, queueSize, isNetworkError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, readMatchSnapshot, writeMatchSnapshot } from "@tournament/client";
 import { applyOptimisticScore, mergeMatchFromResult, reconcileAuthoritativeScore, isCoinTossCommitted } from "@tournament/engine";
 import { clearStation, parsePairingInput, readStation, writeStation } from "./stationSession.js";
 import PairingScanner from "./PairingScanner.jsx";
@@ -641,7 +641,15 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose }) {
 }
 
 function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut }) {
-  const [match, setMatch] = useState(null);
+  // Read once, synchronously, before first paint: if this device already has
+  // a locally-durable snapshot of this exact match, the scoreboard can render
+  // it immediately — including while offline and before load() ever gets a
+  // chance to run — instead of blocking on a network round trip. This is the
+  // fix for "refresh while offline loses the score."
+  const initialSnapshot = readMatchSnapshot();
+  const cachedForThisMatch = initialSnapshot?.matchId === matchId ? initialSnapshot : null;
+
+  const [match, setMatch] = useState(() => cachedForThisMatch?.match ?? null);
   const [sides, setSides] = useState([]);
   const [participants, setParticipants] = useState([]);
   const [court, setCourt] = useState(null);
@@ -656,16 +664,55 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   const [holdReason, setHoldReason] = useState("");
   const [holding, setHolding] = useState(false);
   const [pendingSync, setPendingSync] = useState(0);
+  // "offline" | "syncing" | "synced" | "stuck" | "idle" — drives the Step 5
+  // status indicator; "stuck" means drainQueue hit a real (non-network)
+  // rejection that needs a human decision, see stuckEntry/resolveStuck below.
+  const [syncStatus, setSyncStatus] = useState("idle");
+  const [stuckEntry, setStuckEntry] = useState(null);
+  const [showStuckConfirm, setShowStuckConfirm] = useState(false);
+  const [resolvingStuck, setResolvingStuck] = useState(false);
   const matchRef = useRef(null);
-  const seqRef = useRef(0);
+  const seqRef = useRef(cachedForThisMatch ? Number(cachedForThisMatch.seq || 0) : 0);
   const epochRef = useRef(0);
   const pendingRef = useRef(0);
+  const drainRef = useRef(null);
   const outboxRef = useRef(null);
   if (!outboxRef.current) outboxRef.current = defaultStore("tournament-umpire-outbox");
   matchRef.current = match;
 
+  // Keep the durable snapshot current with whatever's on screen — optimistic
+  // taps, drained server confirmations, and fresh loads all flow through
+  // setMatch, so persisting here (rather than at every call site) covers all
+  // of them once. Best-effort: writeMatchSnapshot never throws.
+  useEffect(() => {
+    if (match) writeMatchSnapshot(matchId, match, seqRef.current);
+  }, [match, matchId]);
+
+  // Any command mutating this match (a score_event above all — its `seq`
+  // must be strictly gap-free) must never be sent live while an earlier one
+  // for this same match is still sitting undrained in the outbox: on a flaky
+  // connection a later tap can otherwise slip through before an earlier
+  // queued one, creating a gap that later gets the earlier command
+  // permanently rejected once it's finally replayed. Callers pass the
+  // result as sendCommandDurable's forceQueue option.
+  async function hasQueuedForMatch(id) {
+    const store = outboxRef.current;
+    if (!store) return false;
+    const all = await store.list();
+    return all.some((e) => e.payload?.match_id === id);
+  }
+
   const load = useCallback(async () => {
     if (pendingRef.current > 0) return;
+    const store = outboxRef.current;
+    const queued = store ? await store.list() : [];
+    // This match still has commands sitting in the durable outbox awaiting
+    // replay — applyResult() is already advancing `match` correctly as each
+    // one drains, so a fetch here would only show a stale, pre-drain
+    // snapshot. Once the backlog clears (or its stuck entry is resolved),
+    // load() resumes overwriting freely — this is recomputed fresh on every
+    // call, never a lingering flag.
+    const hasQueuedForThisMatch = queued.some((e) => e.payload?.match_id === matchId);
     if (station) {
       try {
         const body = await sendCommand({
@@ -678,14 +725,24 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         const sync = body.result;
         const m = (sync.matches || []).find((row) => row.id === matchId);
         if (!m) { setLoadError("This match is not on this court."); setMatch(null); return; }
-        setMatch(m);
-        seqRef.current = Number(m.score_state?.lastSeq || 0);
+        if (!hasQueuedForThisMatch) {
+          setMatch(m);
+          seqRef.current = Number(m.score_state?.lastSeq || 0);
+        }
         setSides((sync.sides || []).filter((row) => row.match_id === matchId));
         setParticipants(sync.participants || []);
         setCourt(sync.court || null);
         setLoadError("");
         setError("");
+        if (queued.length > 0) drainRef.current?.();
       } catch (err) {
+        // A plain connectivity blip with something already on screen (cached
+        // from a prior load or rehydrated from the durable snapshot) must
+        // not blank the scoreboard — the umpire keeps scoring from the
+        // durable local view, and the next successful load/drain catches up.
+        // A genuine server rejection (station revoked, etc. — has a status)
+        // always still surfaces, since that's a real problem to act on.
+        if (isNetworkError(err) && matchRef.current) return;
         setLoadError(isStationInactiveError(err)
           ? "This court station was revoked. Pair again with a new QR."
           : err.message);
@@ -697,9 +754,14 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
       supabase.from("match_participants").select("*").eq("match_id", matchId),
       supabase.from("court_assignments").select("*").eq("match_id", matchId).maybeSingle(),
     ]);
-    if (m.error) { setLoadError(m.error.message); return; }
-    if (s.error) { setLoadError(s.error.message); return; }
-    if (ca.error) { setLoadError(ca.error.message); return; }
+    // Any of these can fail on a plain connectivity blip; supabase-js doesn't
+    // give a clean network-vs-real-error signal the way sendCommand's
+    // err.status does, so the safe rule here is simpler: never blank an
+    // already-populated scoreboard, whatever the cause — the explicit
+    // "Reload" button remains available to retry.
+    if (m.error) { if (!matchRef.current) setLoadError(m.error.message); return; }
+    if (s.error) { if (!matchRef.current) setLoadError(s.error.message); return; }
+    if (ca.error) { if (!matchRef.current) setLoadError(ca.error.message); return; }
     if (!m.data) { setLoadError("Match not found."); return; }
     const participantIds = [...new Set((s.data || []).map((x) => x.participant_id).filter(Boolean))];
     const [p, c] = await Promise.all([
@@ -710,15 +772,18 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         ? supabase.from("courts").select("*").eq("id", ca.data.court_id).maybeSingle()
         : Promise.resolve({ data: null }),
     ]);
-    if (p.error) { setLoadError(p.error.message); return; }
-    if (c?.error) { setLoadError(c.error.message); return; }
-    setMatch(m.data);
-    seqRef.current = Number(m.data.score_state?.lastSeq || 0);
+    if (p.error) { if (!matchRef.current) setLoadError(p.error.message); return; }
+    if (c?.error) { if (!matchRef.current) setLoadError(c.error.message); return; }
+    if (!hasQueuedForThisMatch) {
+      setMatch(m.data);
+      seqRef.current = Number(m.data.score_state?.lastSeq || 0);
+    }
     setSides(s.data || []);
     setParticipants(p.data || []);
     setCourt(c.data || null);
     setLoadError("");
     setError("");
+    if (queued.length > 0) drainRef.current?.();
   }, [supabase, matchId, station, cfg, session]);
 
   useEffect(() => { load(); }, [load]);
@@ -739,27 +804,67 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   }, []);
 
   const drain = useCallback(async () => {
+    if (stuckEntry) return { drained: 0, remaining: 0, stoppedOn: "stuck" };
+    const store = outboxRef.current;
+    const before = store ? (await store.list()).length : 0;
+    if (before > 0) setSyncStatus((s) => (s === "stuck" ? s : "syncing"));
     const outcome = await drainQueue({
-      store: outboxRef.current,
+      store,
       getAccessToken: async () => session?.access_token,
       publishableKey: cfg.publishableKey,
       onEach: (entry, result, err) => {
-        if (result) applyResult(result);
-        else if (err && !isNetworkError(err)) setError(`A queued action could not be synced: ${err.message}`);
+        if (result) { applyResult(result); return; }
+        // A real (non-network) rejection is a genuine conflict — e.g. this
+        // match moved on (completed, or a correction changed its seq) while
+        // this device was offline. Surface it as an actionable choice rather
+        // than silently deleting the entry or looping on it forever.
+        if (err && !isNetworkError(err)) setStuckEntry({ entry, error: err });
       },
     });
     if (outcome.drained > 0) await load();
     await refreshPendingSync();
-  }, [session, cfg, refreshPendingSync, load]);
+    if (outcome.stoppedOn === "rejected") {
+      setSyncStatus("stuck");
+    } else if (outcome.stoppedOn === "offline") {
+      setSyncStatus("offline");
+    } else if (outcome.stoppedOn !== "already_draining" && before > 0 && outcome.remaining === 0) {
+      setSyncStatus("synced");
+      window.setTimeout(() => setSyncStatus((s) => (s === "synced" ? "idle" : s)), 2500);
+    }
+    return outcome;
+  }, [session, cfg, refreshPendingSync, load, stuckEntry]);
+  drainRef.current = drain;
+
+  async function resolveStuck() {
+    if (!stuckEntry) return;
+    setResolvingStuck(true);
+    try {
+      const store = outboxRef.current;
+      const all = store ? await store.list() : [];
+      const thisMatchId = stuckEntry.entry?.payload?.match_id;
+      for (const e of all) {
+        if (!thisMatchId || e.payload?.match_id === thisMatchId) await store.delete(e.command_id);
+      }
+      setStuckEntry(null);
+      setSyncStatus("idle");
+      await refreshPendingSync();
+      await load();
+    } finally {
+      setResolvingStuck(false);
+    }
+  }
 
   useEffect(() => {
     refreshPendingSync();
     drain();
     function onOnline() { drain(); }
+    function onOffline() { setSyncStatus((s) => (s === "stuck" ? s : "offline")); }
     window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
     const interval = setInterval(drain, 20000);
     return () => {
       window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
       clearInterval(interval);
     };
   }, [drain, refreshPendingSync]);
@@ -786,7 +891,7 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         type,
         payload,
       });
-      if (body.queued) await refreshPendingSync();
+      if (body.queued) { setSyncStatus((s) => (s === "stuck" ? s : "offline")); await refreshPendingSync(); }
       else if (body.result) applyResult(body.result);
       else await load();
     } catch (err) {
@@ -814,6 +919,7 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
     setBusy(true);
     setError("");
     const event_id = crypto.randomUUID();
+    const forceQueue = await hasQueuedForMatch(current.id);
     try {
       const body = await sendCommandDurable({
         store: outboxRef.current,
@@ -829,8 +935,9 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
           type: "correction",
           payload: correctionPayload,
         },
+        forceQueue,
       });
-      if (body.queued) { await refreshPendingSync(); return null; }
+      if (body.queued) { setSyncStatus((s) => (s === "stuck" ? s : "offline")); await refreshPendingSync(); return null; }
       if (body.result) applyResult(body.result);
       return body.result;
     } catch (err) {
@@ -851,6 +958,7 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
     const snapshot = current;
     const snapshotSeq = seqRef.current;
     const epoch = epochRef.current;
+    const forceQueue = await hasQueuedForMatch(current.id);
     try {
       const optimistic = applyOptimisticScore(current, event);
       seqRef.current = seq;
@@ -874,9 +982,10 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         type: "score_event",
         commandId: event_id,
         payload: { match_id: current.id, event_id, seq, type, payload: extra },
+        forceQueue,
       });
       if (epochRef.current !== epoch) return;
-      if (body.queued) { await refreshPendingSync(); return; }
+      if (body.queued) { setSyncStatus((s) => (s === "stuck" ? s : "offline")); await refreshPendingSync(); return; }
       if (body.result) applyResult(body.result);
     } catch (err) {
       // A real server rejection (not a network failure — sendCommandDurable
@@ -972,10 +1081,20 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
               <div className="game">Game {score.gameNumber || 1}</div>
               <StatusBadge status={match.status} />
               {pending > 0 ? <div className="ump-sync"><span className="ump-sync-dot" aria-hidden="true" /> Saving…</div> : null}
-              {pendingSync > 0 ? (
+              {syncStatus === "stuck" ? (
                 <div className="ump-sync ump-sync-offline">
-                  <span className="ump-sync-dot" aria-hidden="true" /> {pendingSync} unsynced — will send when back online
+                  <span className="ump-sync-dot" aria-hidden="true" /> Sync conflict — action needed
                 </div>
+              ) : syncStatus === "offline" && pendingSync > 0 ? (
+                <div className="ump-sync ump-sync-offline">
+                  <span className="ump-sync-dot" aria-hidden="true" /> OFFLINE — {pendingSync} score{pendingSync === 1 ? "" : "s"} saved on this device
+                </div>
+              ) : syncStatus === "syncing" ? (
+                <div className="ump-sync">
+                  <span className="ump-sync-dot" aria-hidden="true" /> SYNCING SCORES…
+                </div>
+              ) : syncStatus === "synced" ? (
+                <div className="ump-sync">SYNCED</div>
               ) : null}
             </>
           )}
@@ -992,6 +1111,14 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
 
       <div className="ump-actions">
         {error && <Alert>{error}</Alert>}
+        {stuckEntry && (
+          <Alert>
+            A locally-saved action could not be synced: {stuckEntry.error?.message || "sync conflict"}. It will keep failing the same way until this is resolved.
+            <div className="row" style={{ marginTop: 8 }}>
+              <Button variant="secondary" onClick={() => setShowStuckConfirm(true)}>Resolve sync conflict</Button>
+            </div>
+          </Alert>
+        )}
 
         {canStart && (
           <Button disabled={busy} onClick={() => command("start_match", { match_id: match.id })}>
@@ -1010,14 +1137,33 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
               if (isCoinTossCommitted(matchRef.current)) return { match: matchRef.current };
               setBusy(true);
               setError("");
+              const forceQueue = await hasQueuedForMatch(payload.match_id);
               try {
-                const body = await sendCommand({
+                const body = await sendCommandDurable({
+                  store: outboxRef.current,
                   commandUrl: cfg.commandUrl,
                   accessToken: session.access_token,
                   publishableKey: cfg.publishableKey,
                   type: "coin_toss",
+                  commandId: payload.event_id,
                   payload,
+                  forceQueue,
                 });
+                if (body.queued) {
+                  // Same network-drop path as scoring: keep the umpire
+                  // moving instead of reopening the toss form (which would
+                  // invite a resubmission the server would then silently
+                  // ignore, since it only keeps whichever toss it saw
+                  // first). Patch the exact shape readCoinToss()/
+                  // normalizeCoinTossPayload() already interpret — the real
+                  // drained confirmation later overwrites with identical
+                  // data, so there's no visible change when it lands.
+                  const current = matchRef.current;
+                  if (current) setMatch({ ...current, coin_toss: payload, serving_team: payload.serving_team });
+                  setSyncStatus((s) => (s === "stuck" ? s : "offline"));
+                  await refreshPendingSync();
+                  return { match: matchRef.current, queued: true };
+                }
                 if (body.result) applyResult(body.result);
                 return body.result;
               } catch (err) {
@@ -1124,6 +1270,20 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
           onConfirm={() => {
             setConfirmUndo(false);
             sendScore("undo");
+          }}
+        />
+      )}
+
+      {showStuckConfirm && (
+        <ConfirmDialog
+          title="Resolve sync conflict"
+          body="This device has scores that the server has rejected — usually because this match changed elsewhere while it was offline. Discarding them reloads the official score from the server; any point saved only on this device since the conflict began will need to be re-entered."
+          confirmLabel="Discard local scores and reload"
+          busy={resolvingStuck}
+          onCancel={() => setShowStuckConfirm(false)}
+          onConfirm={async () => {
+            setShowStuckConfirm(false);
+            await resolveStuck();
           }}
         />
       )}

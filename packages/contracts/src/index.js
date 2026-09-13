@@ -63,6 +63,8 @@ export const DIVISION_FORMATS = Object.freeze([
   "team_elimination",
 ]);
 
+export const TEAM_PROGRESSION_MODES = Object.freeze(["playoffs", "direct_semifinals"]);
+
 export const SCORE_EVENT_TYPES = Object.freeze(["point", "undo", "timeout", "coin_toss"]);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

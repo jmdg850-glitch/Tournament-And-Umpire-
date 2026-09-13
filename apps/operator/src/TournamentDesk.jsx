@@ -685,6 +685,7 @@ function DivisionsPanel({ data, busy, run }) {
   const [qualifierMode, setQualifierMode] = useState("top_x");
   const [qualifierCount, setQualifierCount] = useState("4");
   const [sameTeamPolicy, setSameTeamPolicy] = useState("avoid_semis");
+  const [progressionMode, setProgressionMode] = useState("playoffs");
   const [edit, setEdit] = useState({});
   return (
     <div className="stack">
@@ -699,8 +700,9 @@ function DivisionsPanel({ data, busy, run }) {
         const config = { winTo: 11, bestOf: 1, winBy: "two", isDoubles: true, bronzeMatch: true };
         if (format === "team_elimination") {
           config.qualifierMode = qualifierMode;
-          config.qualifierCount = Number(qualifierCount) || 4;
+          config.qualifierCount = progressionMode === "direct_semifinals" ? 4 : Number(qualifierCount) || 4;
           config.sameTeamPolicy = sameTeamPolicy;
+          config.progressionMode = progressionMode;
         }
         run("Create division", "create_division", {
           tournament_id: data.tournament.id,
@@ -720,12 +722,32 @@ function DivisionsPanel({ data, busy, run }) {
         </div>
         {format === "team_elimination" && (
           <div className="row">
+            <Select
+              label="After Qualifiers"
+              value={progressionMode}
+              onChange={(e) => setProgressionMode(e.target.value)}
+              hint={
+                progressionMode === "direct_semifinals"
+                  ? "The highest-ranked qualifiers advance directly to the semifinals."
+                  : "Qualified competitors go through the playoff bracket before the semifinals."
+              }
+            >
+              <option value="playoffs">Playoffs / Elimination</option>
+              <option value="direct_semifinals">Direct Semifinals</option>
+            </Select>
             <Select label="Qualification" value={qualifierMode} onChange={(e) => setQualifierMode(e.target.value)}>
               <option value="top_x">Top X overall</option>
               <option value="top_x_per_team">Top X per team</option>
               <option value="manual">Manual qualification</option>
             </Select>
-            <Input label="Qualifier count" value={qualifierCount} onChange={(e) => setQualifierCount(e.target.value)} inputMode="numeric" />
+            <Input
+              label="Qualifier count"
+              value={progressionMode === "direct_semifinals" ? "4" : qualifierCount}
+              onChange={(e) => setQualifierCount(e.target.value)}
+              inputMode="numeric"
+              disabled={progressionMode === "direct_semifinals"}
+              hint={progressionMode === "direct_semifinals" ? "Fixed at 4 for Direct Semifinals." : undefined}
+            />
             <Select
               label="Same-team matchup policy"
               value={sameTeamPolicy}
@@ -748,6 +770,7 @@ function DivisionsPanel({ data, busy, run }) {
           qualifierMode: d.config?.qualifierMode || "top_x",
           qualifierCount: String(d.config?.qualifierCount ?? 4),
           sameTeamPolicy: d.config?.sameTeamPolicy || "avoid_semis",
+          progressionMode: d.config?.progressionMode || "playoffs",
         };
         return (
           <Card className="stack" key={d.id}>
@@ -782,11 +805,25 @@ function DivisionsPanel({ data, busy, run }) {
                   division_id: d.id,
                   config: {
                     qualifierMode: cfg.qualifierMode,
-                    qualifierCount: Number(cfg.qualifierCount) || 4,
+                    qualifierCount: cfg.progressionMode === "direct_semifinals" ? 4 : Number(cfg.qualifierCount) || 4,
                     sameTeamPolicy: cfg.sameTeamPolicy,
+                    progressionMode: cfg.progressionMode,
                   },
                 });
               }}>
+                <Select
+                  label="After Qualifiers"
+                  value={cfg.progressionMode}
+                  onChange={(e) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, progressionMode: e.target.value } }))}
+                  hint={
+                    cfg.progressionMode === "direct_semifinals"
+                      ? "The highest-ranked qualifiers advance directly to the semifinals."
+                      : "Qualified competitors go through the playoff bracket before the semifinals."
+                  }
+                >
+                  <option value="playoffs">Playoffs / Elimination</option>
+                  <option value="direct_semifinals">Direct Semifinals</option>
+                </Select>
                 <Select
                   label="Qualification"
                   value={cfg.qualifierMode}
@@ -798,9 +835,11 @@ function DivisionsPanel({ data, busy, run }) {
                 </Select>
                 <Input
                   label="Qualifier count"
-                  value={cfg.qualifierCount}
+                  value={cfg.progressionMode === "direct_semifinals" ? "4" : cfg.qualifierCount}
                   onChange={(e) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, qualifierCount: e.target.value } }))}
                   inputMode="numeric"
+                  disabled={cfg.progressionMode === "direct_semifinals"}
+                  hint={cfg.progressionMode === "direct_semifinals" ? "Fixed at 4 for Direct Semifinals." : undefined}
                 />
                 <Select
                   label="Same-team matchup policy"

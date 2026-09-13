@@ -1041,6 +1041,7 @@ var DIVISION_FORMATS = Object.freeze([
   "pool",
   "team_elimination"
 ]);
+var TEAM_PROGRESSION_MODES = Object.freeze(["playoffs", "direct_semifinals"]);
 var SCORE_EVENT_TYPES = Object.freeze(["point", "undo", "timeout", "coin_toss"]);
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function isUuid(value) {
@@ -1848,6 +1849,7 @@ async function handleCreateDivision(admin, actor, payload, envelope) {
     if (config.sameTeamPolicy == null) config.sameTeamPolicy = "avoid_semis";
     if (config.qualifierMode == null) config.qualifierMode = "top_x";
     if (config.qualifierCount == null) config.qualifierCount = 4;
+    if (config.progressionMode == null) config.progressionMode = "playoffs";
   }
   const ts = nowIso();
   const division = {
@@ -2464,6 +2466,14 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
   const mode = division.config?.qualifierMode || "top_x";
   const count = Number(division.config?.qualifierCount || 4);
   const qualifiers = selectQualifiers(ranked, mode, count);
+  const progressionMode = division.config?.progressionMode || "playoffs";
+  if (progressionMode === "direct_semifinals" && qualifiers.length !== 4) {
+    throw httpError(
+      400,
+      "DIRECT_SEMIS_INVALID_COUNT",
+      `Direct Semifinals requires exactly 4 qualifying pairs (got ${qualifiers.length}). Adjust the qualifier count or qualification mode.`
+    );
+  }
   if (qualifiers.length < 2) throw httpError(400, "TE_INVALID", "Not enough qualifiers for playoffs");
   const startRound = Math.max(0, ...parents.map((m) => m.round || 0)) + 1;
   const { teamMatchups, pairMatches } = generateQualifierBracketShell(qualifiers, {
@@ -2476,7 +2486,7 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
     division_id: division.id,
     kind: "team_knockout",
     name: "Team playoffs",
-    config: { qualifierMode: mode, qualifierCount: count },
+    config: { qualifierMode: mode, qualifierCount: count, progressionMode },
     created_at: nowIso()
   };
   const batch = createBatch();

@@ -128,6 +128,16 @@ describe("generateQualifierBracketShell", () => {
     ]);
   });
 
+  test("M=4 invariant: exactly 2 semifinal + 1 final + 1 bronze shells, zero intermediate knockout-stage matches (Direct Semifinals relies on this)", () => {
+    const qualifiers = [q("p1","tA"), q("p2","tB"), q("p3","tC"), q("p4","tD")];
+    const { teamMatchups } = generateQualifierBracketShell(qualifiers, { makeId: idGen() });
+    expect(teamMatchups).toHaveLength(4);
+    expect(teamMatchups.filter(m => m.stage === "semifinal")).toHaveLength(2);
+    expect(teamMatchups.filter(m => m.stage === "final")).toHaveLength(1);
+    expect(teamMatchups.filter(m => m.stage === "bronze")).toHaveLength(1);
+    expect(teamMatchups.filter(m => m.stage === "knockout")).toHaveLength(0);
+  });
+
   test("avoid_semis repairs 1v4/2v3 so two Team A pairs are not in the same semifinal", () => {
     const qualifiers = [q("A1","tA"), q("B1","tB"), q("B2","tB"), q("A2","tA")];
     const raw = generateQualifierBracketShell(qualifiers, { makeId: idGen(), sameTeamPolicy: "allow_anywhere" });
