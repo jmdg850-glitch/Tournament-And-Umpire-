@@ -18,11 +18,8 @@
   --court: #2f6f58;
   --court-2: #101318;
   --live: #e23b32;
-  /* --ok/--success and --warn/--warning are intentional aliases (same value) — update both together. */
-  --ok: #3dbe8c;
   --success: #3dbe8c;
   --warn: #e0a106;
-  --warning: #e0a106;
   --fault: #e24b4a;
   --danger: #e24b4a;
   --info: #5aa7d6;
@@ -296,7 +293,8 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
 .table tbody tr { transition: background 120ms var(--ease-out); }
 .table tbody tr:hover { background: color-mix(in srgb, var(--elevated) 60%, var(--surface)); }
 .table tr[data-live="true"] { background: color-mix(in srgb, var(--live) 12%, var(--surface)); }
-.table input[type="checkbox"], .table-wrap input[type="checkbox"] { width: 18px; height: 18px; min-height: 0; accent-color: var(--tape); cursor: pointer; }
+.table tr[data-held="true"] { background: color-mix(in srgb, var(--warn) 10%, var(--surface)); }
+.checkbox { width: 18px; height: 18px; min-height: 0; accent-color: var(--tape); cursor: pointer; }
 .table td:has(input[type="checkbox"]) { width: 1%; }
 .table td.rank-cell { width: 1%; white-space: nowrap; font-family: "Barlow Condensed", sans-serif; font-size: var(--text-lg); }
 .table tr[data-rank="1"] td.rank-cell { color: #ffd451; }
@@ -457,6 +455,9 @@ body:has(.update-banner) .toast-stack {
 }
 .shell-brand { padding: 0 var(--space-2); }
 .shell-brand h1 { font-size: var(--text-lg); }
+/* Once a tournament context block is present below it, that name+status is the
+   primary "where am I" signal — the generic brand mark steps back to secondary. */
+.shell-rail:has(.shell-context) .shell-brand h1 { font-size: var(--text-base); }
 .shell-context {
   padding: var(--space-2) var(--space-2) var(--space-3);
   border-bottom: 1px solid var(--border);
@@ -580,7 +581,7 @@ body:has(.update-banner) .toast-stack {
   padding: 10px 8px;
   font-size: 0.82rem;
 }
-@media (max-width: 420px) {
+@media (max-width: 480px) {
   .auth-modes { grid-template-columns: 1fr; }
 }
 .live-strip {

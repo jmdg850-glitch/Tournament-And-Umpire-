@@ -40,7 +40,6 @@ export const FORMAT_LABEL = {
 
 export const DESK_TABS = [
   ["overview", "Overview"],
-  ["live", "Live"],
   ["matches", "Matches"],
   ["courts", "Courts"],
   ["players", "Players"],

@@ -1,4 +1,5 @@
-import { createContext, useCallback, useContext, useEffect, useId, useRef, useState } from "react";
+import { createContext, forwardRef, useCallback, useContext, useEffect, useId, useRef, useState } from "react";
+import { matchStatusTone, tournamentStatusTone } from "./statusTone.js";
 
 export function Button({
   children,
@@ -40,12 +41,7 @@ const TOURNAMENT_STATUS_LABEL = {
 
 export function StatusBadge({ status, kind = "match" }) {
   const labels = kind === "tournament" ? TOURNAMENT_STATUS_LABEL : MATCH_STATUS_LABEL;
-  const tournamentLive = kind === "tournament" && status === "in_progress";
-  const tone =
-    status === "in_progress" && !tournamentLive ? "live"
-      : status === "completed" || status === "bye" ? "ok"
-      : status === "postponed" || status === "assigned" || status === "ready" || tournamentLive ? "warn"
-      : "muted";
+  const tone = kind === "tournament" ? tournamentStatusTone(status) : matchStatusTone(status);
   const label = labels[status] || String(status || "unknown").replaceAll("_", " ");
   return <Badge tone={tone}>{label}</Badge>;
 }
@@ -112,6 +108,12 @@ export function Select({ label, id, hideLabel, hint, children, ...props }) {
   );
 }
 
+/** Forwards its ref to the underlying <input> — callers rely on this to set the
+ * non-prop `.indeterminate` DOM property (e.g. a "select all" header checkbox). */
+export const Checkbox = forwardRef(function Checkbox({ className = "", ...props }, ref) {
+  return <input ref={ref} type="checkbox" className={`checkbox ${className}`.trim()} {...props} />;
+});
+
 export function Badge({ children, tone = "muted" }) {
   return <span className={`badge ${tone}`}>{children}</span>;
 }
@@ -137,6 +139,37 @@ export function PageHeader({ kicker, title, actions, children }) {
   );
 }
 
+/** For same-page content tabs (a WAI-ARIA tablist switching what's shown below it) —
+ * distinct from NavItem, which is page-to-page navigation and deliberately does not
+ * use the tab-widget pattern (see the note on NavGroup). Not yet adopted anywhere;
+ * reserved for when a hand-rolled tab-state screen switcher gets componentized. */
+/**
+ * Per-screen sub-header used inside a page that already has its own top-level
+ * PageHeader (e.g. one panel/tab within a larger desk) — renders at h2, not h1,
+ * so a screen never ends up with two competing top-level headings. Reuses the
+ * existing .panel-toolbar/.panel-toolbar-title/.panel-toolbar-sub/
+ * .panel-toolbar-actions classes verbatim (including their responsive
+ * action-wrapping at 560px) rather than introducing a second, parallel set.
+ */
+export function SectionHeader({ title, description, actions }) {
+  return (
+    <div className="panel-toolbar">
+      <div>
+        <h2 className="panel-toolbar-title">{title}</h2>
+        {description ? <p className="muted panel-toolbar-sub">{description}</p> : null}
+      </div>
+      {actions ? <div className="panel-toolbar-actions">{actions}</div> : null}
+    </div>
+  );
+}
+
+/** For same-page content tabs (a WAI-ARIA tablist switching what's shown below it) —
+ * distinct from NavItem, which is page-to-page navigation and deliberately does not
+ * use the tab-widget pattern (see the note on NavGroup). Assessed for adoption in
+ * TournamentDesk's screen switcher and declined — that's genuinely page-to-page
+ * navigation (NavItem/NavGroup is already correct there), not same-page tabs.
+ * Still reserved for a genuine future same-page-tab need (e.g. a status filter
+ * within one screen). */
 export function Tabs({ tabs, value, onChange }) {
   return (
     <div className="nav-tabs" role="tablist">

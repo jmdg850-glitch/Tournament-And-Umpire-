@@ -73,3 +73,22 @@ test("brackets.jsx never renders a JSX component that isn't imported/declared", 
 test("BracketImportModal.jsx never renders a JSX component that isn't imported/declared", () => {
   assertNoUndeclaredJsxTags(resolve(dir, "BracketImportModal.jsx"));
 });
+
+test("AttentionPanel.jsx never renders a JSX component that isn't imported/declared", () => {
+  assertNoUndeclaredJsxTags(resolve(dir, "AttentionPanel.jsx"));
+});
+
+for (const name of [
+  "DivisionsPanel",
+  "PlayersPanel",
+  "TeamsPanel",
+  "CourtsPanel",
+  "UmpiresPanel",
+  "MatchesPanel",
+  "ResultsPanel",
+  "SettingsPanel",
+]) {
+  test(`screens/${name}.jsx never renders a JSX component that isn't imported/declared`, () => {
+    assertNoUndeclaredJsxTags(resolve(dir, "screens", `${name}.jsx`));
+  });
+}

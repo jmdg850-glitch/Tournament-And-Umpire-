@@ -155,12 +155,14 @@
 .btn.point.a { background: var(--team-a); }
 .btn.point.b { background: var(--team-b); }
 
-@media (max-width: 420px) {
+@media (max-width: 480px) {
   .ump-top { flex-wrap: wrap; }
   .pads { gap: 8px; }
   .btn.point { min-height: 64px; }
 }
 
+/* Height/orientation constraint, not a width breakpoint — the documented
+   mobile/tablet/narrow-desktop scale (packages/ui/src/styles.css) doesn't apply here. */
 @media (orientation: landscape) and (max-height: 520px) {
   .ump-desk {
     display: grid;

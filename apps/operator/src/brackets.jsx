@@ -1,7 +1,24 @@
 import { useRef, useState } from "react";
-import { Alert, Badge, Button, Card, EmptyState, StandingsTable, StatusBadge, useToast } from "@tournament/ui";
-import { courtFor, isTeamMatchup, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor } from "./lib.js";
+import { Alert, Badge, Button, Card, EmptyState, SectionHeader, StandingsTable, StatusBadge, useToast } from "@tournament/ui";
+import { courtFor, isTeamMatchup, membersOfParticipant, personLabel, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor } from "./lib.js";
 import BracketImportModal from "./BracketImportModal.jsx";
+
+// A pair's `name` (from sideOf) is a single flat string, e.g. "Alice Smith /
+// Bob Jones" — shows the individual members on a small muted sub-line below
+// it, the same treatment already proven in PlayersPanel's Division Entries
+// table, so a long pair name never reads as ambiguous with a single long name.
+function SideName({ side, data }) {
+  const members = side.participant ? membersOfParticipant(side.participant.id, data.participantMembers) : [];
+  if (members.length < 2) return <span>{side.name}</span>;
+  return (
+    <span>
+      <span>{side.name}</span>
+      <div className="muted" style={{ fontSize: "0.7rem", lineHeight: 1.3 }}>
+        {members.map((m) => personLabel(m.person_id, data.persons)).join(" · ")}
+      </div>
+    </span>
+  );
+}
 
 function MatchChip({ match, data }) {
   const a = sideOf(match.id, "A", data);
@@ -17,11 +34,11 @@ function MatchChip({ match, data }) {
         {match.stage_label ? <Badge>{stageTitle(match.stage_label)}</Badge> : null}
       </div>
       <div className={`side ${match.winner === "A" ? "won" : ""}`}>
-        <span>{a.name}</span>
+        <SideName side={a} data={data} />
         <span className="mono">{match.winner === "A" || match.status === "in_progress" || match.status === "completed" ? (result?.score_a ?? match.score_state?.scoreA ?? "") : ""}</span>
       </div>
       <div className={`side ${match.winner === "B" ? "won" : ""}`}>
-        <span>{b.name}</span>
+        <SideName side={b} data={data} />
         <span className="mono">{match.winner === "B" || match.status === "in_progress" || match.status === "completed" ? (result?.score_b ?? match.score_state?.scoreB ?? "") : ""}</span>
       </div>
       <div className="muted" style={{ fontSize: "0.78rem" }}>
@@ -184,13 +201,11 @@ export function BracketsPanel({ data, command, load }) {
   }
   return (
     <div className="stack">
-      {command && (
-        <div className="panel-toolbar">
-          <div>
-            <h1 className="panel-toolbar-title">Brackets</h1>
-            <p className="muted panel-toolbar-sub">Export to Excel, edit players manually, then import the changes back.</p>
-          </div>
-          <div className="panel-toolbar-actions">
+      <SectionHeader
+        title="Brackets"
+        description="Export to Excel, edit players manually, then import the changes back."
+        actions={command ? (
+          <>
             <input
               ref={fileInputRef}
               type="file"
@@ -200,9 +215,9 @@ export function BracketsPanel({ data, command, load }) {
             />
             <Button type="button" variant="secondary" onClick={exportBracket}>Export Bracket</Button>
             <Button type="button" variant="secondary" onClick={() => fileInputRef.current?.click()}>Import Bracket</Button>
-          </div>
-        </div>
-      )}
+          </>
+        ) : undefined}
+      />
       {importError && <Alert>{importError}</Alert>}
       {importAnalysis && (
         <BracketImportModal

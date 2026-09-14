@@ -7,7 +7,8 @@
     "./styles.css": "./src/styles.css"
   },
   "scripts": {
-    "lint": "node -e \"process.exit(0)\""
+    "lint": "node -e \"process.exit(0)\"",
+    "test": "node --test src/statusTone.test.js"
   },
   "peerDependencies": {
     "react": "^19.2.7"

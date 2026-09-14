@@ -599,15 +599,15 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose }) {
           <div className="stack" style={{ gap: 4 }}>
             <Input label={nameA} inputMode="numeric" value={scoreA} onChange={(e) => setScoreA(digitsOnly(e.target.value))} />
             <div className="row" style={{ gap: 6 }}>
-              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreA, scoreA, -1)} disabled={busy}>−1</Button>
-              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreA, scoreA, 1)} disabled={busy}>+1</Button>
+              <Button type="button" variant="secondary" onClick={() => step(setScoreA, scoreA, -1)} disabled={busy}>−1</Button>
+              <Button type="button" variant="secondary" onClick={() => step(setScoreA, scoreA, 1)} disabled={busy}>+1</Button>
             </div>
           </div>
           <div className="stack" style={{ gap: 4 }}>
             <Input label={nameB} inputMode="numeric" value={scoreB} onChange={(e) => setScoreB(digitsOnly(e.target.value))} />
             <div className="row" style={{ gap: 6 }}>
-              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreB, scoreB, -1)} disabled={busy}>−1</Button>
-              <Button type="button" variant="secondary" className="compact" onClick={() => step(setScoreB, scoreB, 1)} disabled={busy}>+1</Button>
+              <Button type="button" variant="secondary" onClick={() => step(setScoreB, scoreB, -1)} disabled={busy}>−1</Button>
+              <Button type="button" variant="secondary" onClick={() => step(setScoreB, scoreB, 1)} disabled={busy}>+1</Button>
             </div>
           </div>
         </div>

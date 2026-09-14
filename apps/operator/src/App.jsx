@@ -5,6 +5,7 @@ import {
   Alert,
   Button,
   Card,
+  Checkbox,
   ConfirmDialog,
   EmptyState,
   Input,
@@ -26,6 +27,9 @@ import TournamentDesk from "./TournamentDesk.jsx";
 import LiveMatchWindow from "./LiveMatchWindow.jsx";
 import UpdateBanner, { useDesktopUpdateContext } from "./UpdateBanner.jsx";
 import AuthLayout from "./AuthLayout.jsx";
+import AppBrand from "./AppBrand.jsx";
+import AttentionPanel from "./AttentionPanel.jsx";
+import { buildDeskHash, parseDeskHash } from "./deskHash.js";
 import { firstQueryError, isToday } from "./lib.js";
 import { version as APP_VERSION } from "../package.json";
 
@@ -300,7 +304,8 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
   const [tournaments, setTournaments] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [recentMatches, setRecentMatches] = useState([]);
-  const [selectedId, setSelectedId] = useState(null);
+  const [courtDevices, setCourtDevices] = useState([]);
+  const [selectedId, setSelectedId] = useState(() => parseDeskHash(typeof window === "undefined" ? "" : window.location.hash)?.tournamentId ?? null);
   const [loadError, setLoadError] = useState("");
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
@@ -321,11 +326,11 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
     const queries = await Promise.all([
       supabase.from("tournaments").select("*").order("created_at", { ascending: false }),
       supabase.from("matches").select("id, status, started_at, completed_at, created_at, tournament_id"),
-      supabase.from("courts").select("id, tournament_id"),
+      supabase.from("courts").select("id, tournament_id, name"),
       supabase.from("persons").select("id"),
       supabase.from("teams").select("id"),
       supabase.from("umpire_assignments").select("id, user_id, match_id"),
-      supabase.from("court_devices").select("id, status"),
+      supabase.from("court_devices").select("id, status, court_id, tournament_id"),
     ]);
     const err = firstQueryError(queries.slice(0, 6));
     if (err) {
@@ -339,6 +344,7 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
     setTournaments(t.data || []);
     const matchRows = matches.data || [];
     setRecentMatches(matchRows);
+    setCourtDevices(devices.error ? [] : devices.data || []);
     setMetrics({
       tournaments: (t.data || []).length,
       active: (t.data || []).filter((x) => ["registration", "registration_closed", "ready", "in_progress"].includes(x.status)).length,
@@ -435,6 +441,11 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
     }
   }
 
+  function openTournamentAt(tournamentId, tab) {
+    window.location.hash = buildDeskHash(tournamentId, tab);
+    setSelectedId(tournamentId);
+  }
+
   if (selectedId) {
     return (
       <TournamentDesk
@@ -443,7 +454,7 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
         command={command}
         pendingSync={pendingSync}
         tournamentId={selectedId}
-        onBack={() => { setSelectedId(null); reloadList(); }}
+        onBack={() => { setSelectedId(null); window.location.hash = ""; reloadList(); }}
         onSignOut={onSignOut}
       />
     );
@@ -451,7 +462,7 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
 
   return (
     <PageShell
-      brand={<><h1>Tournament</h1><div className="kicker">Control</div></>}
+      brand={<AppBrand />}
       navLabel="Sections"
       nav={
         <NavGroup>
@@ -536,22 +547,13 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
           )}
           {!loadError && metrics && (
             <>
-              <div className="ops-board">
-                <Stat tone={metrics.live ? "hero live" : "hero"} value={metrics.live} label="Live matches" />
-                <Stat value={metrics.ready} label="Ready to start" />
-                <Stat value={metrics.scheduled} label="Scheduled" />
-                <Stat value={metrics.completed} label="Completed" />
-              </div>
-              <div className="section-label" style={{ marginTop: "var(--space-5)" }}>Tournament overview</div>
-              <div className="grid4">
-                <Stat value={metrics.active} label="Active tournaments" />
-                <Stat value={metrics.paired} label="Paired courts" />
-                <Stat value={metrics.courts} label="Courts" />
-                <Stat tone="quiet" value={metrics.today} label="Today's matches" />
-                <Stat tone="quiet" value={metrics.umpires} label="Umpires" />
-                <Stat tone="quiet" value={metrics.players} label="Players" />
-                <Stat tone="quiet" value={metrics.teams} label="Teams" />
-              </div>
+              <AttentionPanel
+                tournaments={tournaments}
+                matches={recentMatches}
+                courtDevices={courtDevices}
+                pendingSync={pendingSync}
+                onOpen={openTournamentAt}
+              />
               <div style={{ height: "var(--space-5)" }} />
               <div className="dashboard-columns">
                 <div className="stack">
@@ -579,17 +581,15 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
                         {
                           key: "select",
                           header: (
-                            <input
+                            <Checkbox
                               ref={headerCheckboxRef}
-                              type="checkbox"
                               aria-label="Select all tournaments"
                               checked={allChecked}
                               onChange={toggleAllTournaments}
                             />
                           ),
                           render: (row) => (
-                            <input
-                              type="checkbox"
+                            <Checkbox
                               aria-label={`Select ${row.name}`}
                               checked={checkedIds.has(row.id)}
                               onChange={() => toggleTournament(row.id)}
@@ -607,7 +607,7 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
                           key: "open",
                           header: "",
                           render: (row) => (
-                            <Button variant="secondary" onClick={() => setSelectedId(row.id)}>Open <ArrowRight size={15} aria-hidden="true" /></Button>
+                            <Button variant="secondary" onClick={() => openTournamentAt(row.id, "overview")}>Open <ArrowRight size={15} aria-hidden="true" /></Button>
                           ),
                         },
                       ]}
@@ -637,6 +637,19 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
                     )}
                   </Card>
                 </div>
+              </div>
+              <div className="section-label" style={{ marginTop: "var(--space-5)" }}>Tournament summary</div>
+              <div className="grid4">
+                <Stat tone="quiet" value={metrics.ready} label="Ready to start" />
+                <Stat tone="quiet" value={metrics.scheduled} label="Scheduled" />
+                <Stat tone="quiet" value={metrics.completed} label="Completed" />
+                <Stat tone="quiet" value={metrics.active} label="Active tournaments" />
+                <Stat tone="quiet" value={metrics.paired} label="Paired courts" />
+                <Stat tone="quiet" value={metrics.courts} label="Courts" />
+                <Stat tone="quiet" value={metrics.today} label="Today's matches" />
+                <Stat tone="quiet" value={metrics.umpires} label="Umpires" />
+                <Stat tone="quiet" value={metrics.players} label="Players" />
+                <Stat tone="quiet" value={metrics.teams} label="Teams" />
               </div>
             </>
           )}
