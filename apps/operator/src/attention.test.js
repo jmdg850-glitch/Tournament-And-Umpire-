@@ -49,6 +49,34 @@ test("computeAttentionItems: sorts tournaments with more live matches first", ()
   assert.deepEqual(items.map((i) => i.tournamentId), ["t1", "t2"]);
 });
 
+test("computeAttentionItems: a deleted division's matches no longer count once the reload reflects the delete", () => {
+  // Division deletion (delete_division) is a real, hard delete that cascades
+  // to every match scoped to it (see packages/api/src/handleCommand.js's
+  // handleDeleteDivision and the FK cascades in
+  // supabase/migrations/0001_initial_schema.sql) — it does not set a
+  // client-side "deleted" flag that this function would need to filter out.
+  // So the contract this documents is: once TournamentDesk's load()/App.jsx's
+  // reloadList() re-fetch `matches` from Postgres after a division delete,
+  // the deleted division's matches are simply gone from the array passed in
+  // here — this asserts that a live/held count computed before the delete
+  // does not linger after that reload, the same way it wouldn't linger for
+  // any other match that stopped existing.
+  const beforeDelete = computeAttentionItems({
+    tournaments,
+    matches: [
+      { tournament_id: "t1", status: "in_progress" },
+      { tournament_id: "t1", status: "postponed" },
+    ],
+    courtDevices: [],
+  });
+  assert.deepEqual(beforeDelete, [
+    { tournamentId: "t1", tournamentName: "Riverside Open", live: 1, held: 1, courtsNeedRepairing: 0 },
+  ]);
+
+  const afterDeleteAndReload = computeAttentionItems({ tournaments, matches: [], courtDevices: [] });
+  assert.deepEqual(afterDeleteAndReload, []);
+});
+
 test("computeAttentionItems: falls back to a generic name if the tournament isn't in the given list", () => {
   const items = computeAttentionItems({
     tournaments: [],

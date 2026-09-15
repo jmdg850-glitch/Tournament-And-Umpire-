@@ -1,7 +1,9 @@
 import { useRef, useState } from "react";
 import { Alert, Badge, Button, Card, EmptyState, SectionHeader, StandingsTable, StatusBadge, useToast } from "@tournament/ui";
+import { ExternalLink } from "lucide-react";
 import { courtFor, isTeamMatchup, membersOfParticipant, personLabel, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor } from "./lib.js";
 import BracketImportModal from "./BracketImportModal.jsx";
+import { openBracketWindow } from "./useRealtimeChannel.js";
 
 // A pair's `name` (from sideOf) is a single flat string, e.g. "Alice Smith /
 // Bob Jones" — shows the individual members on a small muted sub-line below
@@ -161,6 +163,26 @@ function SingleElimBoard({ division, data }) {
   );
 }
 
+// The read-only per-division board — extracted so both the Brackets tab
+// (BracketsPanel below) and the standalone BracketWindow display (opened in
+// its own window/monitor, see useRealtimeChannel.js's openBracketWindow) show
+// the exact same bracket rendering/data logic. Never duplicate this.
+export function DivisionBracketCard({ division, data }) {
+  return (
+    <Card className="stack">
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <h2>{division.name}</h2>
+        <Badge>{division.format === "team_elimination" ? "Team elimination" : division.format === "single_elim" ? "Single elimination" : "Round robin"}</Badge>
+      </div>
+      {division.format === "team_elimination" ? (
+        <TeamEliminationBoard division={division} data={data} />
+      ) : (
+        <SingleElimBoard division={division} data={data} />
+      )}
+    </Card>
+  );
+}
+
 export function BracketsPanel({ data, command, load }) {
   const fileInputRef = useRef(null);
   const [importAnalysis, setImportAnalysis] = useState(null);
@@ -204,19 +226,26 @@ export function BracketsPanel({ data, command, load }) {
       <SectionHeader
         title="Brackets"
         description="Export to Excel, edit players manually, then import the changes back."
-        actions={command ? (
+        actions={(
           <>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".xlsx,.xls"
-              style={{ display: "none" }}
-              onChange={handleImportFile}
-            />
-            <Button type="button" variant="secondary" onClick={exportBracket}>Export Bracket</Button>
-            <Button type="button" variant="secondary" onClick={() => fileInputRef.current?.click()}>Import Bracket</Button>
+            <Button type="button" variant="secondary" onClick={() => openBracketWindow(data.tournament?.id)}>
+              Open Bracket Window <ExternalLink size={15} aria-hidden="true" />
+            </Button>
+            {command ? (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".xlsx,.xls"
+                  style={{ display: "none" }}
+                  onChange={handleImportFile}
+                />
+                <Button type="button" variant="secondary" onClick={exportBracket}>Export Bracket</Button>
+                <Button type="button" variant="secondary" onClick={() => fileInputRef.current?.click()}>Import Bracket</Button>
+              </>
+            ) : null}
           </>
-        ) : undefined}
+        )}
       />
       {importError && <Alert>{importError}</Alert>}
       {importAnalysis && (
@@ -232,17 +261,7 @@ export function BracketsPanel({ data, command, load }) {
         />
       )}
       {data.divisions.map((d) => (
-        <Card className="stack" key={d.id}>
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            <h2>{d.name}</h2>
-            <Badge>{d.format === "team_elimination" ? "Team elimination" : d.format === "single_elim" ? "Single elimination" : "Round robin"}</Badge>
-          </div>
-          {d.format === "team_elimination" ? (
-            <TeamEliminationBoard division={d} data={data} />
-          ) : (
-            <SingleElimBoard division={d} data={data} />
-          )}
-        </Card>
+        <DivisionBracketCard key={d.id} division={d} data={data} />
       ))}
     </div>
   );

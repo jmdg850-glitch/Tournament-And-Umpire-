@@ -133,7 +133,7 @@ export function UmpiresPanel({ data, session, busy, run }) {
             ) : (
               <div className="stack" style={{ gap: 8 }}>
                 {withAssignment.map((m) => (
-                  <Card key={m.id} className="row" style={{ justifyContent: "space-between", padding: "12px 16px" }}>
+                  <Card key={m.id} className="row" style={{ justifyContent: "space-between", padding: "var(--space-3) var(--space-4)" }}>
                     <div>
                       <strong>{memberName(m.user_id, data.profiles)}</strong>
                       <div className="muted" style={{ fontSize: "var(--text-sm)" }}>

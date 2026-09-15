@@ -21,6 +21,7 @@ export const STATION_FORBIDDEN_COMMANDS = Object.freeze([
   "update_tournament",
   "transition_tournament",
   "remove_participant",
+  "delete_division",
   "create_court",
   "add_member",
   "add_person",

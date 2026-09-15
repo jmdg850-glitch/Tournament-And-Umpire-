@@ -17,6 +17,16 @@ describe("contracts", () => {
     assert.equal(COMMAND_TYPES.includes("remove_participant"), true);
     assert.equal(COMMAND_TYPES.includes("open_court_pairing"), true);
   });
+
+  it("accepts a delete_division envelope", () => {
+    const cmd = parseCommandEnvelope({
+      command_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      type: "delete_division",
+      payload: { division_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" },
+    });
+    assert.equal(cmd.type, "delete_division");
+    assert.equal(COMMAND_TYPES.includes("delete_division"), true);
+  });
 });
 
 describe("pairing payload {v,sid,g}", () => {

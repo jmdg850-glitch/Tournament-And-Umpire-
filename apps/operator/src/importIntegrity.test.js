@@ -78,6 +78,14 @@ test("AttentionPanel.jsx never renders a JSX component that isn't imported/decla
   assertNoUndeclaredJsxTags(resolve(dir, "AttentionPanel.jsx"));
 });
 
+test("BracketWindow.jsx never renders a JSX component that isn't imported/declared", () => {
+  assertNoUndeclaredJsxTags(resolve(dir, "BracketWindow.jsx"));
+});
+
+test("MatchDisplayWindow.jsx never renders a JSX component that isn't imported/declared", () => {
+  assertNoUndeclaredJsxTags(resolve(dir, "MatchDisplayWindow.jsx"));
+});
+
 for (const name of [
   "DivisionsPanel",
   "PlayersPanel",

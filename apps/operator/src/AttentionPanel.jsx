@@ -20,7 +20,7 @@ export default function AttentionPanel({ tournaments, matches, courtDevices, pen
       <h2>Attention needed</h2>
       <div className="stack" style={{ gap: 10 }}>
         {items.map((item) => (
-          <div key={item.tournamentId} className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
+          <div key={item.tournamentId} className="row attention-item" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
             <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               <strong>{item.tournamentName}</strong>
               {item.live > 0 && <Badge tone="live">{item.live} live</Badge>}

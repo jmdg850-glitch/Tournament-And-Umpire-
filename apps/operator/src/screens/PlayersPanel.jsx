@@ -362,7 +362,7 @@ export function PlayersPanel({ data, busy, run, command, load }) {
             </Button>
             <p className="muted">Players already assigned to a pair or another team in this division are hidden here and rejected by the server.</p>
           </Card>
-          <h2>Division entries</h2>
+          <div className="section-label">Division entries</div>
           {data.participants.length === 0 ? (
             <EmptyState title="No entries yet">Register a player or a pair into a division.</EmptyState>
           ) : (

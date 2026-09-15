@@ -51,6 +51,7 @@ import {
   TOURNAMENT_STATUS_LABEL,
   firstQueryError,
   labelStatus,
+  loadDeskData,
   playableMatches,
 } from "./lib.js";
 import { version as APP_VERSION } from "../package.json";
@@ -107,79 +108,13 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
   }, [tab]);
 
   const load = useCallback(async () => {
-    // Two phases: the tournament-scoped primary tables first (they carry
-    // their own tournament_id filter), then the dependent tables — which
-    // have no tournament_id column of their own — scoped by the resulting
-    // match/team/participant/division IDs via .in(). This used to fetch
-    // match_participants/participant_members/match_results/court_assignments/
-    // umpire_assignments/team_members/stages completely unfiltered (every row
-    // in the whole Supabase project) and filter client-side, which silently
-    // truncated at PostgREST's default response cap once the project
-    // accumulated enough tournaments — matches would show as "Side A vs Side
-    // B" instead of real names with no error at all. Scoping the query itself
-    // (the same .in() pattern already used server-side, e.g.
-    // packages/api/src/handleCommand.js's loadDivisionAssignment) fixes this
-    // for good, not just for the current row count.
-    const primary = await Promise.all([
-      supabase.from("tournaments").select("*").eq("id", tournamentId).maybeSingle(),
-      supabase.from("divisions").select("*").eq("tournament_id", tournamentId),
-      supabase.from("persons").select("*").eq("tournament_id", tournamentId).order("display_name"),
-      supabase.from("teams").select("*").eq("tournament_id", tournamentId).order("name"),
-      supabase.from("participants").select("*").eq("tournament_id", tournamentId),
-      supabase.from("courts").select("*").eq("tournament_id", tournamentId).order("sort_order"),
-      supabase.from("tournament_members").select("*").eq("tournament_id", tournamentId),
-      supabase.from("matches").select("*").eq("tournament_id", tournamentId).order("round"),
-      supabase.from("court_devices").select("*").eq("tournament_id", tournamentId),
-      supabase.from("profiles").select("id, display_name"),
-    ]);
-    const primaryErr = firstQueryError(primary);
-    if (primaryErr) {
-      setError(primaryErr.message);
+    const { data: next, error: err } = await loadDeskData(supabase, tournamentId);
+    if (err) {
+      setError(err.message);
       return;
     }
-    const [t, divisions, persons, teams, participants, courts, members, matches, courtDevices, profiles] = primary;
-    const matchIds = (matches.data || []).map((m) => m.id);
-    const teamIds = (teams.data || []).map((x) => x.id);
-    const participantIds = (participants.data || []).map((x) => x.id);
-    const divisionIds = (divisions.data || []).map((x) => x.id);
-
-    const empty = Promise.resolve({ data: [] });
-    const dependent = await Promise.all([
-      teamIds.length ? supabase.from("team_members").select("*").in("team_id", teamIds) : empty,
-      matchIds.length ? supabase.from("match_results").select("*").in("match_id", matchIds) : empty,
-      matchIds.length ? supabase.from("court_assignments").select("*").in("match_id", matchIds) : empty,
-      matchIds.length ? supabase.from("umpire_assignments").select("*").in("match_id", matchIds) : empty,
-      matchIds.length ? supabase.from("match_participants").select("*").in("match_id", matchIds) : empty,
-      participantIds.length ? supabase.from("participant_members").select("*").in("participant_id", participantIds) : empty,
-      divisionIds.length ? supabase.from("stages").select("*").in("division_id", divisionIds) : empty,
-    ]);
-    const dependentErr = firstQueryError(dependent);
-    if (dependentErr) {
-      setError(dependentErr.message);
-      return;
-    }
-    const [teamMembers, results, courtsA, umpiresA, matchParticipants, participantMembers, stages] = dependent;
-
     setError("");
-    setData({
-      tournament: t.data,
-      divisions: divisions.data || [],
-      persons: persons.data || [],
-      teams: teams.data || [],
-      teamMembers: teamMembers.data || [],
-      participants: participants.data || [],
-      participantMembers: participantMembers.data || [],
-      stages: stages.data || [],
-      courts: courts.data || [],
-      members: members.data || [],
-      matches: matches.data || [],
-      results: results.data || [],
-      courtAssignments: courtsA.data || [],
-      umpireAssignments: umpiresA.data || [],
-      courtDevices: courtDevices.data || [],
-      matchParticipants: matchParticipants.data || [],
-      profiles: profiles.data || [],
-    });
+    setData(next);
   }, [supabase, tournamentId]);
 
   const patchLiveTables = useCallback(async () => {
@@ -387,30 +322,32 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
           {error ? <Alert>{error}</Alert> : null}
           {busy ? <p className="muted" role="status">{busy}…</p> : null}
 
-          {tab === "overview" && (
-            <OverviewPanel
-              data={data}
-              t={t}
-              nextStatus={nextStatus}
-              busy={busy}
-              run={run}
-              live={live}
-              upcoming={upcoming}
-              completed={completed}
-              onOpenLive={() => setTab("matches")}
-              onOpenLiveWindow={(matchId) => openLiveMatchWindow(t.id, matchId)}
-              onGoto={setTab}
-            />
-          )}
-          {tab === "brackets" && <BracketsPanel data={data} command={command} load={load} />}
-          {tab === "settings" && <SettingsPanel t={t} busy={busy} run={run} />}
-          {tab === "divisions" && <DivisionsPanel data={data} busy={busy} run={run} />}
-          {tab === "players" && <PlayersPanel data={data} busy={busy} run={run} command={command} load={load} />}
-          {tab === "teams" && <TeamsPanel data={data} busy={busy} run={run} />}
-          {tab === "courts" && <CourtsPanel data={data} busy={busy} run={run} onOpenLiveWindow={(matchId) => openLiveMatchWindow(t.id, matchId)} />}
-          {tab === "umpires" && <UmpiresPanel data={data} session={session} busy={busy} run={run} />}
-          {tab === "matches" && <MatchesPanel data={data} busy={busy} run={run} command={command} load={load} />}
-          {tab === "results" && <ResultsPanel data={data} />}
+          <div key={tab} className="tab-panel">
+            {tab === "overview" && (
+              <OverviewPanel
+                data={data}
+                t={t}
+                nextStatus={nextStatus}
+                busy={busy}
+                run={run}
+                live={live}
+                upcoming={upcoming}
+                completed={completed}
+                onOpenLive={() => setTab("matches")}
+                onOpenLiveWindow={(matchId) => openLiveMatchWindow(t.id, matchId)}
+                onGoto={setTab}
+              />
+            )}
+            {tab === "brackets" && <BracketsPanel data={data} command={command} load={load} />}
+            {tab === "settings" && <SettingsPanel t={t} busy={busy} run={run} />}
+            {tab === "divisions" && <DivisionsPanel data={data} busy={busy} run={run} />}
+            {tab === "players" && <PlayersPanel data={data} busy={busy} run={run} command={command} load={load} />}
+            {tab === "teams" && <TeamsPanel data={data} busy={busy} run={run} />}
+            {tab === "courts" && <CourtsPanel data={data} busy={busy} run={run} onOpenLiveWindow={(matchId) => openLiveMatchWindow(t.id, matchId)} />}
+            {tab === "umpires" && <UmpiresPanel data={data} session={session} busy={busy} run={run} />}
+            {tab === "matches" && <MatchesPanel data={data} busy={busy} run={run} command={command} load={load} />}
+            {tab === "results" && <ResultsPanel data={data} />}
+          </div>
     </PageShell>
   );
 }

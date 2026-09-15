@@ -676,6 +676,45 @@ async function handleUpdateDivision(admin, actor, payload, envelope) {
   });
 }
 
+// Division deletion is a real, hard delete — not an archive/status flag. The
+// `divisions` row is deleted through the same apply_official_writes path as
+// every other write; everything scoped to it (teams, participants/participant
+// members, stages, matches and everything matches cascade to — match_participants,
+// score_events, match_results, court_assignments, umpire_assignments) is removed
+// by the existing `on delete cascade` foreign keys already defined in
+// supabase/migrations/0001_initial_schema.sql — no migration or schema change is
+// needed for this. Courts and persons are tournament-scoped, not division-scoped,
+// so they are correctly left untouched. A division with a match currently
+// in_progress is protected — deleting it out from under a live umpire session
+// would destroy in-flight scoring state, so that must be resolved (completed,
+// held, or cancelled) before the division itself can be deleted.
+async function handleDeleteDivision(admin, actor, payload, envelope) {
+  const division = await getDivision(admin, payload.division_id);
+  const member = await loadMember(admin, division.tournament_id, actor.id);
+  requireOrganizer(member);
+  const { data: liveMatches } = await admin
+    .from("matches")
+    .select("id")
+    .eq("division_id", division.id)
+    .eq("status", "in_progress")
+    .limit(1);
+  if (liveMatches?.length) {
+    throw httpError(
+      409,
+      "DIVISION_HAS_LIVE_MATCHES",
+      "This division has a match in progress. Complete, hold, or cancel it before deleting the division.",
+    );
+  }
+  const batch = createBatch();
+  batch.delete("divisions", division.id);
+  return commit(admin, batch, {
+    ...envelope,
+    actorId: actor.id,
+    tournamentId: division.tournament_id,
+    result: { division_id: division.id, deleted: true },
+  });
+}
+
 async function handleAddPerson(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
@@ -1877,6 +1916,7 @@ const HANDLERS = {
   transition_tournament: handleTransitionTournament,
   create_division: handleCreateDivision,
   update_division: handleUpdateDivision,
+  delete_division: handleDeleteDivision,
   add_person: handleAddPerson,
   update_person: handleUpdatePerson,
   remove_person: handleRemovePerson,

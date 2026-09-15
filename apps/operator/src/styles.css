@@ -230,3 +230,62 @@ input, select, textarea { background: #fff; }
   font-weight: 600;
   color: var(--warn);
 }
+
+/* Match display window (MatchDisplayWindow.jsx) — lives inside .live-window,
+   so like .scoreboard/.live-tile it is deliberately theme-independent (always
+   dark, "stadium" styling) rather than pulling --surface/--border, which are
+   light in the operator app's own theme. */
+.display-match-groups { gap: 22px; }
+.display-match-group-toggle {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0 0 10px;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+}
+.display-match-group-toggle .section-label { color: #9099a8; }
+.display-match-group-toggle .section-label.tone-live { color: var(--live); }
+.display-match-group-toggle .section-label.tone-warn { color: var(--warn); }
+.display-match-empty { margin: 0; color: #8b93a1; }
+.display-match-rows { gap: 10px; }
+.display-match-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-lg);
+  padding: 14px 18px;
+}
+.display-match-row[data-live="true"] {
+  border-color: var(--live);
+  background: color-mix(in srgb, var(--live) 16%, rgba(255, 255, 255, 0.04));
+}
+.display-match-row-main { min-width: 0; }
+.display-match-names {
+  font-size: clamp(1.05rem, 2.2vw, 1.4rem);
+  font-weight: 700;
+  font-family: "Barlow Condensed", sans-serif;
+  letter-spacing: 0.02em;
+  color: #eef1f4;
+  overflow-wrap: anywhere;
+}
+.display-match-names .won { color: var(--tape); }
+.display-match-meta { font-size: 0.8rem; margin-top: 2px; color: #9099a8; }
+.display-match-row-side {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.display-match-score {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: clamp(1.3rem, 3vw, 2rem);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #eef1f4;
+}

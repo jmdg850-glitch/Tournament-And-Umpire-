@@ -21,6 +21,7 @@ export {
   ServeIndicator,
   SetupChecklist,
   Skeleton,
+  SplashScreen,
   Stat,
   StandingsTable,
   StatusBadge,

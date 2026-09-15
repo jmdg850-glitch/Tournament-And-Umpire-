@@ -1540,3 +1540,94 @@ describe.skipIf(!live)("Match integrity: self-match and cross-team protection (u
     expect(crossTeamTry.body.error.code).toBe("PLAYER_NOT_ON_TEAM");
   }, 60_000);
 });
+
+describe.skipIf(!live)("Division deletion (delete_division)", () => {
+  let organizer;
+  let umpire;
+  let outsider;
+
+  beforeAll(async () => {
+    organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+    umpire = await signIn("umpire.dev@tournament.local", "dev-umpire-pass");
+    outsider = await signIn("outsider.dev@tournament.local", "dev-outsider-pass");
+  }, 30_000);
+
+  test("organizer-only, blocked while a match is live, cascades matches/participants on success, and 404s on a repeat delete", async () => {
+    let r = await expectOk(organizer.token, "create_tournament", { name: `DD ${Date.now()}` });
+    const tournamentId = r.body.result.tournament.id;
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+
+    r = await expectOk(organizer.token, "create_division", {
+      tournament_id: tournamentId,
+      name: "Doomed Division",
+      format: "single_elim",
+      config: { winTo: 11, winBy: "two", bestOf: 1, isDoubles: false },
+    });
+    const divisionId = r.body.result.division.id;
+
+    const persons = [];
+    for (const name of ["Uno", "Dos", "Tres", "Cuatro"]) {
+      const p = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: name });
+      persons.push(p.body.result.person);
+    }
+    for (const [i, p] of persons.entries()) {
+      await expectOk(organizer.token, "register_participant", {
+        division_id: divisionId,
+        kind: "singles",
+        display_name: p.display_name,
+        seed: i + 1,
+        person_ids: [p.id],
+      });
+    }
+
+    r = await expectOk(organizer.token, "create_court", { tournament_id: tournamentId, name: "DD Court" });
+    const courtId = r.body.result.court.id;
+    await expectOk(organizer.token, "add_member", { tournament_id: tournamentId, user_id: umpire.user.id, role: "umpire" });
+
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration_closed" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "ready" });
+    await expectOk(organizer.token, "generate_bracket", { division_id: divisionId });
+
+    const { data: matches } = await organizer.client.from("matches").select("*").eq("division_id", divisionId);
+    expect(matches.length).toBeGreaterThan(0);
+    const liveMatchId = matches.find((m) => m.status === "scheduled").id;
+
+    // A non-organizer/admin cannot delete the division.
+    const denied = await send(outsider.token, "delete_division", { division_id: divisionId });
+    expect(denied.body.ok).toBe(false);
+    expect(denied.status).toBe(403);
+
+    await assignAndPlay(organizer.token, liveMatchId, courtId, umpire.user.id, "A");
+    const { data: liveRow } = await organizer.client.from("matches").select("status").eq("id", liveMatchId).maybeSingle();
+    expect(liveRow.status).toBe("in_progress");
+
+    // Deleting a division out from under a live match would destroy the umpire's
+    // in-flight scoring session — the handler must refuse this, not silently wipe it.
+    const blocked = await send(organizer.token, "delete_division", { division_id: divisionId });
+    expect(blocked.body.ok).toBe(false);
+    expect(blocked.body.error.code).toBe("DIVISION_HAS_LIVE_MATCHES");
+
+    // Once the live match is held (no longer in_progress), deletion is allowed.
+    await expectOk(umpire.token, "transition_match", { match_id: liveMatchId, status: "postponed" });
+
+    r = await expectOk(organizer.token, "delete_division", { division_id: divisionId });
+    expect(r.body.result.deleted).toBe(true);
+
+    // The division and everything scoped to it (matches, and — via the same FK
+    // cascades — match_participants/score_events/match_results/court_assignments/
+    // umpire_assignments, plus participants/teams/stages) is actually gone, not
+    // just hidden — this is a real delete through apply_official_writes, not a
+    // client-side/status-flag fake delete.
+    const { data: goneDivision } = await organizer.client.from("divisions").select("id").eq("id", divisionId).maybeSingle();
+    expect(goneDivision).toBeNull();
+    const { data: goneMatches } = await organizer.client.from("matches").select("id").eq("division_id", divisionId);
+    expect(goneMatches).toEqual([]);
+    const { data: goneParticipants } = await organizer.client.from("participants").select("id").eq("division_id", divisionId);
+    expect(goneParticipants).toEqual([]);
+
+    // Deleting an already-deleted division is a clean 404, not a crash.
+    const again = await send(organizer.token, "delete_division", { division_id: divisionId });
+    expect(again.body.ok).toBe(false);
+    expect(again.status).toBe(404);
+  }, 60_000);
+});

@@ -16,6 +16,7 @@ import {
   LoadingState,
   Modal,
   Scoreboard,
+  SplashScreen,
   StatusBadge,
 } from "@tournament/ui";
 import { ArrowLeft, LogOut, PauseCircle, QrCode, RefreshCw } from "lucide-react";
@@ -54,11 +55,7 @@ export default function App() {
   }, [supabase]);
 
   if (session === undefined) {
-    return (
-      <div className="ump-shell">
-        <div className="ump-top"><LoadingState label="Restoring session" /></div>
-      </div>
-    );
+    return <SplashScreen tagline="Umpire" status="Restoring your session…" />;
   }
   if (station?.access_token) {
     return matchId ? (

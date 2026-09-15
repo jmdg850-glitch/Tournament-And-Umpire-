@@ -4,6 +4,7 @@ export const COMMAND_TYPES = Object.freeze([
   "transition_tournament",
   "create_division",
   "update_division",
+  "delete_division",
   "add_person",
   "update_person",
   "remove_person",

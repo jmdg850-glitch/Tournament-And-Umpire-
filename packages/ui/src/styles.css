@@ -692,6 +692,89 @@ body:has(.update-banner) .toast-stack {
 }
 .scoreboard .game { letter-spacing: 0.16em; font-size: 0.75rem; text-transform: uppercase; color: var(--tape); font-weight: 700; }
 
+/* Branded boot/loading screen (SplashScreen) — see components.jsx for why
+   this has no artificial minimum-display timer. Deliberately theme-
+   independent (always dark), same "stadium" treatment as .live-window/
+   .scoreboard, since it appears before either app's own theme override has
+   had a chance to matter (and before there is any session to theme around). */
+.splash-screen {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  gap: var(--space-5);
+  background: var(--shell-bg);
+  color: #eef1f4;
+  text-align: center;
+  padding: 24px;
+}
+.splash-mark {
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+  animation: splash-rise 620ms var(--ease-out) both;
+}
+.splash-mark h1 {
+  font-size: clamp(2.2rem, 6vw, 3.2rem);
+  color: #eef1f4;
+}
+.splash-line {
+  width: 64px;
+  height: 3px;
+  background: var(--tape);
+  border-radius: 999px;
+  transform-origin: center;
+  animation: splash-line-grow 520ms var(--ease-out) 80ms both;
+}
+.splash-tagline {
+  font-size: var(--text-sm);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: #9099a8;
+}
+.splash-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-sm);
+  color: #9099a8;
+  animation: fade-in 420ms var(--ease-out) 260ms both;
+}
+@keyframes splash-rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes splash-line-grow {
+  from { transform: scaleX(0); opacity: 0; }
+  to { transform: scaleX(1); opacity: 1; }
+}
+
+/* Very subtle mount-in for cards/panels as they first appear (a new division
+   card, a newly-relevant Attention item, a tab's content switching in) — not
+   a re-trigger on every re-render, since React only replays a CSS animation
+   when the underlying DOM node is newly created for a stable key, not on
+   ordinary prop updates. */
+.panel {
+  animation: card-enter 180ms var(--ease-out) both;
+}
+@keyframes card-enter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* One section of a tournament desk (Overview/Divisions/Matches/…) fading in
+   as the operator switches tabs — see TournamentDesk.jsx's `.tab-panel`
+   wrapper, keyed by the active tab so React remounts it on each switch. */
+.tab-panel {
+  animation: rise 200ms var(--ease-out) both;
+}
+
+/* A newly-relevant Attention Needed row getting a brief, subtle entrance —
+   see AttentionPanel.jsx. Already-listed items are not re-mounted (stable
+   key={item.tournamentId}), so this only plays for a genuinely new item. */
+.attention-item {
+  animation: rise 220ms var(--ease-out) both;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }

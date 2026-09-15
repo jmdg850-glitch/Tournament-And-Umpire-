@@ -3,18 +3,25 @@ import {
   applyDeskRealtime,
   applyMatchIfScoped,
   isFresherRow,
+  bracketHash,
   createCatchupBuffer,
   createSubscriptionTracker,
   deskLiveChannelName,
+  divisionDisplayChannelName,
   liveHash,
+  matchDisplayHash,
   matchLiveChannelName,
+  parseBracketHash,
   parseLiveHash,
+  parseMatchDisplayHash,
   upsertById,
 } from "./liveSync.js";
 
 const tId = "11111111-1111-4111-8111-111111111111";
 const m1 = "22222222-2222-4222-8222-222222222222";
 const m2 = "33333333-3333-4333-8333-333333333333";
+const dA = "55555555-5555-4555-8555-555555555555";
+const dB = "66666666-6666-4666-8666-666666666666";
 
 function desk(matches) {
   return { tournament: { id: tId }, matches, results: [], courtAssignments: [] };
@@ -29,6 +36,37 @@ describe("live hash routing", () => {
   test("rejects a hash that is not a live match window", () => {
     expect(parseLiveHash("#/tournaments")).toBeNull();
     expect(parseLiveHash(`#/live/${tId}`)).toBeNull();
+  });
+});
+
+describe("bracket display window routing", () => {
+  test("parses a tournament-scoped bracket hash", () => {
+    expect(parseBracketHash(bracketHash(tId))).toEqual({ tournamentId: tId });
+    expect(parseBracketHash(`#/bracket/${tId}`)).toEqual({ tournamentId: tId });
+  });
+
+  test("rejects a hash that is not a bracket window", () => {
+    expect(parseBracketHash("#/tournaments")).toBeNull();
+    expect(parseBracketHash(`#/live/${tId}/${m1}`)).toBeNull();
+  });
+});
+
+describe("per-division match display window routing", () => {
+  test("parses a division-scoped match display hash", () => {
+    expect(parseMatchDisplayHash(matchDisplayHash(tId, dA))).toEqual({ tournamentId: tId, divisionId: dA });
+    expect(parseMatchDisplayHash(`#/matches-display/${tId}/${dA}`)).toEqual({ tournamentId: tId, divisionId: dA });
+  });
+
+  test("rejects a hash that is not a match display window", () => {
+    expect(parseMatchDisplayHash("#/tournaments")).toBeNull();
+    expect(parseMatchDisplayHash(`#/matches-display/${tId}`)).toBeNull();
+  });
+
+  test("two divisions never resolve to the same route or channel — a window for one cannot silently become the other's", () => {
+    expect(matchDisplayHash(tId, dA)).not.toBe(matchDisplayHash(tId, dB));
+    expect(parseMatchDisplayHash(matchDisplayHash(tId, dA)).divisionId).toBe(dA);
+    expect(parseMatchDisplayHash(matchDisplayHash(tId, dB)).divisionId).toBe(dB);
+    expect(divisionDisplayChannelName(dA)).not.toBe(divisionDisplayChannelName(dB));
   });
 });
 

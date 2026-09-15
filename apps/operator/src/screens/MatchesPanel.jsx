@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { Alert, Button, Dropdown, EmptyState, Input, Modal, SectionHeader, Select, ServeIndicator, Stat, StatusBadge, Table } from "@tournament/ui";
+import { Alert, Badge, Button, Card, Dropdown, EmptyState, Input, Modal, SectionHeader, Select, ServeIndicator, Stat, StatusBadge, Table } from "@tournament/ui";
 import { ExternalLink } from "lucide-react";
-import { openLiveMatchWindow } from "../useRealtimeChannel.js";
+import { openLiveMatchWindow, openMatchDisplayWindow } from "../useRealtimeChannel.js";
 import {
   courtFor,
   memberName,
@@ -541,6 +541,38 @@ function MatchTable({ data, rows, busy, run, command, load }) {
   );
 }
 
+// A read-only, TV/second-monitor match display per division — every division
+// can have its own window open at once, each independently scoped by its
+// division id (see MatchDisplayWindow.jsx and useRealtimeChannel.js's
+// openMatchDisplayWindow). Opening one never navigates this Operator tab away.
+function DivisionMatchWindows({ data }) {
+  return (
+    <Card className="stack">
+      <SectionHeader title="Match displays" description="Open a read-only match display for a division on a second monitor or TV." />
+      <div className="grid2">
+        {data.divisions.map((d) => {
+          const liveCount = data.matches.filter((m) => m.division_id === d.id && m.status === "in_progress").length;
+          return (
+            <div key={d.id} className="row" style={{ justifyContent: "space-between" }}>
+              <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                <span>{d.name}</span>
+                {liveCount > 0 && <Badge tone="live">{liveCount} live</Badge>}
+              </div>
+              <Button
+                variant="secondary"
+                aria-label={`Open match window for ${d.name}`}
+                onClick={() => openMatchDisplayWindow(data.tournament.id, d.id)}
+              >
+                Open Match Window <ExternalLink size={15} aria-hidden="true" />
+              </Button>
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
 export function MatchesPanel({ data, busy, run, command, load }) {
   const [showCompleted, setShowCompleted] = useState(false);
   const rows = playableMatches(data.matches);
@@ -560,6 +592,10 @@ export function MatchesPanel({ data, busy, run, command, load }) {
         <Stat value={held.length} label="Held" />
         <Stat tone="quiet" value={completed.length} label="Completed" />
       </div>
+
+      {data.divisions.length > 0 && (
+        <DivisionMatchWindows data={data} />
+      )}
 
       {live.length > 0 && (
         <div>

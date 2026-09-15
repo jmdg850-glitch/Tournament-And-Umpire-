@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createBrowserClient, envConfig, sendCommand, sendCommandDurable, defaultStore, drainQueue, queueSize, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
-import { parseLiveHash } from "@tournament/engine";
+import { parseBracketHash, parseLiveHash, parseMatchDisplayHash } from "@tournament/engine";
 import {
   Alert,
   Button,
@@ -16,6 +16,7 @@ import {
   PageShell,
   Select,
   Skeleton,
+  SplashScreen,
   Stat,
   StatusBadge,
   Table,
@@ -25,6 +26,8 @@ import {
 import { ArrowRight, LayoutDashboard, LogOut, Plus, RefreshCw, Trash2 } from "lucide-react";
 import TournamentDesk from "./TournamentDesk.jsx";
 import LiveMatchWindow from "./LiveMatchWindow.jsx";
+import BracketWindow from "./BracketWindow.jsx";
+import MatchDisplayWindow from "./MatchDisplayWindow.jsx";
 import UpdateBanner, { useDesktopUpdateContext } from "./UpdateBanner.jsx";
 import AuthLayout from "./AuthLayout.jsx";
 import AppBrand from "./AppBrand.jsx";
@@ -44,10 +47,14 @@ export default function App() {
   const [error, setError] = useState("");
   const [recovering, setRecovering] = useState(() => isRecoveryAuthUrl());
   const [liveRoute, setLiveRoute] = useState(() => parseLiveHash(typeof window === "undefined" ? "" : window.location.hash));
+  const [bracketRoute, setBracketRoute] = useState(() => parseBracketHash(typeof window === "undefined" ? "" : window.location.hash));
+  const [matchDisplayRoute, setMatchDisplayRoute] = useState(() => parseMatchDisplayHash(typeof window === "undefined" ? "" : window.location.hash));
 
   useEffect(() => {
     function onHash() {
       setLiveRoute(parseLiveHash(window.location.hash));
+      setBracketRoute(parseBracketHash(window.location.hash));
+      setMatchDisplayRoute(parseMatchDisplayHash(window.location.hash));
     }
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
@@ -137,10 +144,10 @@ export default function App() {
 
   if (session === undefined) {
     return (
-      <div className="auth-wrap">
+      <>
         <UpdateBanner />
-        <LoadingState label="Restoring session" />
-      </div>
+        <SplashScreen tagline="Operator Desk" status="Restoring your session…" />
+      </>
     );
   }
   if (liveRoute) {
@@ -150,6 +157,25 @@ export default function App() {
         session={session}
         tournamentId={liveRoute.tournamentId}
         matchId={liveRoute.matchId}
+      />
+    );
+  }
+  if (bracketRoute) {
+    return (
+      <BracketWindow
+        supabase={supabase}
+        session={session}
+        tournamentId={bracketRoute.tournamentId}
+      />
+    );
+  }
+  if (matchDisplayRoute) {
+    return (
+      <MatchDisplayWindow
+        supabase={supabase}
+        session={session}
+        tournamentId={matchDisplayRoute.tournamentId}
+        divisionId={matchDisplayRoute.divisionId}
       />
     );
   }

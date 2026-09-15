@@ -8,25 +8,36 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 
 let mainWindow = null;
 let pendingAuthUrl = null;
-const liveWindows = new Map();
+// One shared registry for every popped-out display window (live match,
+// bracket, per-division match display) — each entry is keyed with its own
+// kind prefix (e.g. "live:<tournamentId>:<matchId>", "bracket:<tournamentId>",
+// "match:<tournamentId>:<divisionId>") so a Bracket window for tournament A
+// and a Match window for the same tournament A never collide, while an
+// already-open window for the exact same thing is focused/reused instead of
+// duplicated (see createDisplayWindow below). This also means the desktop
+// auto-updater's "don't restart while a display window an operator has
+// handed off to a second screen/projector is open" gate (getLiveWindowCount /
+// closeLiveWindows, passed into updater.cjs) already covers Bracket/Match
+// windows too, not just the original Live match window.
+const displayWindows = new Map();
 let rendererUpdateContext = { liveMatches: 0, busy: false, dialogOpen: false };
 
 function liveWindowCount() {
   let n = 0;
-  for (const win of liveWindows.values()) {
+  for (const win of displayWindows.values()) {
     if (win && !win.isDestroyed()) n += 1;
   }
   return n;
 }
 
 function closeLiveWindows() {
-  for (const [key, win] of [...liveWindows.entries()]) {
+  for (const [key, win] of [...displayWindows.entries()]) {
     try {
       if (win && !win.isDestroyed()) win.close();
     } catch {
       /* ignore */
     }
-    liveWindows.delete(key);
+    displayWindows.delete(key);
   }
 }
 
@@ -96,23 +107,26 @@ function createWindow() {
   mainWindow.on("closed", () => { mainWindow = null; });
 }
 
-function createLiveWindow({ tournamentId, matchId }) {
-  if (!UUID_RE.test(tournamentId) || !UUID_RE.test(matchId)) {
-    return { ok: false, error: "Invalid live window request" };
-  }
-  const key = `${tournamentId}:${matchId}`;
-  const existing = liveWindows.get(key);
+// Shared implementation behind createLiveWindow/createBracketWindow/
+// createMatchWindow: opens a BrowserWindow scoped to one hash route, focusing
+// an already-open window for the same `key` instead of duplicating it. Each
+// window is locked to navigating only within its own route family
+// (`navPattern`) — the same protection createLiveWindow already had — so this
+// popped-out display can never be redirected into the full authenticated
+// Operator app or an arbitrary URL.
+function createDisplayWindow({ key, hashPath, title, navPattern, width, height, minWidth, minHeight }) {
+  const existing = displayWindows.get(key);
   if (existing && !existing.isDestroyed()) {
     if (existing.isMinimized()) existing.restore();
     existing.focus();
     return { ok: true, focused: true };
   }
   const win = new BrowserWindow({
-    width: 920,
-    height: 640,
-    minWidth: 420,
-    minHeight: 320,
-    title: "Live match",
+    width,
+    height,
+    minWidth,
+    minHeight,
+    title,
     icon: ICON,
     backgroundColor: "#0c0f13",
     autoHideMenuBar: true,
@@ -120,15 +134,69 @@ function createLiveWindow({ tournamentId, matchId }) {
   });
   denyWindowOpen(win.webContents);
   win.webContents.on("will-navigate", (event, url) => {
-    const live = /#\/?live\//.test(url);
-    if (!live) event.preventDefault();
+    if (!navPattern.test(url)) event.preventDefault();
   });
-  loadOperator(win, `/live/${tournamentId}/${matchId}`);
-  liveWindows.set(key, win);
+  loadOperator(win, hashPath);
+  displayWindows.set(key, win);
   win.on("closed", () => {
-    if (liveWindows.get(key) === win) liveWindows.delete(key);
+    if (displayWindows.get(key) === win) displayWindows.delete(key);
   });
   return { ok: true, opened: true };
+}
+
+function createLiveWindow({ tournamentId, matchId }) {
+  if (!UUID_RE.test(tournamentId) || !UUID_RE.test(matchId)) {
+    return { ok: false, error: "Invalid live window request" };
+  }
+  return createDisplayWindow({
+    key: `live:${tournamentId}:${matchId}`,
+    hashPath: `/live/${tournamentId}/${matchId}`,
+    title: "Live match",
+    navPattern: /#\/?live\//,
+    width: 920,
+    height: 640,
+    minWidth: 420,
+    minHeight: 320,
+  });
+}
+
+// Read-only, whole-tournament bracket display — one window per tournament
+// (opening it again while already open focuses that same window rather than
+// spawning a second one for the same tournament).
+function createBracketWindow({ tournamentId }) {
+  if (!UUID_RE.test(tournamentId)) {
+    return { ok: false, error: "Invalid bracket window request" };
+  }
+  return createDisplayWindow({
+    key: `bracket:${tournamentId}`,
+    hashPath: `/bracket/${tournamentId}`,
+    title: "Bracket",
+    navPattern: /#\/?bracket\//,
+    width: 1280,
+    height: 840,
+    minWidth: 640,
+    minHeight: 420,
+  });
+}
+
+// Read-only, division-scoped match display — keyed by (tournamentId,
+// divisionId), so Division A's window and Division B's window are always two
+// independent windows; opening Division A's again reuses/focuses it without
+// touching Division B's.
+function createMatchWindow({ tournamentId, divisionId }) {
+  if (!UUID_RE.test(tournamentId) || !UUID_RE.test(divisionId)) {
+    return { ok: false, error: "Invalid match window request" };
+  }
+  return createDisplayWindow({
+    key: `match:${tournamentId}:${divisionId}`,
+    hashPath: `/matches-display/${tournamentId}/${divisionId}`,
+    title: "Match display",
+    navPattern: /#\/?matches-display\//,
+    width: 1000,
+    height: 760,
+    minWidth: 480,
+    minHeight: 360,
+  });
 }
 
 function deliverAuthUrl(url) {
@@ -182,6 +250,19 @@ if (!gotLock) {
     return createLiveWindow({
       tournamentId: String(payload.tournamentId || ""),
       matchId: String(payload.matchId || ""),
+    });
+  });
+
+  ipcMain.handle("open-bracket-window", (_event, payload = {}) => {
+    return createBracketWindow({
+      tournamentId: String(payload.tournamentId || ""),
+    });
+  });
+
+  ipcMain.handle("open-match-window", (_event, payload = {}) => {
+    return createMatchWindow({
+      tournamentId: String(payload.tournamentId || ""),
+      divisionId: String(payload.divisionId || ""),
     });
   });
 

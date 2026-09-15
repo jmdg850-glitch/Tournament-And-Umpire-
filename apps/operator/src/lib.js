@@ -74,6 +74,78 @@ export function firstQueryError(results) {
   return results.find((r) => r?.error)?.error || null;
 }
 
+// The full tournament-desk dataset (divisions, persons, teams, participants,
+// matches, and everything that hangs off them) — extracted from
+// TournamentDesk.jsx's own `load()` so the read-only display windows
+// (BracketWindow, MatchDisplayWindow) can reuse the exact same query shape
+// instead of re-deriving it, since the shared board/match renderers
+// (brackets.jsx, lib.js helpers like sideOf/courtFor/umpireFor) all expect
+// this same `data` shape. Two phases: the tournament-scoped primary tables
+// first (they carry their own tournament_id filter), then the dependent
+// tables — which have no tournament_id column of their own — scoped by the
+// resulting match/team/participant/division IDs via .in(). See the git
+// history on TournamentDesk.jsx's load() for why unfiltered dependent-table
+// queries are unsafe (PostgREST's default response cap silently truncated
+// them once a project had enough tournaments).
+export async function loadDeskData(supabase, tournamentId) {
+  const primary = await Promise.all([
+    supabase.from("tournaments").select("*").eq("id", tournamentId).maybeSingle(),
+    supabase.from("divisions").select("*").eq("tournament_id", tournamentId),
+    supabase.from("persons").select("*").eq("tournament_id", tournamentId).order("display_name"),
+    supabase.from("teams").select("*").eq("tournament_id", tournamentId).order("name"),
+    supabase.from("participants").select("*").eq("tournament_id", tournamentId),
+    supabase.from("courts").select("*").eq("tournament_id", tournamentId).order("sort_order"),
+    supabase.from("tournament_members").select("*").eq("tournament_id", tournamentId),
+    supabase.from("matches").select("*").eq("tournament_id", tournamentId).order("round"),
+    supabase.from("court_devices").select("*").eq("tournament_id", tournamentId),
+    supabase.from("profiles").select("id, display_name"),
+  ]);
+  const primaryErr = firstQueryError(primary);
+  if (primaryErr) return { data: null, error: primaryErr };
+  const [t, divisions, persons, teams, participants, courts, members, matches, courtDevices, profiles] = primary;
+  const matchIds = (matches.data || []).map((m) => m.id);
+  const teamIds = (teams.data || []).map((x) => x.id);
+  const participantIds = (participants.data || []).map((x) => x.id);
+  const divisionIds = (divisions.data || []).map((x) => x.id);
+
+  const empty = Promise.resolve({ data: [] });
+  const dependent = await Promise.all([
+    teamIds.length ? supabase.from("team_members").select("*").in("team_id", teamIds) : empty,
+    matchIds.length ? supabase.from("match_results").select("*").in("match_id", matchIds) : empty,
+    matchIds.length ? supabase.from("court_assignments").select("*").in("match_id", matchIds) : empty,
+    matchIds.length ? supabase.from("umpire_assignments").select("*").in("match_id", matchIds) : empty,
+    matchIds.length ? supabase.from("match_participants").select("*").in("match_id", matchIds) : empty,
+    participantIds.length ? supabase.from("participant_members").select("*").in("participant_id", participantIds) : empty,
+    divisionIds.length ? supabase.from("stages").select("*").in("division_id", divisionIds) : empty,
+  ]);
+  const dependentErr = firstQueryError(dependent);
+  if (dependentErr) return { data: null, error: dependentErr };
+  const [teamMembers, results, courtsA, umpiresA, matchParticipants, participantMembers, stages] = dependent;
+
+  return {
+    error: null,
+    data: {
+      tournament: t.data,
+      divisions: divisions.data || [],
+      persons: persons.data || [],
+      teams: teams.data || [],
+      teamMembers: teamMembers.data || [],
+      participants: participants.data || [],
+      participantMembers: participantMembers.data || [],
+      stages: stages.data || [],
+      courts: courts.data || [],
+      members: members.data || [],
+      matches: matches.data || [],
+      results: results.data || [],
+      courtAssignments: courtsA.data || [],
+      umpireAssignments: umpiresA.data || [],
+      courtDevices: courtDevices.data || [],
+      matchParticipants: matchParticipants.data || [],
+      profiles: profiles.data || [],
+    },
+  };
+}
+
 export function isTeamMatchup(match) {
   if (!match || match.parent_match_id) return false;
   if (match.bracket_side === "pair") return false;

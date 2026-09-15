@@ -10,6 +10,13 @@ contextBridge.exposeInMainWorld("tournamentDesktop", {
     tournamentId: payload?.tournamentId,
     matchId: payload?.matchId,
   }),
+  openBracketWindow: (payload) => ipcRenderer.invoke("open-bracket-window", {
+    tournamentId: payload?.tournamentId,
+  }),
+  openMatchWindow: (payload) => ipcRenderer.invoke("open-match-window", {
+    tournamentId: payload?.tournamentId,
+    divisionId: payload?.divisionId,
+  }),
   updates: {
     getState: () => ipcRenderer.invoke("updater:get-state"),
     check: () => ipcRenderer.invoke("updater:check"),

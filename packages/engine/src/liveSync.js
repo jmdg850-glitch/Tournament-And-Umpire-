@@ -15,12 +15,47 @@ export function liveHash(tournamentId, matchId) {
   return `#/live/${tournamentId}/${matchId}`;
 }
 
+// Same hand-rolled hash-route family as parseLiveHash/liveHash above — a
+// read-only "open in another window" display for the whole tournament's
+// bracket, following the exact pattern already established for the live
+// match popup (see apps/operator/src/useRealtimeChannel.js's
+// openLiveMatchWindow / BracketWindow.jsx).
+export function parseBracketHash(hash) {
+  const h = String(hash || "").replace(/^#/, "");
+  const m = h.match(/^\/?bracket\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i);
+  if (!m) return null;
+  return { tournamentId: m[1] };
+}
+
+export function bracketHash(tournamentId) {
+  return `#/bracket/${tournamentId}`;
+}
+
+// A read-only, division-scoped match display — one tournament can have many of
+// these open at once (one per division), each independently addressed by the
+// division id in the hash so two open windows can never cross-contaminate each
+// other's state (see MatchDisplayWindow.jsx).
+export function parseMatchDisplayHash(hash) {
+  const h = String(hash || "").replace(/^#/, "");
+  const m = h.match(/^\/?matches-display\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i);
+  if (!m) return null;
+  return { tournamentId: m[1], divisionId: m[2] };
+}
+
+export function matchDisplayHash(tournamentId, divisionId) {
+  return `#/matches-display/${tournamentId}/${divisionId}`;
+}
+
 export function deskLiveChannelName(tournamentId) {
   return `desk-live:${tournamentId}`;
 }
 
 export function matchLiveChannelName(matchId) {
   return `live-match:${matchId}`;
+}
+
+export function divisionDisplayChannelName(divisionId) {
+  return `division-display:${divisionId}`;
 }
 
 function lastSeqOf(row) {

@@ -300,6 +300,35 @@ export function LoadingState({ label = "Loading" }) {
   );
 }
 
+/**
+ * Branded boot/loading screen, shared by both apps' "restoring session" state
+ * (see App.jsx in each app) — not shown on every tab change, only while the
+ * app is genuinely still initializing. Purely reactive to how long that
+ * actually takes: there is no artificial minimum-display timer here, so a
+ * fast start never turns this into a forced wait, and a slow one just leaves
+ * it on screen naturally for as long as it takes. `prefers-reduced-motion`
+ * is handled by the same global `* { animation: none !important }` rule this
+ * stylesheet already applies everywhere else (see the bottom of this file's
+ * companion styles.css) — no separate reduced-motion branch is needed here.
+ */
+export function SplashScreen({ brand = "Tournament", tagline, status }) {
+  return (
+    <div className="splash-screen" role="status" aria-live="polite">
+      <div className="splash-mark">
+        <span className="splash-line" aria-hidden="true" />
+        <h1>{brand}</h1>
+        {tagline ? <div className="splash-tagline">{tagline}</div> : null}
+      </div>
+      {status ? (
+        <div className="splash-status">
+          <span className="spinner" aria-hidden="true" />
+          <span>{status}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function Skeleton({ lines = 3 }) {
   return (
     <div className="stack" aria-hidden="true">

@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Badge, Button, Card, EmptyState, Input, Select, SectionHeader } from "@tournament/ui";
+import { Badge, Button, Card, ConfirmDialog, EmptyState, Input, Select, SectionHeader } from "@tournament/ui";
+import { Trash2 } from "lucide-react";
 import { FORMAT_LABEL } from "../lib.js";
 
 export function DivisionsPanel({ data, busy, run }) {
@@ -10,6 +11,7 @@ export function DivisionsPanel({ data, busy, run }) {
   const [sameTeamPolicy, setSameTeamPolicy] = useState("avoid_semis");
   const [progressionMode, setProgressionMode] = useState("playoffs");
   const [edit, setEdit] = useState({});
+  const [confirmDelete, setConfirmDelete] = useState(null);
   return (
     <div className="stack">
       <SectionHeader title="Divisions" description="Group players into competitions, then generate each division's bracket." />
@@ -173,9 +175,36 @@ export function DivisionsPanel({ data, busy, run }) {
                 <Button type="submit" variant="secondary" disabled={!!busy}>Save options</Button>
               </form>
             )}
+            <div className="row" style={{ justifyContent: "flex-end", borderTop: "1px solid var(--border)", paddingTop: "var(--space-3)" }}>
+              <Button
+                type="button"
+                variant="danger"
+                className="compact"
+                disabled={!!busy}
+                aria-label={`Delete ${d.name} division`}
+                onClick={() => setConfirmDelete(d)}
+              >
+                <Trash2 size={14} aria-hidden="true" /> Delete division
+              </Button>
+            </div>
           </Card>
         );
       })}
+      {confirmDelete && (
+        <ConfirmDialog
+          title={`Delete "${confirmDelete.name}"?`}
+          body={`This permanently deletes the division and everything scheduled under it — its matches, bracket progress, and team/player registrations for this division — and removes it from every operational view, including the Dashboard's Attention Needed. Other divisions in this tournament aren't affected. This can't be undone.`}
+          confirmLabel="Delete division"
+          danger
+          busy={!!busy}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() => {
+            const target = confirmDelete;
+            setConfirmDelete(null);
+            run("Delete division", "delete_division", { division_id: target.id });
+          }}
+        />
+      )}
     </div>
   );
 }
