@@ -77,6 +77,66 @@ test("computeAttentionItems: a deleted division's matches no longer count once t
   assert.deepEqual(afterDeleteAndReload, []);
 });
 
+test("computeAttentionItems: a tournament removed from the dashboard (cancelled/archived) no longer shows its leftover matches as an attention item", () => {
+  // "Remove from dashboard" (App.jsx's archiveSelectedTournaments) is the only
+  // "delete this event" action the operator dashboard exposes — it calls
+  // transition_tournament to flip status to "cancelled" or "archived" rather
+  // than deleting the tournament row, and does NOT touch its matches or
+  // court_devices rows (unlike delete_division, nothing cascades here). So a
+  // live/held match or a revoked court device that existed before the removal
+  // would otherwise keep generating an attention item forever, surviving every
+  // refresh, because the underlying rows never disappear from a fresh fetch.
+  const tournamentsWithOneRemoved = [
+    { id: "t1", name: "Riverside Open", status: "archived" },
+    { id: "t2", name: "Summer Slam", status: "in_progress" },
+  ];
+  const matches = [
+    { tournament_id: "t1", status: "in_progress" }, // leftover from before removal
+    { tournament_id: "t1", status: "postponed" },
+    { tournament_id: "t2", status: "in_progress" }, // unrelated, still valid
+  ];
+  const courtDevices = [
+    { tournament_id: "t1", court_id: "c1", status: "revoked" }, // leftover from before removal
+    { tournament_id: "t2", court_id: "c2", status: "revoked" }, // unrelated, still valid
+  ];
+  const items = computeAttentionItems({ tournaments: tournamentsWithOneRemoved, matches, courtDevices });
+  assert.deepEqual(items, [
+    { tournamentId: "t2", tournamentName: "Summer Slam", live: 1, held: 0, courtsNeedRepairing: 1 },
+  ]);
+});
+
+test("computeAttentionItems: 'cancelled' status is treated the same as 'archived'", () => {
+  const items = computeAttentionItems({
+    tournaments: [{ id: "t1", name: "Riverside Open", status: "cancelled" }],
+    matches: [{ tournament_id: "t1", status: "in_progress" }],
+    courtDevices: [],
+  });
+  assert.deepEqual(items, []);
+});
+
+test("computeAttentionItems: simulates delete-while-dashboard-is-open — a fresh reload after removal drops the stale item without a page reload", () => {
+  const tournaments = [{ id: "t1", name: "Riverside Open", status: "in_progress" }];
+  const beforeRemoval = computeAttentionItems({
+    tournaments,
+    matches: [{ tournament_id: "t1", status: "in_progress" }],
+    courtDevices: [],
+  });
+  assert.deepEqual(beforeRemoval, [
+    { tournamentId: "t1", tournamentName: "Riverside Open", live: 1, held: 0, courtsNeedRepairing: 0 },
+  ]);
+
+  // Mirrors App.jsx's archiveSelectedTournaments -> reloadList(): the command
+  // resolves, then the dashboard replaces its state with a fresh fetch — the
+  // tournament row now has the new status, matches are re-fetched as-is.
+  const tournamentsAfterRemoval = [{ id: "t1", name: "Riverside Open", status: "archived" }];
+  const afterRemovalAndReload = computeAttentionItems({
+    tournaments: tournamentsAfterRemoval,
+    matches: [{ tournament_id: "t1", status: "in_progress" }],
+    courtDevices: [],
+  });
+  assert.deepEqual(afterRemovalAndReload, []);
+});
+
 test("computeAttentionItems: falls back to a generic name if the tournament isn't in the given list", () => {
   const items = computeAttentionItems({
     tournaments: [],
