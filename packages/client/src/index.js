@@ -14,6 +14,18 @@ export function createBrowserClient(url, publishableKey) {
   });
 }
 
+// For the public "Live" spectator page: a signed-out visitor never needs a
+// persisted/refreshed session, so this deliberately skips all of that
+// (persistSession/autoRefreshToken/detectSessionInUrl all false) rather than
+// reusing createBrowserClient — avoids any session-restore cost or flicker
+// for a page that's read-only and anon-role by design (see
+// supabase/migrations/0012_public_live_tournaments.sql).
+export function createSpectatorClient(url, publishableKey) {
+  return createClient(url, publishableKey, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  });
+}
+
 export async function sendCommand({ commandUrl, accessToken, publishableKey, type, payload, commandId }) {
   const command_id = commandId || crypto.randomUUID();
   const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();

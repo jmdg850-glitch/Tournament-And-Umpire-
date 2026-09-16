@@ -6,7 +6,7 @@
 // of resolvePersonByName/normalizePersonName, fully exercised below.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizePersonName, resolvePersonByName } from "./lib.js";
+import { normalizePersonName, resolvePersonByName, liveShareUrl } from "./lib.js";
 
 const persons = [
   { id: "p1", display_name: "Rem" },
@@ -75,4 +75,13 @@ test("normalizePersonName: trims and lowercases", () => {
   assert.equal(normalizePersonName("REM"), "rem");
   assert.equal(normalizePersonName(null), "");
   assert.equal(normalizePersonName(undefined), "");
+});
+
+test("liveShareUrl: builds the share link for a slug", () => {
+  assert.equal(liveShareUrl("https://tournament-operator.vercel.app", "summer-open-2026"), "https://tournament-operator.vercel.app/live/summer-open-2026");
+});
+
+test("liveShareUrl: builds the share link for a raw uuid", () => {
+  const id = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+  assert.equal(liveShareUrl("https://tournament-operator.vercel.app", id), `https://tournament-operator.vercel.app/live/${id}`);
 });

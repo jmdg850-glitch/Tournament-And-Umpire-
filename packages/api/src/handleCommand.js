@@ -23,6 +23,7 @@ import {
 } from "@tournament/engine";
 import { parseCommandEnvelope, isUuid } from "@tournament/contracts";
 import { applyBatch, createBatch, httpError, nowIso, uuid } from "./writes.js";
+import { ensureUniqueSlug } from "./slug.js";
 import {
   loadMember,
   requireOrganizer,
@@ -335,7 +336,8 @@ async function ensurePlayoffChildInBatch(admin, batch, parent, overlaySides) {
   return true;
 }
 
-async function reconcilePlayoffChildren(admin, divisionId) {
+async function reconcilePlayoffChildren(admin, divisionId, format) {
+  if (format !== "team_elimination") return;
   if (!divisionId) return;
   const { data: parents } = await admin
     .from("matches")
@@ -591,6 +593,17 @@ async function handleUpdateTournament(admin, actor, payload, envelope) {
     updated_at: nowIso(),
   };
   if (!next.name) throw httpError(400, "INVALID_COMMAND", "name is required");
+  // Public "Live" spectator page (see supabase/migrations/0012_public_live_tournaments.sql).
+  // A slug is generated once, the first time is_public flips on — never
+  // organizer-typed, and never regenerated/cleared afterward, so a
+  // previously shared/QR'd link keeps working even if the organizer toggles
+  // the page private and public again later.
+  if (payload.is_public != null) {
+    next.is_public = Boolean(payload.is_public);
+    if (next.is_public && !next.slug) {
+      next.slug = await ensureUniqueSlug(admin, tournament.id, next.name);
+    }
+  }
   const batch = createBatch();
   batch.upsert("tournaments", next);
   return commit(admin, batch, {
@@ -1773,7 +1786,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     detail,
   });
   if (!wasCompleted && state.status === "completed") {
-    await reconcilePlayoffChildren(admin, match.division_id);
+    await reconcilePlayoffChildren(admin, match.division_id, division.format);
   }
   return result;
 }
@@ -1781,11 +1794,11 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
 async function handleCompleteMatch(admin, actor, payload, envelope) {
   const match = await getMatch(admin, payload.match_id);
   await authorizeMatchOperation(admin, actor, match);
+  const division = await getDivision(admin, match.division_id);
   if (match.status === "completed") {
-    await reconcilePlayoffChildren(admin, match.division_id);
+    await reconcilePlayoffChildren(admin, match.division_id, division.format);
     return { match, already_complete: true };
   }
-  const division = await getDivision(admin, match.division_id);
   const { data: events } = await admin.from("score_events").select("*").eq("match_id", match.id).order("seq");
   const state = reduceScoreEvents(scoringSettings(division.config), events || []);
   if (state.status !== "completed") {
@@ -1800,7 +1813,7 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
     matchId: match.id,
     result: { match: fin.match, progressed: fin.progressed },
   });
-  await reconcilePlayoffChildren(admin, match.division_id);
+  await reconcilePlayoffChildren(admin, match.division_id, division.format);
   return result;
 }
 

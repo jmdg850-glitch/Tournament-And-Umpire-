@@ -3,5 +3,8 @@
   "framework": "vite",
   "installCommand": "npm install --ignore-scripts",
   "buildCommand": "npm run build -w @tournament/operator",
-  "outputDirectory": "apps/operator/dist"
+  "outputDirectory": "apps/operator/dist",
+  "rewrites": [
+    { "source": "/live/:slug", "destination": "/index.html" }
+  ]
 }

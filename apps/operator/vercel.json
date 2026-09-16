@@ -1,8 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "vite",
-  "installCommand": "cd ../.. && npm install --ignore-scripts",
-  "buildCommand": "cd ../.. && npm run build -w @tournament/operator",
-  "outputDirectory": "dist"
+  "installCommand": "npm install --prefix ../.. --ignore-scripts",
+  "buildCommand": "npm run build --prefix ../.. -w @tournament/operator",
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/live/:slug", "destination": "/index.html" }
+  ]
 }
 

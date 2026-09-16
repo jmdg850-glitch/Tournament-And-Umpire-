@@ -350,3 +350,10 @@ export function pairingQrText(payload) {
     g: payload?.g || "",
   });
 }
+
+// The public "Live" spectator page's shareable URL — see publicLive/route.js
+// (the /live/<slug-or-id> route it points to) and screens/SettingsPanel.jsx
+// (where this is surfaced to organizers as a copy-link/QR).
+export function liveShareUrl(origin, slugOrId) {
+  return `${origin}/live/${slugOrId}`;
+}

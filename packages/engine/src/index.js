@@ -106,6 +106,7 @@ export {
 } from "./optimisticScore.js";
 
 export {
+  isUuid,
   parseLiveHash,
   liveHash,
   parseBracketHash,

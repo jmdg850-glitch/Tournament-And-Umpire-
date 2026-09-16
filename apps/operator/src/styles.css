@@ -289,3 +289,86 @@ input, select, textarea { background: #fff; }
   font-variant-numeric: tabular-nums;
   color: #eef1f4;
 }
+
+/* Public "Live" spectator page (publicLive/LiveTournamentPage.jsx) —
+   mobile-first: most visitors open this on a phone from a QR code/share
+   link. Single column, sticky tab bar, large tap targets by default; a
+   wider multi-column layout only kicks in once there's room for it. Reuses
+   the light workspace tokens (--bg/--surface/--border) this app already
+   defines above, plus .scoreboard/.serve-status/.badge.live from
+   packages/ui, which are already "always dark stadium" and theme-
+   independent — no separate dark-mode branch needed here. */
+.spectator-page {
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--text);
+  padding-bottom: max(var(--space-6), env(safe-area-inset-bottom));
+}
+.spectator-header {
+  padding: max(var(--space-4), env(safe-area-inset-top)) var(--space-3) var(--space-3);
+  background: var(--navy);
+  color: var(--navy-text);
+}
+.spectator-header h1 {
+  font-size: clamp(1.5rem, 5vw, 2.2rem);
+  margin: 2px 0 10px;
+  overflow-wrap: anywhere;
+}
+.spectator-header .kicker { color: var(--navy-muted); }
+.spectator-header-meta { gap: 8px; }
+.spectator-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 8px var(--space-3);
+  overflow-x: auto;
+}
+.spectator-tabs .nav-tabs { flex-wrap: nowrap; }
+.spectator-tabs .nav-tabs button { flex-shrink: 0; }
+.spectator-body {
+  padding: var(--space-4) var(--space-3);
+  max-width: 960px;
+  margin: 0 auto;
+  display: grid;
+  gap: var(--space-4);
+}
+.spectator-live-grid {
+  display: grid;
+  gap: var(--space-4);
+  grid-template-columns: 1fr;
+}
+.spectator-court { font-size: 1rem; }
+.spectator-subline { font-size: 0.8rem; }
+.spectator-matchup { font-weight: 600; }
+.spectator-matchup.won { color: var(--tape); }
+.spectator-upnext-row, .spectator-result-row, .spectator-find-row { padding: 12px 14px; }
+
+@media (min-width: 720px) {
+  .spectator-header { padding: max(var(--space-5), env(safe-area-inset-top)) var(--space-5) var(--space-4); }
+  .spectator-tabs { padding: 10px var(--space-5); }
+  .spectator-body { padding: var(--space-5); max-width: 1100px; }
+  .spectator-live-grid { grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+}
+
+/* Short landscape phones (e.g. rotated 320-430px-wide devices): the header
+   plus sticky tab bar can otherwise eat most of a ~320-390px-tall viewport,
+   leaving almost no room to see the match itself. Shrink and clamp the
+   header to a couple of lines so real content is visible without scrolling
+   past it first. Matches apps/umpire/src/styles.css's landscape breakpoint. */
+@media (orientation: landscape) and (max-height: 520px) {
+  .spectator-header {
+    padding: max(var(--space-2), env(safe-area-inset-top)) var(--space-3);
+  }
+  .spectator-header h1 {
+    font-size: clamp(1.1rem, 4vh, 1.6rem);
+    margin: 0 0 4px;
+    display: -webkit-box;
+    -webkit-line-clamp: 1;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .spectator-header .kicker { font-size: 0.7rem; }
+  .spectator-tabs { padding: 6px var(--space-3); }
+}

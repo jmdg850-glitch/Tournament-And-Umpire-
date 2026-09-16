@@ -1045,7 +1045,7 @@ var DIVISION_FORMATS = Object.freeze([
 var TEAM_PROGRESSION_MODES = Object.freeze(["playoffs", "direct_semifinals"]);
 var SCORE_EVENT_TYPES = Object.freeze(["point", "undo", "timeout", "coin_toss"]);
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-function isUuid(value) {
+function isUuid2(value) {
   return typeof value === "string" && UUID_RE.test(value);
 }
 function parseCommandEnvelope(body) {
@@ -1056,7 +1056,7 @@ function parseCommandEnvelope(body) {
     throw err;
   }
   const { command_id, type, payload } = body;
-  if (!isUuid(command_id)) {
+  if (!isUuid2(command_id)) {
     const err = new Error("command_id must be a UUID");
     err.code = "INVALID_COMMAND";
     err.status = 400;
@@ -1115,6 +1115,28 @@ function nowIso() {
 }
 function uuid() {
   return crypto.randomUUID();
+}
+
+// packages/api/src/slug.js
+function generateTournamentSlug(name) {
+  const base = String(name || "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60).replace(/-+$/g, "");
+  return base || "tournament";
+}
+function candidateSlug(base, attempt) {
+  if (attempt <= 1) return base;
+  if (attempt <= 9) return `${base}-${attempt}`;
+  const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 5);
+  return `${base}-${suffix}`;
+}
+async function ensureUniqueSlug(admin, tournamentId, name) {
+  const base = generateTournamentSlug(name);
+  for (let attempt = 1; attempt <= 14; attempt++) {
+    const candidate = candidateSlug(base, attempt);
+    const { data, error } = await admin.from("tournaments").select("id").eq("slug", candidate).neq("id", tournamentId).maybeSingle();
+    if (error) throw error;
+    if (!data) return candidate;
+  }
+  throw httpError(500, "SLUG_GENERATION_FAILED", "Could not generate a unique tournament slug");
 }
 
 // packages/api/src/authz.js
@@ -1579,7 +1601,8 @@ async function ensurePlayoffChildInBatch(admin, batch, parent, overlaySides) {
   }
   return true;
 }
-async function reconcilePlayoffChildren(admin, divisionId) {
+async function reconcilePlayoffChildren(admin, divisionId, format) {
+  if (format !== "team_elimination") return;
   if (!divisionId) return;
   const { data: parents } = await admin.from("matches").select("*").eq("division_id", divisionId).is("parent_match_id", null);
   if (!parents?.length) return;
@@ -1811,6 +1834,12 @@ async function handleUpdateTournament(admin, actor, payload, envelope) {
     updated_at: nowIso()
   };
   if (!next.name) throw httpError(400, "INVALID_COMMAND", "name is required");
+  if (payload.is_public != null) {
+    next.is_public = Boolean(payload.is_public);
+    if (next.is_public && !next.slug) {
+      next.slug = await ensureUniqueSlug(admin, tournament.id, next.name);
+    }
+  }
   const batch = createBatch();
   batch.upsert("tournaments", next);
   return commit(admin, batch, {
@@ -1936,7 +1965,7 @@ async function handleAddPerson(admin, actor, payload, envelope) {
   });
 }
 async function handleUpdatePerson(admin, actor, payload, envelope) {
-  if (!isUuid(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
+  if (!isUuid2(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
   const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
   if (!person) throw httpError(404, "NOT_FOUND", "Person not found");
   const member = await loadMember(admin, person.tournament_id, actor.id);
@@ -1954,7 +1983,7 @@ async function handleUpdatePerson(admin, actor, payload, envelope) {
   });
 }
 async function handleRemovePerson(admin, actor, payload, envelope) {
-  if (!isUuid(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
+  if (!isUuid2(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
   const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
   if (!person) throw httpError(404, "NOT_FOUND", "Person not found");
   const member = await loadMember(admin, person.tournament_id, actor.id);
@@ -2000,7 +2029,7 @@ async function handleAddTeamMember(admin, actor, payload, envelope) {
   if (!team) throw httpError(404, "NOT_FOUND", "Team not found");
   const member = await loadMember(admin, team.tournament_id, actor.id);
   requireOrganizer(member);
-  if (!isUuid(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
+  if (!isUuid2(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
   const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
   if (!person || person.tournament_id !== team.tournament_id) {
     throw httpError(400, "INVALID_PLAYER", "Person is not in this tournament");
@@ -2043,7 +2072,7 @@ async function handleAddTeamMember(admin, actor, payload, envelope) {
   }
 }
 async function handleRemoveTeamMember(admin, actor, payload, envelope) {
-  if (!isUuid(payload.team_member_id)) throw httpError(400, "INVALID_COMMAND", "team_member_id must be a UUID");
+  if (!isUuid2(payload.team_member_id)) throw httpError(400, "INVALID_COMMAND", "team_member_id must be a UUID");
   const { data: row } = await admin.from("team_members").select("*").eq("id", payload.team_member_id).maybeSingle();
   if (!row) throw httpError(404, "NOT_FOUND", "Team member not found");
   const { data: team } = await admin.from("teams").select("*").eq("id", row.team_id).maybeSingle();
@@ -2071,7 +2100,7 @@ async function handleRegisterParticipant(admin, actor, payload, envelope) {
     throw httpError(409, "DUPLICATE_PLAYER_IN_PAIR", "The same player cannot be selected twice in one pair");
   }
   for (const personId of personIds) {
-    if (!isUuid(personId)) throw httpError(400, "INVALID_COMMAND", "person_ids must be UUIDs");
+    if (!isUuid2(personId)) throw httpError(400, "INVALID_COMMAND", "person_ids must be UUIDs");
     const { data: person } = await admin.from("persons").select("*").eq("id", personId).maybeSingle();
     if (!person || person.tournament_id !== division.tournament_id) {
       throw httpError(400, "INVALID_PLAYER", "Person is not in this tournament");
@@ -2131,7 +2160,7 @@ async function handleRegisterParticipant(admin, actor, payload, envelope) {
   });
 }
 async function handleRemoveParticipant(admin, actor, payload, envelope) {
-  if (!isUuid(payload.participant_id)) throw httpError(400, "INVALID_COMMAND", "participant_id must be a UUID");
+  if (!isUuid2(payload.participant_id)) throw httpError(400, "INVALID_COMMAND", "participant_id must be a UUID");
   const { data: participant } = await admin.from("participants").select("*").eq("id", payload.participant_id).maybeSingle();
   if (!participant) throw httpError(404, "NOT_FOUND", "Participant not found");
   const member = await loadMember(admin, participant.tournament_id, actor.id);
@@ -2171,7 +2200,7 @@ async function handleUpdateMatchParticipant(admin, actor, payload, envelope) {
     throw httpError(400, "INVALID_COMMAND", `This side needs exactly ${oldPersonIds.length} player(s)`);
   }
   for (const personId of personIds) {
-    if (!isUuid(personId)) throw httpError(400, "INVALID_COMMAND", "person_ids must be UUIDs");
+    if (!isUuid2(personId)) throw httpError(400, "INVALID_COMMAND", "person_ids must be UUIDs");
   }
   const { data: personsRows } = await admin.from("persons").select("id, display_name, tournament_id").in("id", [.../* @__PURE__ */ new Set([...personIds, ...oldPersonIds])]);
   const personById = new Map((personsRows || []).map((p) => [p.id, p]));
@@ -2307,7 +2336,7 @@ async function handleAddMember(admin, actor, payload, envelope) {
   }
   if (payload.user_id === actor.id && payload.role !== "organizer") {
   }
-  if (!isUuid(payload.user_id)) throw httpError(400, "INVALID_COMMAND", "user_id must be a UUID");
+  if (!isUuid2(payload.user_id)) throw httpError(400, "INVALID_COMMAND", "user_id must be a UUID");
   await requireProfile(admin, payload.user_id);
   const { data: existing } = await admin.from("tournament_members").select("*").eq("tournament_id", tournament.id).eq("user_id", payload.user_id).maybeSingle();
   const row = {
@@ -2670,7 +2699,7 @@ async function handleCoinToss(admin, actor, payload, envelope) {
   if (!["assigned", "in_progress", "ready"].includes(match.status)) {
     throw httpError(409, "ILLEGAL_TRANSITION", `Cannot coin toss from ${match.status}`);
   }
-  if (!isUuid(payload.event_id)) throw httpError(400, "INVALID_COMMAND", "event_id must be a UUID");
+  if (!isUuid2(payload.event_id)) throw httpError(400, "INVALID_COMMAND", "event_id must be a UUID");
   const { data: existing } = await admin.from("score_events").select("*").eq("id", payload.event_id).maybeSingle();
   if (existing) {
     return existingReceipt(admin, envelope.command_id).then((r) => r?.result || coinTossResult(match, { duplicate: true }));
@@ -2773,7 +2802,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
   } else if (match.status !== "in_progress") {
     throw httpError(409, "ILLEGAL_TRANSITION", "Match is not in progress");
   }
-  if (!isUuid(payload.event_id)) throw httpError(400, "INVALID_COMMAND", "event_id must be a UUID");
+  if (!isUuid2(payload.event_id)) throw httpError(400, "INVALID_COMMAND", "event_id must be a UUID");
   if (typeof payload.seq !== "number") throw httpError(400, "INVALID_COMMAND", "seq is required");
   const { data: dup } = await admin.from("score_events").select("id").eq("id", payload.event_id).maybeSingle();
   const cached = match.score_state && typeof match.score_state.lastSeq === "number" ? match.score_state : null;
@@ -2858,18 +2887,18 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     detail
   });
   if (!wasCompleted && state.status === "completed") {
-    await reconcilePlayoffChildren(admin, match.division_id);
+    await reconcilePlayoffChildren(admin, match.division_id, division.format);
   }
   return result;
 }
 async function handleCompleteMatch(admin, actor, payload, envelope) {
   const match = await getMatch(admin, payload.match_id);
   await authorizeMatchOperation(admin, actor, match);
+  const division = await getDivision(admin, match.division_id);
   if (match.status === "completed") {
-    await reconcilePlayoffChildren(admin, match.division_id);
+    await reconcilePlayoffChildren(admin, match.division_id, division.format);
     return { match, already_complete: true };
   }
-  const division = await getDivision(admin, match.division_id);
   const { data: events } = await admin.from("score_events").select("*").eq("match_id", match.id).order("seq");
   const state = reduceScoreEvents(scoringSettings(division.config), events || []);
   if (state.status !== "completed") {
@@ -2884,7 +2913,7 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
     matchId: match.id,
     result: { match: fin.match, progressed: fin.progressed }
   });
-  await reconcilePlayoffChildren(admin, match.division_id);
+  await reconcilePlayoffChildren(admin, match.division_id, division.format);
   return result;
 }
 async function handleOpenCourtPairing(admin, actor, payload, envelope) {

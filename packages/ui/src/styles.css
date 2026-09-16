@@ -433,7 +433,9 @@ body:has(.update-banner) .toast-stack {
   gap: 6px;
   margin: 16px 0 20px;
 }
-.nav-tabs button[data-active="true"] {
+.nav-tabs button[data-active="true"],
+.nav-tabs button[data-active="true"]:hover:not(:disabled),
+.nav-tabs button[data-active="true"]:focus-visible {
   background: var(--court);
   color: #fff;
   border-color: var(--court);
