@@ -1,7 +1,8 @@
 // Publishes the built Windows desktop update (installer + .blockmap + latest.yml)
-// to a GitHub Release in the dedicated releases-only repo. This repo hosts no
-// application source code — see apps/operator/electron/updatePolicy.cjs for
-// the owner/repo the running app itself checks.
+// to a GitHub Release on the owner/repo configured in apps/operator/package.json
+// (build.publish). That repository also contains the application source — it is
+// not a separate releases-only repo. See apps/operator/electron/updatePolicy.cjs
+// for the owner/repo the running app itself checks.
 //
 // Auth: uses the `gh` CLI's own credential store (gh auth login), or the
 // GH_TOKEN / GITHUB_TOKEN environment variable if set — gh picks either up

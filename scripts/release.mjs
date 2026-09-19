@@ -2,20 +2,46 @@
 // and Tournament Umpire (Android). Invoke via `npm run release` (patch bump)
 // or `npm run release -- minor` / `npm run release -- major`.
 //
-// Order: verify tree -> tests -> version bump -> Windows build -> Android
-// build -> verify both -> commit -> push -> publish GitHub release -> report.
-// Any failing step stops the pipeline before anything is committed/pushed/
-// published — see fail() below. Nothing here bypasses the existing build,
-// test, or publish tooling; it orchestrates the same npm scripts a human
-// would run by hand (see apps/operator/package.json, apps/umpire/package.json,
-// scripts/publish-desktop-update.mjs).
+//   npm run release -- --preflight-only        run every preflight check, change nothing
+//   npm run release -- --allow=<path-or-dir/>  explicitly allow one more dirty path
+//                                              (or directory prefix ending in "/") to be
+//                                              committed with this release; repeatable
+//
+// Order: PREFLIGHT (nothing is modified until every check passes) -> version
+// bump -> Windows build -> Android build -> verify both -> commit (explicit
+// allowlist only) -> push -> publish GitHub release -> verify the release.
+// Any failing step stops the pipeline and reports which stage failed and what
+// state the repo is in — see fail() below. The Android APK is built and
+// verified locally only; nothing here uploads it anywhere.
+//
+// Nothing here bypasses the existing build, test, or publish tooling; it
+// orchestrates the same npm scripts a human would run by hand (see
+// apps/operator/package.json, apps/umpire/package.json,
+// scripts/publish-desktop-update.mjs). It never force-pushes and never
+// overwrites an existing tag or release.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import {
+  run,
+  runCapture,
+  tryCapture,
+  findJavaHome,
+  findAndroidSdk,
+  findLatestBuildTools,
+  verifyWindowsInstaller,
+  verifyAndroidApk,
+} from "./lib/buildVerify.mjs";
+import { assertRepoRoot } from "./lib/repoGuard.mjs";
+import { checkDependencies } from "./check-dependencies.mjs";
 
-const root = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
+let root;
+try {
+  root = assertRepoRoot();
+} catch (err) {
+  console.error(err.message);
+  process.exit(1);
+}
 const operatorDir = resolve(root, "apps/operator");
 const umpireDir = resolve(root, "apps/umpire");
 const androidDir = resolve(umpireDir, "android");
@@ -25,27 +51,202 @@ const androidDir = resolve(umpireDir, "android");
 const lockPath = resolve(root, "node_modules/.release.lock");
 const commitMsgPath = resolve(root, "node_modules/.release-commit-msg.txt");
 
+// ---------------------------------------------------------------------------
+// Arguments
+// ---------------------------------------------------------------------------
 const BUMP_TYPES = ["patch", "minor", "major"];
-const bumpType = (process.argv[2] || "patch").toLowerCase();
+const positional = [];
+const flags = { preflightOnly: false, allow: [] };
+for (const arg of process.argv.slice(2)) {
+  if (arg === "--preflight-only") flags.preflightOnly = true;
+  else if (arg.startsWith("--allow=")) flags.allow.push(arg.slice("--allow=".length));
+  else if (arg.startsWith("--")) {
+    console.error(`Unknown option "${arg}". Supported: --preflight-only, --allow=<path>.`);
+    process.exit(1);
+  } else positional.push(arg);
+}
+if (positional.length > 1) {
+  console.error(`Expected at most one bump type, got: ${positional.join(" ")}`);
+  process.exit(1);
+}
+const bumpType = (positional[0] || "patch").toLowerCase();
 if (!BUMP_TYPES.includes(bumpType)) {
   console.error(`Unknown bump type "${bumpType}". Use one of: ${BUMP_TYPES.join(", ")}.`);
   process.exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// What a release is allowed to touch
+// ---------------------------------------------------------------------------
+// Files this script rewrites itself (the version bump). They must be clean
+// before the release starts so the bump can never be mixed with unrelated edits.
+const VERSION_FILES = [
+  "apps/operator/package.json",
+  "apps/umpire/package.json",
+  "apps/umpire/android/app/build.gradle",
+];
+// Release-tooling files that may be dirty when a release starts and are then
+// committed with it: the release script itself and the files it imports/invokes.
+// Anything else that is dirty (build-all, clean-build, reset-dependencies,
+// docs, root package.json, app source ...) makes the release refuse to run
+// unless it is committed separately first or passed explicitly via --allow=.
+const RELEASE_TOOLING_FILES = [
+  "scripts/release.mjs",
+  "scripts/publish-desktop-update.mjs",
+  "scripts/check-dependencies.mjs",
+  "scripts/lib/buildVerify.mjs",
+  "scripts/lib/repoGuard.mjs",
+];
+const SUSPICIOUS_PATTERNS = [
+  /(^|[\\/])\.env(\.[^\\/]*)?$/i,
+  /\.(pem|p12|jks|keystore)$/i,
+  /(^|[\\/])keystore\.properties$/i,
+  /credentials?/i,
+  /secret/i,
+  /\.git-credentials$/i,
+  /id_rsa/i,
+];
+const isSuspicious = (path) => !/\.env\.example$/i.test(path) && SUSPICIOUS_PATTERNS.some((re) => re.test(path));
+
+const allowedFiles = new Set(RELEASE_TOOLING_FILES);
+const allowedDirs = [];
+for (const raw of flags.allow) {
+  const p = String(raw).replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!/^[A-Za-z0-9._\-/]+$/.test(p) || p.startsWith("/") || p.split("/").includes("..") || p === "." || p === "") {
+    console.error(`Invalid --allow value "${raw}": use a repo-relative file path, or a directory path ending in "/" (letters, digits, . _ - / only).`);
+    process.exit(1);
+  }
+  if (VERSION_FILES.includes(p)) {
+    console.error(`--allow=${p}: version files are rewritten by the release itself and must be clean beforehand; they cannot be allowed as pre-existing changes.`);
+    process.exit(1);
+  }
+  if (isSuspicious(p)) {
+    console.error(`--allow=${p}: refusing — this path looks sensitive (env/key/credential material).`);
+    process.exit(1);
+  }
+  if (p.endsWith("/")) allowedDirs.push(p);
+  else allowedFiles.add(p);
+}
+const isAllowedPath = (p) => allowedFiles.has(p) || allowedDirs.some((d) => p.startsWith(d));
+
+// ---------------------------------------------------------------------------
+// State tracking + failure handling
+// ---------------------------------------------------------------------------
 const startedAt = Date.now();
-const report = { bumpType, steps: [] };
+let stage = "preflight";
+const state = {
+  baseSha: null,
+  versionsBumped: false,
+  releaseDirCleanupStarted: false,
+  buildsStarted: false,
+  committed: false,
+  commitHash: null,
+  pushed: false,
+  ghReleaseStarted: false,
+  tag: null,
+  releaseSlug: null,
+};
+// Files the bump wrote, kept so a failure BEFORE the commit can put them back.
+const bumpedFiles = [];
+let lockOwned = false;
+let failing = false;
 
 function logStep(name) {
   console.log(`\n--- ${name} ---`);
-  report.steps.push(name);
+}
+
+function releaseUnlock() {
+  if (!lockOwned) return; // never remove a lock that another running release holds
+  try { unlinkSync(lockPath); } catch { /* already gone */ }
+  lockOwned = false;
+}
+
+function acquireLock() {
+  if (existsSync(lockPath)) {
+    const pid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+    let alive = false;
+    if (Number.isInteger(pid) && pid > 0) {
+      try { process.kill(pid, 0); alive = true; } catch (err) { alive = err.code === "EPERM"; }
+    }
+    if (alive) {
+      console.error("Release already in progress.");
+      console.error(`Lock held by running pid ${pid} (${lockPath}).`);
+      console.error("If that process is not actually a release (recycled pid), delete the lock file and retry.");
+      process.exit(1);
+    }
+    console.log(`Removing stale release lock (pid ${Number.isInteger(pid) ? pid : "unknown"} is not running).`);
+    unlinkSync(lockPath);
+  }
+  writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+  lockOwned = true;
+}
+
+// Put the three version files back exactly as they were, but only if they still
+// contain exactly what the bump wrote (never clobber anything else). Only ever
+// used while nothing has been committed. Returns human-readable result lines.
+function restoreVersionFiles() {
+  const lines = [];
+  for (const f of bumpedFiles) {
+    try {
+      const current = readFileSync(f.path, "utf8");
+      if (current === f.original) lines.push(`  ${f.rel}: unchanged`);
+      else if (current === f.written) {
+        writeFileSync(f.path, f.original);
+        lines.push(`  ${f.rel}: restored to its pre-release contents`);
+      } else lines.push(`  ${f.rel}: LEFT AS-IS (contents differ from what the bump wrote — restore it manually)`);
+    } catch (err) {
+      lines.push(`  ${f.rel}: could not be restored (${err.message})`);
+    }
+  }
+  return lines;
+}
+
+function describeState() {
+  const lines = [];
+  if (!state.versionsBumped) {
+    lines.push("Version files: NOT modified.");
+  } else if (!state.committed) {
+    lines.push("Version files were bumped and NOT committed. Automatic restore:");
+    lines.push(...restoreVersionFiles());
+  } else {
+    lines.push(`Version files were bumped and committed (${state.commitHash}).`);
+  }
+  if (state.releaseDirCleanupStarted) {
+    lines.push("apps/operator/release/ WAS cleaned by the Windows build step; its contents may be missing or from a failed build.");
+  } else {
+    lines.push("apps/operator/release/: untouched.");
+  }
+  lines.push(state.committed ? `Commit: ${state.commitHash} exists locally.` : "Commit: none created.");
+  lines.push(state.pushed ? "Push: origin/main was updated." : "Push: nothing pushed.");
+  if (state.ghReleaseStarted) {
+    lines.push(`GitHub release ${state.tag} on ${state.releaseSlug}: state UNCONFIRMED — a draft or published release may exist. Check: gh release view ${state.tag} --repo ${state.releaseSlug}`);
+  } else {
+    lines.push("GitHub release: none created.");
+  }
+  if (state.committed && !state.pushed) {
+    lines.push("Recovery: inspect the commit (git show --stat HEAD), then either `git push origin main` (never force-push) or undo it with `git reset --soft HEAD~1`.");
+  } else if (state.pushed) {
+    lines.push(`Recovery: the source commit is already on origin/main. Do NOT re-run \`npm run release\` (it would bump again). Fix the cause, then publish only the Windows update with: npm run publish:desktop -w @tournament/operator`);
+  } else if (state.versionsBumped || state.releaseDirCleanupStarted) {
+    lines.push("Recovery: fix the cause and re-run the release; run `npm run release -- --preflight-only` first to re-check.");
+  } else {
+    lines.push("Recovery: fix the reported problem and re-run.");
+  }
+  return lines;
 }
 
 function fail(step, reason) {
+  if (failing) process.exit(1);
+  failing = true;
+  const details = describeState();
   releaseUnlock();
   console.log(`
 ========================================
 RELEASE FAILED
 ==============
+
+Stage:
+${stage}
 
 Step:
 ${step}
@@ -53,64 +254,25 @@ ${step}
 Reason:
 ${reason}
 
-NO release published.
+State:
+${details.map((l) => (l.startsWith("  ") ? l : `- ${l}`)).join("\n")}
+
+${state.ghReleaseStarted ? "GitHub release NOT confirmed — verify manually before assuming anything was published." : "NO release published."}
 ========================================`);
   process.exit(1);
 }
 
-function releaseLock() {
-  if (existsSync(lockPath)) {
-    const pid = readFileSync(lockPath, "utf8").trim();
-    console.error("Release already in progress.");
-    console.error(`Lock held by pid ${pid || "unknown"} (${lockPath}).`);
-    console.error("If a previous run crashed without cleaning up, delete that file and retry.");
-    process.exit(1);
-  }
-  writeFileSync(lockPath, String(process.pid));
-}
-function releaseUnlock() {
-  try { unlinkSync(lockPath); } catch { /* already gone */ }
-}
 process.on("exit", releaseUnlock);
-process.on("SIGINT", () => { releaseUnlock(); process.exit(130); });
+process.on("SIGINT", () => fail("Interrupted", "Received SIGINT (Ctrl+C)."));
+process.on("SIGTERM", () => fail("Interrupted", "Received SIGTERM."));
+process.on("uncaughtException", (err) => fail("Unexpected error", err?.stack || String(err)));
+process.on("unhandledRejection", (err) => fail("Unexpected error", err?.stack || String(err)));
 
-// On Windows, spawnSync/execFileSync with shell:true hands the whole command
-// line to cmd.exe as a raw string — cmd.exe tokenizes on whitespace before
-// anything else, and (unlike a shell:false spawn, which goes through
-// CreateProcess's own argv escaping) Node does NOT quote `cmd` or any `args`
-// element for you. An absolute path containing a space (this repo's own
-// directory, "TOURNAMENT FINAL", included) therefore gets split apart and
-// treated as two separate words — confirmed here twice, once as the `cmd`
-// itself (gradlew.bat) and once as an argument (a script path passed to
-// `node`). Quoting is safe to apply unconditionally to anything containing a
-// space; things that never contain one (bare command names, flags like -w)
-// are returned unchanged.
-function quoteForWindowsShell(value) {
-  if (process.platform !== "win32") return value;
-  if (!/\s/.test(value)) return value;
-  if (/^".*"$/.test(value)) return value;
-  return `"${value}"`;
-}
-
-function run(cmd, args, opts = {}) {
-  // shell:true on Windows is required for `npm` (it's npm.cmd, not an .exe) —
-  // applied uniformly here so every call behaves the same way. Every arg is
-  // quoted too (see quoteForWindowsShell) since the same cmd.exe tokenizing
-  // hazard applies to arguments, not just the command itself.
-  const res = spawnSync(quoteForWindowsShell(cmd), (args || []).map(quoteForWindowsShell), { stdio: "inherit", shell: process.platform === "win32", ...opts });
-  if (res.error) throw res.error;
-  return res.status ?? 1;
-}
-function runCapture(cmd, args, opts = {}) {
-  return execFileSync(cmd, args, { encoding: "utf8", ...opts });
-}
-function tryCapture(cmd, args, opts = {}) {
-  try {
-    return { ok: true, output: runCapture(cmd, args, opts) };
-  } catch (err) {
-    return { ok: false, error: err };
-  }
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+const git = (args, opts = {}) => runCapture("git", args, { cwd: root, ...opts });
+const errText = (res) => String(res.error?.stderr || res.error?.stdout || res.error?.message || "").trim();
 
 function bumpVersion(version, type) {
   const parts = String(version).split(".").map((n) => Number.parseInt(n, 10));
@@ -119,262 +281,484 @@ function bumpVersion(version, type) {
   if (type === "minor") return `${major}.${minor + 1}.0`;
   return `${major}.${minor}.${patch + 1}`;
 }
-
 function readPackageVersion(pkgPath) {
   const raw = readFileSync(pkgPath, "utf8");
   const match = raw.match(/"version":\s*"([^"]+)"/);
   if (!match) throw new Error(`Could not find a "version" field in ${pkgPath}`);
   return match[1];
 }
-function writePackageVersion(pkgPath, nextVersion) {
-  const raw = readFileSync(pkgPath, "utf8");
-  const next = raw.replace(/"version":\s*"[^"]+"/, `"version": "${nextVersion}"`);
-  writeFileSync(pkgPath, next);
+
+// `git status --porcelain=v1 -z`: NUL-separated, never quoted, untracked
+// directories expanded to individual files. A rename/copy entry is followed by
+// an extra NUL field holding the original path.
+function readWorkingTree() {
+  const raw = git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const parts = raw.split("\0").filter(Boolean);
+  const entries = [];
+  for (let i = 0; i < parts.length; i++) {
+    const code = parts[i].slice(0, 2);
+    const path = parts[i].slice(3);
+    let renamedFrom = null;
+    if (/[RC]/.test(code)) renamedFrom = parts[++i] ?? null;
+    entries.push({ code, path, renamedFrom });
+  }
+  return entries;
 }
 
-// --- 0. Release lock ---
-releaseLock();
+function parseGitHubRemote(url) {
+  const m = String(url).match(/github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
+  return m ? { owner: m[1], repo: m[2] } : null;
+}
 
-// --- 1/2. Verify working tree + inspect changes ---
-logStep("Verify working tree");
-const statusRaw = runCapture("git", ["status", "--porcelain"], { cwd: root });
-const changedLines = statusRaw.split(/\r?\n/).filter(Boolean);
-if (changedLines.length === 0) {
+// Verify only — this script no longer switches the machine's active gh account.
+function ghActiveLogin() {
+  const res = tryCapture("gh", ["api", "user", "--jq", ".login"]);
+  if (!res.ok) throw new Error(`gh is not authenticated (${errText(res) || "gh api user failed"}). Run: gh auth login`);
+  return res.output.trim();
+}
+function assertGhAccountMatches(owner) {
+  const login = ghActiveLogin();
+  if (login.toLowerCase() !== String(owner).toLowerCase()) {
+    throw new Error(`Active gh account is "${login}" but the repository owner is "${owner}". Run: gh auth switch --user ${owner} --hostname github.com (this script does not switch accounts for you).`);
+  }
+  return login;
+}
+
+// Throws if the tag/release exists anywhere we can see, OR if existence could
+// not be determined (a network failure must never read as "does not exist").
+function assertReleaseTargetFree(tag, originSlug, releaseSlug) {
+  const local = git(["tag", "--list", tag]).trim();
+  if (local) throw new Error(`Local git tag ${tag} already exists.`);
+
+  const originTags = tryCapture("git", ["ls-remote", "--tags", "origin", `refs/tags/${tag}`], { cwd: root });
+  if (!originTags.ok) throw new Error(`Could not query origin tags: ${errText(originTags)}`);
+  if (originTags.output.trim()) throw new Error(`Tag ${tag} already exists on origin.`);
+
+  const refs = tryCapture("gh", ["api", `repos/${releaseSlug}/git/matching-refs/tags/${tag}`, "--jq", `[.[] | select(.ref == "refs/tags/${tag}")] | length`]);
+  if (!refs.ok) throw new Error(`Could not query tags on ${releaseSlug}: ${errText(refs)}`);
+  if (refs.output.trim() !== "0") throw new Error(`Tag ${tag} already exists on ${releaseSlug}.`);
+
+  // stderr is captured (not inherited): "release not found" is the expected answer here.
+  const view = tryCapture("gh", ["release", "view", tag, "--repo", releaseSlug, "--json", "tagName,isDraft"], { stdio: ["ignore", "pipe", "pipe"] });
+  if (view.ok) throw new Error(`A GitHub release for ${tag} already exists on ${releaseSlug} (${view.output.trim()}).`);
+  if (!/release not found/i.test(errText(view))) {
+    throw new Error(`Could not determine whether release ${tag} exists on ${releaseSlug}: ${errText(view)}`);
+  }
+  return `${tag} not found locally, on origin, or as a release on ${releaseSlug}`;
+}
+
+function parseProperties(text) {
+  const props = {};
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#") || t.startsWith("!")) continue;
+    const i = t.indexOf("=");
+    if (i > 0) props[t.slice(0, i).trim()] = t.slice(i + 1).trim();
+  }
+  return props;
+}
+
+const sha256OfFile = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+
+// ---------------------------------------------------------------------------
+// 0. Lock
+// ---------------------------------------------------------------------------
+acquireLock();
+
+// ---------------------------------------------------------------------------
+// 1. PREFLIGHT — read-only. Nothing below this block modifies a version file,
+//    deletes apps/operator/release/, builds, commits, pushes, or publishes
+//    until every check has passed.
+// ---------------------------------------------------------------------------
+const ctx = {};
+function check(name, fn) {
+  try {
+    const detail = fn();
+    console.log(`  PASS  ${name}${detail ? ` — ${detail}` : ""}`);
+  } catch (err) {
+    fail(`Preflight: ${name}`, err.message);
+  }
+}
+
+logStep("Preflight (read-only)");
+
+// Working-tree gate first: cheapest check, and the one most likely to fail.
+const initialEntries = readWorkingTree();
+if (initialEntries.length === 0) {
   releaseUnlock();
-  console.log("No source changes detected — release skipped.");
+  console.log("No changes in the working tree — release skipped. (Commit the source changes to ship first if they are not committed yet, or pass them via --allow=.)");
   process.exit(0);
 }
-console.log(`${changedLines.length} changed path(s):`);
-for (const line of changedLines) console.log(`  ${line}`);
 
-const SUSPICIOUS_PATTERNS = [
-  /(^|[\\/])\.env(\.[^\\/]*)?$/i,
-  /\.(pem|p12|jks|keystore)$/i,
-  /credentials?/i,
-  /secret/i,
-  /\.git-credentials$/i,
-  /id_rsa/i,
-];
-const suspicious = changedLines.filter((line) => {
-  const path = line.slice(3).trim();
-  if (/\.env\.example$/i.test(path)) return false;
-  return SUSPICIOUS_PATTERNS.some((re) => re.test(path));
+check("Git branch is main", () => {
+  const branch = git(["branch", "--show-current"]).trim();
+  if (branch !== "main") throw new Error(`On branch "${branch || "(detached HEAD)"}", but this release pushes to origin main. Switch to main first.`);
+  state.baseSha = git(["rev-parse", "HEAD"]).trim();
+  return `HEAD ${state.baseSha.slice(0, 7)}`;
 });
-if (suspicious.length) {
-  fail(
-    "Verify working tree",
-    `Suspicious/sensitive-looking path(s) in the working tree — refusing to auto-commit:\n${suspicious.join("\n")}\nReview these manually, then rerun.`
-  );
+
+check("No merge/rebase/cherry-pick in progress", () => {
+  const gitDir = resolve(root, ".git");
+  const busy = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"].filter((n) => existsSync(resolve(gitDir, n)));
+  if (busy.length) throw new Error(`Git operation in progress (${busy.join(", ")}). Finish or abort it first.`);
+});
+
+check("Nothing is pre-staged", () => {
+  const staged = git(["diff", "--cached", "--name-only", "-z"]).split("\0").filter(Boolean);
+  if (staged.length) throw new Error(`Index already contains staged changes:\n${staged.map((p) => `  ${p}`).join("\n")}\nUnstage them (git restore --staged <path>) so the release commit contains only what it stages itself.`);
+});
+
+check("Working tree contains only changes allowed for this release", () => {
+  console.log(`         ${initialEntries.length} changed path(s):`);
+  for (const e of initialEntries) console.log(`           ${e.code} ${e.path}${e.renamedFrom ? ` (from ${e.renamedFrom})` : ""}`);
+  const sensitive = initialEntries.filter((e) => isSuspicious(e.path));
+  if (sensitive.length) throw new Error(`Sensitive-looking path(s) — refusing to commit:\n${sensitive.map((e) => `  ${e.path}`).join("\n")}`);
+  const versionDirty = initialEntries.filter((e) => VERSION_FILES.includes(e.path));
+  if (versionDirty.length) throw new Error(`Version file(s) already modified:\n${versionDirty.map((e) => `  ${e.path}`).join("\n")}\nThe release rewrites these itself; commit or discard those edits first.`);
+  const unexpected = initialEntries.filter((e) => e.renamedFrom || !isAllowedPath(e.path));
+  if (unexpected.length) {
+    throw new Error(
+      `Unexpected change(s) that this release is not allowed to commit:\n${unexpected.map((e) => `  ${e.code} ${e.path}`).join("\n")}\n` +
+        "Commit or stash them separately first, or — if they really belong in this release — pass each one explicitly with --allow=<path> (or --allow=<dir/>).\n" +
+        `Allowed by default: ${RELEASE_TOOLING_FILES.join(", ")}`
+    );
+  }
+  return "all changes are on the allowlist";
+});
+
+check("Version files are consistent", () => {
+  const operatorPkgPath = resolve(operatorDir, "package.json");
+  const umpirePkgPath = resolve(umpireDir, "package.json");
+  const gradlePath = resolve(androidDir, "app/build.gradle");
+  ctx.currentOperator = readPackageVersion(operatorPkgPath);
+  ctx.currentUmpire = readPackageVersion(umpirePkgPath);
+  const gradleRaw = readFileSync(gradlePath, "utf8");
+  const code = gradleRaw.match(/versionCode\s+(\d+)/);
+  const name = gradleRaw.match(/versionName\s+"([^"]+)"/);
+  if (!code) throw new Error(`Could not find versionCode in ${gradlePath}`);
+  if (!name) throw new Error(`Could not find versionName in ${gradlePath}`);
+  if (name[1] !== ctx.currentUmpire) throw new Error(`Android versionName (${name[1]}) != Umpire package.json (${ctx.currentUmpire}) — fix before releasing.`);
+  ctx.currentVersionCode = Number.parseInt(code[1], 10);
+  ctx.nextOperator = bumpVersion(ctx.currentOperator, bumpType);
+  ctx.nextUmpire = bumpVersion(ctx.currentUmpire, bumpType);
+  ctx.nextVersionCode = ctx.currentVersionCode + 1;
+  state.tag = `v${ctx.nextOperator}`;
+  return `Operator ${ctx.currentOperator} -> ${ctx.nextOperator}, Umpire ${ctx.currentUmpire} -> ${ctx.nextUmpire}, versionCode ${ctx.currentVersionCode} -> ${ctx.nextVersionCode}`;
+});
+
+check("Dependency health", () => {
+  const health = checkDependencies();
+  if (!health.ok) throw new Error(`node_modules is not healthy:\n${health.problems.map((p) => `  - ${p}`).join("\n")}\nThis release never installs or resets dependencies. See docs/BUILD_WORKFLOW.md.`);
+  return "node_modules healthy";
+});
+
+check("Node, npm, git and gh are available", () => {
+  const need = Number.parseInt(String(JSON.parse(readFileSync(resolve(root, "package.json"), "utf8")).engines?.node || "").match(/(\d+)/)?.[1] || "0", 10);
+  const have = Number.parseInt(process.versions.node, 10);
+  if (have < need) throw new Error(`Node ${process.versions.node} is older than the required >=${need}.`);
+  const npm = process.platform === "win32" ? tryCapture("cmd.exe", ["/d", "/c", "npm --version"]) : tryCapture("npm", ["--version"]);
+  if (!npm.ok) throw new Error("npm is not available on PATH.");
+  if (!tryCapture("git", ["--version"]).ok) throw new Error("git is not available on PATH.");
+  if (!tryCapture("gh", ["--version"]).ok) throw new Error("GitHub CLI (gh) is not installed or not on PATH.");
+  return `node ${process.versions.node}, npm ${npm.output.trim()}`;
+});
+
+check("Local build tooling is installed", () => {
+  const pkgs = ["electron-builder", "electron", "cross-env", "vite", "vitest", "@capacitor/cli", "@capacitor/android"];
+  const missing = pkgs.filter((p) => !existsSync(resolve(root, "node_modules", p, "package.json")));
+  if (missing.length) throw new Error(`Missing from node_modules: ${missing.join(", ")}`);
+  const gradleFiles = ["gradlew.bat", "gradle/wrapper/gradle-wrapper.jar"].filter((f) => !existsSync(resolve(androidDir, f)));
+  if (gradleFiles.length) throw new Error(`Gradle wrapper files missing under apps/umpire/android: ${gradleFiles.join(", ")}`);
+  return `${pkgs.length} packages + Gradle wrapper present`;
+});
+
+check("JDK is available", () => {
+  ctx.javaHome = findJavaHome();
+  if (!ctx.javaHome) throw new Error("Could not find a JDK. Set JAVA_HOME, or install Android Studio (its bundled JBR is auto-detected).");
+  const java = tryCapture(resolve(ctx.javaHome, "bin/java.exe"), ["-version"], { stdio: ["ignore", "pipe", "pipe"] });
+  if (!java.ok) throw new Error(`java.exe under ${ctx.javaHome} did not run.`);
+  return ctx.javaHome;
+});
+
+check("Android SDK and build-tools are available", () => {
+  ctx.androidSdk = findAndroidSdk(androidDir);
+  if (!ctx.androidSdk) throw new Error("Could not find the Android SDK. Set ANDROID_HOME/ANDROID_SDK_ROOT, or fix apps/umpire/android/local.properties.");
+  const tools = findLatestBuildTools(ctx.androidSdk);
+  if (!tools) throw new Error(`No build-tools with aapt.exe under ${ctx.androidSdk}\\build-tools`);
+  if (!existsSync(resolve(tools, "apksigner.bat"))) throw new Error(`apksigner.bat missing from ${tools}`);
+  return `${ctx.androidSdk} (build-tools ${tools.split(/[\\/]/).pop()})`;
+});
+
+check("Android release signing configuration is present", () => {
+  const ksPath = resolve(androidDir, "keystore.properties");
+  if (!existsSync(ksPath)) throw new Error("apps/umpire/android/keystore.properties is missing — Gradle would produce an UNSIGNED release APK.");
+  const props = parseProperties(readFileSync(ksPath, "utf8"));
+  const missing = ["storeFile", "storePassword", "keyAlias", "keyPassword"].filter((k) => !props[k]);
+  if (missing.length) throw new Error(`keystore.properties is missing or has empty value(s) for: ${missing.join(", ")} (values are never printed).`);
+  const storePath = resolve(androidDir, props.storeFile.replace(/\\\\/g, "\\"));
+  if (!existsSync(storePath)) throw new Error(`The keystore file that keystore.properties points to does not exist (${props.storeFile}).`);
+  const gradle = readFileSync(resolve(androidDir, "app/build.gradle"), "utf8");
+  if (!/signingConfig\s+signingConfigs\.release/.test(gradle)) throw new Error("app/build.gradle does not apply signingConfigs.release to the release build type.");
+  return "keystore.properties has all 4 keys, keystore file exists (values not printed)";
+});
+
+check("GitHub CLI is authenticated", () => {
+  if (!tryCapture("gh", ["auth", "status"]).ok) throw new Error("gh is not authenticated. Run: gh auth login");
+  ctx.ghLogin = ghActiveLogin();
+  return `active account ${ctx.ghLogin}`;
+});
+
+check("Repository ownership matches the authenticated account", () => {
+  const originUrl = git(["remote", "get-url", "origin"]).trim();
+  const origin = parseGitHubRemote(originUrl);
+  if (!origin) throw new Error(`origin (${originUrl}) is not a github.com remote.`);
+  const publish = JSON.parse(readFileSync(resolve(operatorDir, "package.json"), "utf8")).build?.publish;
+  if (!publish || publish.provider !== "github" || !publish.owner || !publish.repo) throw new Error("apps/operator/package.json build.publish is not a valid GitHub provider config.");
+  ctx.originSlug = `${origin.owner}/${origin.repo}`;
+  ctx.releaseSlug = `${publish.owner}/${publish.repo}`;
+  state.releaseSlug = ctx.releaseSlug;
+  ctx.originOwner = origin.owner;
+  ctx.releaseOwner = publish.owner;
+  assertGhAccountMatches(origin.owner);
+  assertGhAccountMatches(publish.owner);
+  for (const slug of new Set([ctx.originSlug, ctx.releaseSlug])) {
+    const perm = tryCapture("gh", ["repo", "view", slug, "--json", "viewerPermission", "--jq", ".viewerPermission"]);
+    if (!perm.ok) throw new Error(`Could not read ${slug} with gh: ${errText(perm)}`);
+    if (!["ADMIN", "MAINTAIN", "WRITE"].includes(perm.output.trim())) throw new Error(`Account ${ctx.ghLogin} has "${perm.output.trim()}" permission on ${slug}; write access is required.`);
+  }
+  return ctx.originSlug === ctx.releaseSlug ? `${ctx.originSlug} (source repo and release repo are the same)` : `source ${ctx.originSlug}, releases ${ctx.releaseSlug}`;
+});
+
+check("origin/main has nothing this checkout lacks", () => {
+  const remote = tryCapture("git", ["ls-remote", "origin", "refs/heads/main"], { cwd: root });
+  if (!remote.ok) throw new Error(`Could not query origin: ${errText(remote)}`);
+  const remoteSha = remote.output.trim().split(/\s+/)[0];
+  if (!remoteSha) throw new Error("origin has no main branch.");
+  if (remoteSha === state.baseSha) return "origin/main == HEAD";
+  const anc = tryCapture("git", ["merge-base", "--is-ancestor", remoteSha, "HEAD"], { cwd: root });
+  if (!anc.ok) throw new Error(`origin/main (${remoteSha.slice(0, 7)}) is not an ancestor of local HEAD (${state.baseSha.slice(0, 7)}) — fetch and reconcile before releasing.`);
+  return `origin/main ${remoteSha.slice(0, 7)} is an ancestor of HEAD`;
+});
+
+check("Release tag and GitHub release do not already exist", () => assertReleaseTargetFree(state.tag, ctx.originSlug, ctx.releaseSlug));
+
+logStep("Preflight: root test suite (engine, contracts, api, client, ui)");
+if (run("npm", ["test"], { cwd: root }) !== 0) fail("Preflight: root test suite", "`npm test` failed — see output above. Nothing was modified.");
+console.log("  PASS  root test suite");
+
+logStep("Preflight: Operator test suite");
+if (run("npm", ["test", "-w", "@tournament/operator"], { cwd: root }) !== 0) fail("Preflight: Operator test suite", "`npm test -w @tournament/operator` failed — see output above. Nothing was modified.");
+console.log("  PASS  Operator test suite");
+
+console.log(`
+Preflight PASSED. Plan:
+  Operator ${ctx.currentOperator} -> ${ctx.nextOperator}   Umpire ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.currentVersionCode} -> ${ctx.nextVersionCode})
+  Tag / release: ${state.tag} on ${ctx.releaseSlug}
+  Will stage exactly: ${[...VERSION_FILES, ...initialEntries.map((e) => e.path)].join(", ")}`);
+
+if (flags.preflightOnly) {
+  releaseUnlock();
+  console.log("\n--preflight-only: stopping here. No version file, build output, commit, tag, push, or release was touched.");
+  process.exit(0);
 }
 
-// --- Tests (before touching any version files) ---
-logStep("Run tests: engine, contracts, api");
-const rootTestStatus = run("npm", ["test"], { cwd: root });
-if (rootTestStatus !== 0) fail("Tests: engine/contracts/api", "`npm test` failed — see output above.");
-report.tests = { engine: "PASS", contracts: "PASS", api: "PASS" };
-
-logStep("Run tests: operator");
-const operatorTestStatus = run("npm", ["test", "-w", "@tournament/operator"], { cwd: root });
-if (operatorTestStatus !== 0) fail("Tests: operator", "`npm test -w @tournament/operator` failed — see output above.");
-report.tests.operator = "PASS";
-report.tests.android = "NOT AVAILABLE (no project test suite configured for @tournament/umpire)";
-
-// --- 3/4. Determine + apply next version ---
-logStep("Determine next version");
-const operatorPkgPath = resolve(operatorDir, "package.json");
-const umpirePkgPath = resolve(umpireDir, "package.json");
-const gradlePath = resolve(androidDir, "app/build.gradle");
-
-const currentOperatorVersion = readPackageVersion(operatorPkgPath);
-const currentUmpireVersion = readPackageVersion(umpirePkgPath);
-const nextOperatorVersion = bumpVersion(currentOperatorVersion, bumpType);
-const nextUmpireVersion = bumpVersion(currentUmpireVersion, bumpType);
-
-const gradleRaw = readFileSync(gradlePath, "utf8");
-const versionCodeMatch = gradleRaw.match(/versionCode\s+(\d+)/);
-if (!versionCodeMatch) fail("Determine next version", `Could not find versionCode in ${gradlePath}`);
-const nextVersionCode = Number.parseInt(versionCodeMatch[1], 10) + 1;
-
-console.log(`Operator: ${currentOperatorVersion} -> ${nextOperatorVersion}`);
-console.log(`Umpire:   ${currentUmpireVersion} -> ${nextUmpireVersion} (versionCode ${versionCodeMatch[1]} -> ${nextVersionCode})`);
-console.log("(Operator and Umpire keep independent version lineages, per this project's existing convention — both are bumped by the same amount, from their own current version.)");
-
+// ---------------------------------------------------------------------------
+// 2. Version bump (first modification)
+// ---------------------------------------------------------------------------
+stage = "version-bump";
 logStep("Apply version bump");
-writePackageVersion(operatorPkgPath, nextOperatorVersion);
-writePackageVersion(umpirePkgPath, nextUmpireVersion);
-writeFileSync(
-  gradlePath,
-  gradleRaw
-    .replace(/versionCode\s+\d+/, `versionCode ${nextVersionCode}`)
-    .replace(/versionName\s+"[^"]+"/, `versionName "${nextUmpireVersion}"`)
-);
+state.versionsBumped = true; // set first so a partial write is still covered by the restore
+const gradlePath = resolve(androidDir, "app/build.gradle");
+const bumpPlan = [
+  { rel: "apps/operator/package.json", path: resolve(operatorDir, "package.json"), edit: (raw) => raw.replace(/"version":\s*"[^"]+"/, `"version": "${ctx.nextOperator}"`) },
+  { rel: "apps/umpire/package.json", path: resolve(umpireDir, "package.json"), edit: (raw) => raw.replace(/"version":\s*"[^"]+"/, `"version": "${ctx.nextUmpire}"`) },
+  {
+    rel: "apps/umpire/android/app/build.gradle",
+    path: gradlePath,
+    edit: (raw) => raw.replace(/versionCode\s+\d+/, `versionCode ${ctx.nextVersionCode}`).replace(/versionName\s+"[^"]+"/, `versionName "${ctx.nextUmpire}"`),
+  },
+];
+for (const f of bumpPlan) {
+  const original = readFileSync(f.path, "utf8");
+  const written = f.edit(original);
+  bumpedFiles.push({ rel: f.rel, path: f.path, original, written });
+}
+for (const f of bumpedFiles) writeFileSync(f.path, f.written);
+console.log(`Operator: ${ctx.currentOperator} -> ${ctx.nextOperator}`);
+console.log(`Umpire:   ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.currentVersionCode} -> ${ctx.nextVersionCode})`);
 
-// --- 6. Windows build ---
+// ---------------------------------------------------------------------------
+// 3. Builds — strictly sequential: Windows Operator, then Android Umpire.
+// ---------------------------------------------------------------------------
+const buildStartMs = Date.now() - 5000; // artifacts older than this run are stale, not new
+
+stage = "windows-build";
+state.buildsStarted = true;
 logStep("Build Windows (electron-builder, includes clean:desktop)");
-const winBuildStatus = run("npm", ["run", "build:desktop", "-w", "@tournament/operator"], { cwd: root });
-if (winBuildStatus !== 0) fail("Windows build", "`npm run build:desktop -w @tournament/operator` failed — see output above. Version files were changed but nothing was committed.");
+state.releaseDirCleanupStarted = true; // build:desktop deletes apps/operator/release/ first
+if (run("npm", ["run", "build:desktop", "-w", "@tournament/operator"], { cwd: root }) !== 0) {
+  fail("Windows build", "`npm run build:desktop -w @tournament/operator` failed — see output above.");
+}
 
-// --- 7. Android build ---
+stage = "android-build";
 logStep("Build Android (vite + cap sync)");
-const androidWebStatus = run("npm", ["run", "build:android", "-w", "@tournament/umpire"], { cwd: root });
-if (androidWebStatus !== 0) fail("Android build (web bundle)", "`npm run build:android -w @tournament/umpire` failed — see output above.");
-
-function findJavaHome() {
-  if (process.env.JAVA_HOME && existsSync(resolve(process.env.JAVA_HOME, "bin/java.exe"))) return process.env.JAVA_HOME;
-  const candidates = [
-    "C:\\Program Files\\Android\\Android Studio\\jbr",
-    "C:\\Program Files\\Android\\Android Studio1\\jbr",
-  ];
-  for (const c of candidates) {
-    if (existsSync(resolve(c, "bin/java.exe"))) return c;
-  }
-  return null;
+if (run("npm", ["run", "build:android", "-w", "@tournament/umpire"], { cwd: root }) !== 0) {
+  fail("Android build (web bundle)", "`npm run build:android -w @tournament/umpire` failed — see output above.");
 }
-function findAndroidSdk() {
-  if (process.env.ANDROID_HOME && existsSync(process.env.ANDROID_HOME)) return process.env.ANDROID_HOME;
-  if (process.env.ANDROID_SDK_ROOT && existsSync(process.env.ANDROID_SDK_ROOT)) return process.env.ANDROID_SDK_ROOT;
-  const localProps = resolve(androidDir, "local.properties");
-  if (existsSync(localProps)) {
-    const m = readFileSync(localProps, "utf8").match(/sdk\.dir=(.+)/);
-    if (m) {
-      const p = m[1].trim().replace(/\\\\/g, "\\");
-      if (existsSync(p)) return p;
-    }
-  }
-  const fallback = resolve(String(process.env.LOCALAPPDATA || ""), "Android/Sdk");
-  if (existsSync(fallback)) return fallback;
-  return null;
-}
-function findLatestBuildTools(sdkPath) {
-  const dir = resolve(sdkPath, "build-tools");
-  if (!existsSync(dir)) return null;
-  const versions = readdirSync(dir).filter((v) => existsSync(resolve(dir, v, "aapt.exe")));
-  if (!versions.length) return null;
-  versions.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  return resolve(dir, versions[versions.length - 1]);
-}
-
-const javaHome = findJavaHome();
-if (!javaHome) fail("Android build (Gradle)", "Could not find a JDK. Set JAVA_HOME, or install Android Studio (its bundled JBR is auto-detected).");
-const androidSdk = findAndroidSdk();
-if (!androidSdk) fail("Android build (Gradle)", "Could not find the Android SDK. Set ANDROID_HOME/ANDROID_SDK_ROOT, or fix apps/umpire/android/local.properties.");
-console.log(`Using JAVA_HOME=${javaHome}`);
-console.log(`Using Android SDK=${androidSdk}`);
+console.log(`Using JAVA_HOME=${ctx.javaHome}`);
+console.log(`Using Android SDK=${ctx.androidSdk}`);
 
 logStep("Build Android (gradlew assembleRelease)");
 const gradleStatus = run(resolve(androidDir, "gradlew.bat"), ["assembleRelease", "--no-daemon"], {
   cwd: androidDir,
-  env: { ...process.env, JAVA_HOME: javaHome, ANDROID_HOME: androidSdk, ANDROID_SDK_ROOT: androidSdk },
+  env: { ...process.env, JAVA_HOME: ctx.javaHome, ANDROID_HOME: ctx.androidSdk, ANDROID_SDK_ROOT: ctx.androidSdk },
 });
-if (gradleStatus !== 0) fail("Android build (Gradle)", "`gradlew.bat assembleRelease` failed — see output above. The existing signing config was not touched.");
+if (gradleStatus !== 0) fail("Android build (Gradle)", "`gradlew.bat assembleRelease` failed — see output above. The signing config was not touched.");
 
-// --- 8. Verify both builds ---
+// ---------------------------------------------------------------------------
+// 4. Verify both artifacts directly (an exit code alone is not enough)
+// ---------------------------------------------------------------------------
+stage = "verify";
 logStep("Verify Windows build");
-const winCheckStatus = run("node", [resolve(root, "scripts/publish-desktop-update.mjs"), "--check"], { cwd: root });
-if (winCheckStatus !== 0) fail("Verify Windows build", "Windows release artifact verification failed (see scripts/publish-desktop-update.mjs --check output above).");
-
-const winInstallerPath = resolve(operatorDir, `release/Tournament-Operator-Setup-${nextOperatorVersion}.exe`);
-const winInstallerSize = statSync(winInstallerPath).size;
+const winResult = verifyWindowsInstaller({ root, operatorDir, version: ctx.nextOperator, notOlderThanMs: buildStartMs });
+if (!winResult.ok) fail("Verify Windows build", winResult.error);
+console.log(`Installer:            ${winResult.path} (${winResult.size} bytes, ${winResult.mtime.toISOString()})`);
+console.log(`NSIS installer:       yes (MZ header + Nullsoft/NSIS stub)`);
+console.log(`ProductVersion:       ${winResult.productVersion ?? "(not readable)"}`);
+console.log(`Windows Authenticode: ${winResult.authenticode.label}`);
+if (winResult.authenticode.signed !== true) console.log("  (not blocking: no Windows signing certificate is configured for this project)");
 
 logStep("Verify Android build");
-const apkPath = resolve(androidDir, "app/build/outputs/apk/release/app-release.apk");
-if (!existsSync(apkPath)) fail("Verify Android build", `Expected release APK not found at ${apkPath}`);
-const buildTools = findLatestBuildTools(androidSdk);
-if (!buildTools) fail("Verify Android build", `No usable build-tools (with aapt.exe) found under ${androidSdk}/build-tools`);
-
-const badging = tryCapture(resolve(buildTools, "aapt.exe"), ["dump", "badging", apkPath]);
-if (!badging.ok) fail("Verify Android build", `aapt dump badging failed: ${badging.error.message}`);
-const pkgLine = badging.output.split(/\r?\n/).find((l) => l.startsWith("package:"));
-const appIdMatch = pkgLine?.match(/name='([^']+)'/);
-const versionCodeOut = pkgLine?.match(/versionCode='([^']+)'/);
-const versionNameOut = pkgLine?.match(/versionName='([^']+)'/);
-if (appIdMatch?.[1] !== "app.tournament.umpire") fail("Verify Android build", `Unexpected applicationId in APK: ${appIdMatch?.[1]}`);
-if (versionCodeOut?.[1] !== String(nextVersionCode)) fail("Verify Android build", `APK versionCode ${versionCodeOut?.[1]} does not match expected ${nextVersionCode}`);
-if (versionNameOut?.[1] !== nextUmpireVersion) fail("Verify Android build", `APK versionName ${versionNameOut?.[1]} does not match expected ${nextUmpireVersion}`);
-
-const sig = tryCapture(quoteForWindowsShell(resolve(buildTools, "apksigner.bat")), ["verify", "--print-certs", apkPath].map(quoteForWindowsShell), {
-  env: { ...process.env, JAVA_HOME: javaHome },
-  shell: process.platform === "win32", // apksigner.bat is a batch file, not a .exe
+const apkResult = verifyAndroidApk({
+  androidDir,
+  androidSdk: ctx.androidSdk,
+  javaHome: ctx.javaHome,
+  expectedAppId: "app.tournament.umpire",
+  expectedVersionCode: ctx.nextVersionCode,
+  expectedVersionName: ctx.nextUmpire,
+  notOlderThanMs: buildStartMs,
 });
-if (!sig.ok) fail("Verify Android build", `apksigner verify failed — the release signing config may be broken:\n${sig.error.message}`);
-const apkSize = statSync(apkPath).size;
+if (!apkResult.ok) fail("Verify Android build", apkResult.error);
+console.log(`APK:     ${apkResult.path} (${apkResult.size} bytes, ${apkResult.mtime.toISOString()})`);
+console.log(`Package: ${apkResult.appId} versionName ${apkResult.versionName} versionCode ${apkResult.versionCode} (release variant, not debuggable)`);
+console.log(`Signer:  ${apkResult.signerDn} SHA-256 ${apkResult.signerSha256 ?? "(n/a)"}`);
+console.log("Android APK stays LOCAL — it is not uploaded anywhere by this script.");
 
-// --- 10. Commit ---
-logStep("Commit");
-const statusBeforeCommit = runCapture("git", ["status", "--porcelain"], { cwd: root })
-  .split(/\r?\n/)
-  .filter(Boolean);
-const pathsToStage = statusBeforeCommit
-  .map((l) => l.slice(3).trim())
-  .filter((p) => !SUSPICIOUS_PATTERNS.some((re) => re.test(p)) || /\.env\.example$/i.test(p));
-if (!pathsToStage.length) fail("Commit", "No stageable changes found after build (unexpected).");
-run("git", ["add", "--", ...pathsToStage], { cwd: root });
-const commitMsg = `Release v${nextOperatorVersion} (Umpire ${nextUmpireVersion})\n\n- Windows Operator: ${currentOperatorVersion} -> ${nextOperatorVersion}\n- Android Umpire: ${currentUmpireVersion} -> ${nextUmpireVersion} (versionCode ${nextVersionCode})\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n`;
+// ---------------------------------------------------------------------------
+// 5. Commit — explicit allowlist only, never "everything git status shows"
+// ---------------------------------------------------------------------------
+stage = "commit";
+logStep("Commit (explicit allowlist)");
+if (git(["rev-parse", "HEAD"]).trim() !== state.baseSha) fail("Commit", "HEAD moved since preflight — refusing to commit on top of an unexpected state.");
+const postBuildEntries = readWorkingTree();
+const allowedPost = (p) => VERSION_FILES.includes(p) || isAllowedPath(p);
+const strays = postBuildEntries.filter((e) => e.renamedFrom || !allowedPost(e.path));
+if (strays.length) {
+  fail("Commit", `Unexpected working-tree change(s) appeared after preflight — nothing was staged:\n${strays.map((e) => `  ${e.code} ${e.path}`).join("\n")}`);
+}
+const missingBump = VERSION_FILES.filter((p) => !postBuildEntries.some((e) => e.path === p));
+if (missingBump.length) fail("Commit", `Expected version file(s) not modified: ${missingBump.join(", ")}`);
+const pathsToStage = postBuildEntries.map((e) => e.path);
+if (git(["diff", "--cached", "--name-only", "-z"]).split("\0").filter(Boolean).length) fail("Commit", "The index gained staged changes during the release — refusing to commit.");
+console.log(`Staging exactly ${pathsToStage.length} path(s):`);
+for (const p of pathsToStage) console.log(`  ${p}`);
+try {
+  git(["add", "--", ...pathsToStage], { stdio: "inherit" });
+} catch (err) {
+  try { git(["restore", "--staged", "--", ...pathsToStage]); } catch { /* best effort */ }
+  fail("Commit", `git add failed: ${err.message}`);
+}
+const stagedNow = git(["diff", "--cached", "--name-only", "-z"]).split("\0").filter(Boolean).sort();
+const expectedStaged = [...pathsToStage].sort();
+if (stagedNow.length !== expectedStaged.length || stagedNow.some((p, i) => p !== expectedStaged[i])) {
+  try { git(["restore", "--staged", "--", ...pathsToStage]); } catch { /* best effort */ }
+  fail("Commit", `Staged set does not match the allowlist exactly.\n  expected: ${expectedStaged.join(", ")}\n  staged:   ${stagedNow.join(", ")}\nThe paths this script staged were unstaged again; nothing was committed.`);
+}
+const commitMsg = `Release v${ctx.nextOperator} (Umpire ${ctx.nextUmpire})\n\n- Windows Operator: ${ctx.currentOperator} -> ${ctx.nextOperator}\n- Android Umpire: ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.nextVersionCode})\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n`;
 writeFileSync(commitMsgPath, commitMsg);
-const commitStatus = run("git", ["commit", "-F", commitMsgPath], { cwd: root });
+try {
+  git(["commit", "-F", commitMsgPath], { stdio: "inherit" });
+} catch (err) {
+  try { unlinkSync(commitMsgPath); } catch { /* ignore */ }
+  try { git(["restore", "--staged", "--", ...pathsToStage]); } catch { /* best effort */ }
+  fail("Commit", `git commit failed: ${err.message}`);
+}
 try { unlinkSync(commitMsgPath); } catch { /* ignore */ }
-if (commitStatus !== 0) fail("Commit", "`git commit` failed — see output above.");
-const commitHash = runCapture("git", ["rev-parse", "--short", "HEAD"], { cwd: root }).trim();
+state.committed = true;
+state.commitHash = git(["rev-parse", "--short", "HEAD"]).trim();
+const commitSha = git(["rev-parse", "HEAD"]).trim();
+console.log(`Committed ${state.commitHash}`);
 
-// --- 11. Push ---
-function remoteOwner(url) {
-  const m = String(url).match(/github\.com[/:]([^/]+)\//i);
-  return m ? m[1] : null;
-}
-function ensureGhAccountActive(login) {
-  if (!login) return;
-  const status = tryCapture("gh", ["auth", "status"]);
-  const text = status.ok ? status.output : (status.error?.stdout?.toString() || status.error?.stderr?.toString() || "");
-  // Parse per-account blocks rather than one greedy regex across the whole
-  // output — otherwise the captured "active" account can be misattributed to
-  // whichever account happens to be listed first, not whichever actually has
-  // "Active account: true" nearest to it.
-  const blocks = text.split(/(?=Logged in to github\.com account )/);
-  const accounts = [];
-  let activeLogin = null;
-  for (const block of blocks) {
-    const nameMatch = block.match(/Logged in to github\.com account (\S+)/);
-    if (!nameMatch) continue;
-    accounts.push(nameMatch[1]);
-    if (/Active account:\s*true/.test(block)) activeLogin = nameMatch[1];
-  }
-  if (activeLogin === login) return;
-  if (!accounts.includes(login)) {
-    throw new Error(`GitHub account "${login}" is not logged into gh on this machine. Run: gh auth login (as ${login})`);
-  }
-  const sw = tryCapture("gh", ["auth", "switch", "--user", login, "--hostname", "github.com"]);
-  if (!sw.ok) throw new Error(`Failed to switch gh to account "${login}": ${sw.error.message}`);
-}
-
+// ---------------------------------------------------------------------------
+// 6. Push — plain push, never forced
+// ---------------------------------------------------------------------------
+stage = "push";
 logStep("Push to GitHub (source repo)");
-const originUrl = runCapture("git", ["remote", "get-url", "origin"], { cwd: root }).trim();
-const sourceOwner = remoteOwner(originUrl);
 try {
-  ensureGhAccountActive(sourceOwner);
+  assertGhAccountMatches(ctx.originOwner);
 } catch (err) {
-  fail("Push to GitHub", `${err.message}\nA local commit (${commitHash}) exists but was NOT pushed. Fix auth and run: git push origin main`);
+  fail("Push to GitHub", err.message);
 }
-const pushStatus = run("git", ["push", "origin", "main"], { cwd: root });
-if (pushStatus !== 0) {
-  fail("Push to GitHub", `\`git push origin main\` failed. A local commit (${commitHash}) exists but was NOT pushed — fix the issue and push manually, do not force-push.`);
+try {
+  git(["push", "origin", "main"], { stdio: "inherit" });
+} catch (err) {
+  fail("Push to GitHub", `\`git push origin main\` failed (${err.message}). Fix the cause and push manually — never force-push.`);
+}
+{
+  const remote = tryCapture("git", ["ls-remote", "origin", "refs/heads/main"], { cwd: root });
+  const remoteSha = remote.ok ? remote.output.trim().split(/\s+/)[0] : "";
+  if (remoteSha !== commitSha) fail("Push to GitHub", `git push reported success, but origin/main is ${remoteSha ? remoteSha.slice(0, 7) : "unreadable"}, not ${commitSha.slice(0, 7)}.`);
+  state.pushed = true;
+  console.log(`origin/main == ${commitSha.slice(0, 7)} (verified)`);
 }
 
-// --- 12/13. Publish Windows GitHub Release ---
+// ---------------------------------------------------------------------------
+// 7. Publish the Windows GitHub release, then verify it independently
+// ---------------------------------------------------------------------------
+stage = "github-release";
 logStep("Publish Windows GitHub Release");
-const operatorPkgForPublish = JSON.parse(readFileSync(operatorPkgPath, "utf8"));
-const releaseOwner = operatorPkgForPublish.build?.publish?.owner;
-const releaseRepo = operatorPkgForPublish.build?.publish?.repo;
 try {
-  ensureGhAccountActive(releaseOwner);
+  assertGhAccountMatches(ctx.releaseOwner);
+  assertReleaseTargetFree(state.tag, ctx.originSlug, ctx.releaseSlug); // must not have appeared since preflight
 } catch (err) {
-  fail("Publish GitHub Release", `${err.message}\nSource push succeeded (commit ${commitHash}), but the release was NOT published. Fix auth and run: npm run publish:desktop -w @tournament/operator`);
+  fail("Publish GitHub Release", `${err.message}\nSource push succeeded (commit ${state.commitHash}); no release was created.`);
 }
-const publishStatus = run("node", [resolve(root, "scripts/publish-desktop-update.mjs")], { cwd: root });
-if (publishStatus !== 0) {
-  fail("Publish GitHub Release", `scripts/publish-desktop-update.mjs failed. Source push already succeeded (commit ${commitHash}) — fix the release issue and run: npm run publish:desktop -w @tournament/operator`);
+state.ghReleaseStarted = true;
+if (run("node", [resolve(root, "scripts/publish-desktop-update.mjs")], { cwd: root }) !== 0) {
+  fail("Publish GitHub Release", `scripts/publish-desktop-update.mjs failed. Source push already succeeded (commit ${state.commitHash}).`);
 }
 
-// --- 14. Final report ---
+logStep("Verify published release");
+const releaseFiles = [
+  resolve(operatorDir, `release/Tournament-Operator-Setup-${ctx.nextOperator}.exe`),
+  resolve(operatorDir, `release/Tournament-Operator-Setup-${ctx.nextOperator}.exe.blockmap`),
+  resolve(operatorDir, "release/latest.yml"),
+];
+const view = tryCapture("gh", ["release", "view", state.tag, "--repo", ctx.releaseSlug, "--json", "tagName,isDraft,url,assets"]);
+if (!view.ok) fail("Verify published release", `gh could not read release ${state.tag}: ${errText(view)}`);
+const published = JSON.parse(view.output);
+if (published.tagName !== state.tag) fail("Verify published release", `Release tag is ${published.tagName}, expected ${state.tag}.`);
+if (published.isDraft) fail("Verify published release", `Release ${state.tag} is still a DRAFT — it was not published.`);
+for (const file of releaseFiles) {
+  const name = file.split(/[\\/]/).pop();
+  const asset = (published.assets || []).find((a) => a.name === name);
+  if (!asset) fail("Verify published release", `Published release is missing asset ${name}.`);
+  const localSize = readFileSync(file).length;
+  if (asset.size !== localSize) fail("Verify published release", `Asset ${name}: remote ${asset.size} bytes, local ${localSize} bytes.`);
+  if (typeof asset.digest === "string" && asset.digest.startsWith("sha256:")) {
+    const local = sha256OfFile(file);
+    if (asset.digest.slice(7).toLowerCase() !== local) fail("Verify published release", `Asset ${name}: remote sha256 ${asset.digest.slice(7)} != local ${local}.`);
+    console.log(`  ${name}: ${asset.size} bytes, sha256 matches`);
+  } else {
+    console.log(`  ${name}: ${asset.size} bytes (size matches; GitHub returned no digest for this asset)`);
+  }
+}
+console.log(`Release ${state.tag} verified: ${published.url}`);
+
+// ---------------------------------------------------------------------------
+// 8. Final report — only reached when every step above verified
+// ---------------------------------------------------------------------------
+const treeAfter = readWorkingTree();
 releaseUnlock();
 const durationSec = Math.round((Date.now() - startedAt) / 1000);
 console.log(`
@@ -382,36 +766,35 @@ console.log(`
 RELEASE COMPLETE
 ================
 
-Operator version: ${nextOperatorVersion}
-Umpire version:   ${nextUmpireVersion} (versionCode ${nextVersionCode})
+Operator version: ${ctx.nextOperator}
+Umpire version:   ${ctx.nextUmpire} (versionCode ${ctx.nextVersionCode})
 Duration: ${durationSec}s
 
 Windows:
 PASS
-Tournament-Operator-Setup-${nextOperatorVersion}.exe (${winInstallerSize} bytes)
+${winResult.path}
+${winResult.size} bytes, NSIS installer, ProductVersion ${winResult.productVersion ?? "n/a"}
+Windows Authenticode: ${winResult.authenticode.label}
 
 Android:
-PASS
-app-release.apk (${apkSize} bytes) - applicationId app.tournament.umpire, signed
+PASS (LOCAL ONLY — not uploaded or published)
+${apkResult.path}
+${apkResult.size} bytes - ${apkResult.appId} ${apkResult.versionName} (${apkResult.versionCode}), release, signed
+Signer SHA-256: ${apkResult.signerSha256 ?? "n/a"}
 
-Tests:
-Engine: PASS
-Contracts: PASS
-API: PASS (live-integration tests skipped unless RUN_LIVE_API_TESTS=1)
+Tests (preflight):
+Root suite (engine, contracts, api, client, ui): PASS
 Operator: PASS
 Android: NOT AVAILABLE (no test suite configured)
 
 Git:
-Commit: ${commitHash}
-Push: PASS
-Working tree: CLEAN
+Commit: ${state.commitHash}
+Push: PASS (origin/main verified)
+Working tree: ${treeAfter.length === 0 ? "CLEAN" : `${treeAfter.length} path(s) still changed:\n${treeAfter.map((e) => `  ${e.code} ${e.path}`).join("\n")}`}
 
 GitHub Release:
-v${nextOperatorVersion}
-Published: YES (${releaseOwner}/${releaseRepo})
-
-Auto-update metadata:
-latest.yml: PASS
+${state.tag}
+Published: YES, verified (${ctx.releaseSlug}) ${published.url}
 
 MANUAL TEST REQUIRED:
 - Windows old-version -> new-version auto-update (install/detect/download/restart)
