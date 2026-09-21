@@ -401,6 +401,15 @@ function stageTitle(label) {
   return STAGE_LABEL[label] || String(label || "").replaceAll("_", " ");
 }
 
+// The recommended default shown in the "Match scoring" confirmation dialog
+// before a match starts — the operator/umpire can still change it. Only a
+// stage-based recommendation; the server independently validates whatever
+// target is actually submitted (see ALLOWED_MATCH_SCORING_TARGETS in
+// packages/api/src/handleCommand.js).
+function recommendedScoringTarget(match) {
+  return ["semifinal", "final", "bronze"].includes(match?.stage_label) ? 15 : 11;
+}
+
 function MatchGroup({ title, rows, onOpen, nameFor }) {
   if (!rows.length) return null;
   return (
@@ -657,6 +666,8 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   const [confirmComplete, setConfirmComplete] = useState(false);
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [showEditScore, setShowEditScore] = useState(false);
+  const [showScoringConfirm, setShowScoringConfirm] = useState(false);
+  const [scoringTarget, setScoringTarget] = useState(11);
   const [showHold, setShowHold] = useState(false);
   const [holdReason, setHoldReason] = useState("");
   const [holding, setHolding] = useState(false);
@@ -1063,6 +1074,12 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         <span className="ump-context-item">{match.stage_label ? stageTitle(match.stage_label) : `Round ${match.round || 1}`}</span>
         <span className="ump-context-sep" aria-hidden="true">·</span>
         <span className="ump-context-item">{court?.name || "No court"}</span>
+        {score.winTo ? (
+          <>
+            <span className="ump-context-sep" aria-hidden="true">·</span>
+            <span className="ump-context-item">Race to {score.winTo}</span>
+          </>
+        ) : null}
       </div>
       <div className="ump-score">
         <div className="ump-court-label">
@@ -1118,9 +1135,53 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         )}
 
         {canStart && (
-          <Button disabled={busy} onClick={() => command("start_match", { match_id: match.id })}>
+          <Button
+            disabled={busy}
+            onClick={() => {
+              setScoringTarget(recommendedScoringTarget(match));
+              setShowScoringConfirm(true);
+            }}
+          >
             Start match
           </Button>
+        )}
+
+        {showScoringConfirm && (
+          <Modal title="Match scoring" onClose={() => setShowScoringConfirm(false)}>
+            <div className="stack">
+              <p className="muted" style={{ margin: 0 }}>How many points? This match ends as soon as a team reaches this number.</p>
+              <div className="ump-choice-row">
+                <button
+                  type="button"
+                  className={`ump-choice ${scoringTarget === 11 ? "selected" : ""}`}
+                  aria-pressed={scoringTarget === 11}
+                  onClick={() => setScoringTarget(11)}
+                >
+                  11 Points
+                </button>
+                <button
+                  type="button"
+                  className={`ump-choice ${scoringTarget === 15 ? "selected" : ""}`}
+                  aria-pressed={scoringTarget === 15}
+                  onClick={() => setScoringTarget(15)}
+                >
+                  15 Points
+                </button>
+              </div>
+              <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
+                <Button variant="secondary" disabled={busy} onClick={() => setShowScoringConfirm(false)}>Cancel</Button>
+                <Button
+                  disabled={busy}
+                  onClick={async () => {
+                    setShowScoringConfirm(false);
+                    await command("start_match", { match_id: match.id, scoring_override: { winTo: scoringTarget } });
+                  }}
+                >
+                  Start Match
+                </Button>
+              </div>
+            </div>
+          </Modal>
         )}
 
         {showToss && (

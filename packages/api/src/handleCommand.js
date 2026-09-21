@@ -40,11 +40,33 @@ export { resolveActor } from "./stationAuth.js";
 function scoringSettings(config = {}) {
   return {
     winTo: config.winTo ?? 11,
-    winBy: config.winBy ?? "two",
+    // This product's scoring rule: first to reach the target wins
+    // immediately — no deuce/win-by-2. checkGameWin (scoring.js) still
+    // generically supports "two"/"one" win-by modes, but this product only
+    // ever uses "none", regardless of what a division's config may have
+    // stored previously.
+    winBy: "none",
     bestOf: config.bestOf ?? 1,
     isDoubles: config.isDoubles !== false,
     timeoutsAllowed: config.timeoutsAllowed ?? 2,
   };
+}
+
+// The only game targets a "Match Scoring" confirmation dialog (Operator or
+// Umpire, at Start Match) may select between — enforced server-side so a
+// per-match override can never smuggle in an arbitrary/invalid target.
+const ALLOWED_MATCH_SCORING_TARGETS = [11, 15];
+
+function applyScoringOverride(settings, override) {
+  if (override == null) return settings;
+  if (typeof override !== "object") {
+    throw httpError(400, "INVALID_COMMAND", "scoring_override must be an object");
+  }
+  const winTo = Number(override.winTo);
+  if (!ALLOWED_MATCH_SCORING_TARGETS.includes(winTo)) {
+    throw httpError(400, "INVALID_COMMAND", `scoring_override.winTo must be one of ${ALLOWED_MATCH_SCORING_TARGETS.join(", ")}`);
+  }
+  return { ...settings, winTo, winBy: "none" };
 }
 
 async function commit(admin, batch, { command_id, type, actorId, actorDeviceId, tournamentId, matchId, result, detail }) {
@@ -1547,7 +1569,8 @@ async function handleStartMatch(admin, actor, payload, envelope) {
     throw httpError(409, err.code || "ILLEGAL_TRANSITION", err.message);
   }
   const division = await getDivision(admin, match.division_id);
-  const score_state = scoreStateForMatchStart(match, scoringSettings(division.config));
+  const settings = applyScoringOverride(scoringSettings(division.config), payload.scoring_override);
+  const score_state = scoreStateForMatchStart(match, settings);
   const next = { ...match, status: "in_progress", started_at: nowIso(), score_state };
   const batch = createBatch();
   persistMatch(batch, next);

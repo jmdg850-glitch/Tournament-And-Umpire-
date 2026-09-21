@@ -220,8 +220,9 @@ export function Table({ columns, rows, empty, rowProps, responsive }) {
 
 const RANK_MEDAL = { 1: "🥇", 2: "🥈", 3: "🥉" };
 
-/** Leaderboard-style table for standings. `rows` need: rank, name, plus any of team/wins/losses/pointDiff/winPct/extra. */
-export function StandingsTable({ rows, extraColumns = [] }) {
+/** Leaderboard-style table for standings. `rows` need: rank, name, plus any of team/wins/losses/pointDiff/winPct/extra.
+ * `nameHeader` overrides the auto-picked header for the `name` column (e.g. "Team" for a team-level table). */
+export function StandingsTable({ rows, extraColumns = [], nameHeader }) {
   if (!rows?.length) return null;
   const hasTeam = rows.some((r) => r.team);
   return (
@@ -238,7 +239,7 @@ export function StandingsTable({ rows, extraColumns = [] }) {
             </span>
           ),
         },
-        { key: "name", header: hasTeam ? "Pair / Player" : "Player" },
+        { key: "name", header: nameHeader || (hasTeam ? "Pair / Player" : "Player") },
         ...(hasTeam ? [{ key: "team", header: "Team" }] : []),
         { key: "wins", header: "W" },
         { key: "losses", header: "L" },

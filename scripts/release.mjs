@@ -2,6 +2,13 @@
 // and Tournament Umpire (Android). Invoke via `npm run release` (patch bump)
 // or `npm run release -- minor` / `npm run release -- major`.
 //
+// Any working-tree change under a recognized Tournament source root (apps/,
+// packages/, scripts/, docs/, supabase/ minus its legacy subpaths) or the
+// root package.json/package-lock.json is auto-included — see
+// isReleasableSourcePath() below. No --allow= is needed for ordinary
+// Tournament development. --allow= remains available for genuine exceptions
+// (a path outside those roots that really belongs in this release).
+//
 //   npm run release -- --preflight-only        run every preflight check, change nothing
 //   npm run release -- --allow=<path-or-dir/>  explicitly allow one more dirty path
 //                                              (or directory prefix ending in "/") to be
@@ -99,14 +106,69 @@ const RELEASE_TOOLING_FILES = [
 ];
 const SUSPICIOUS_PATTERNS = [
   /(^|[\\/])\.env(\.[^\\/]*)?$/i,
-  /\.(pem|p12|jks|keystore)$/i,
+  /\.(pem|p12|pfx|p8|cer|jks|keystore)$/i,
   /(^|[\\/])keystore\.properties$/i,
+  /(^|[\\/])local\.properties$/i,
   /credentials?/i,
   /secret/i,
   /\.git-credentials$/i,
   /id_rsa/i,
 ];
 const isSuspicious = (path) => !/\.env\.example$/i.test(path) && SUSPICIOUS_PATTERNS.some((re) => re.test(path));
+
+// ---------------------------------------------------------------------------
+// Auto-detected source changes — so ordinary Tournament development never
+// needs --allow=. This is additive to RELEASE_TOOLING_FILES/--allow= above,
+// not a replacement: those still work for genuine one-off exceptions.
+//
+// Design: allow-by-recognized-active-source-root, then deny specific known
+// legacy/generated/machine-specific paths within it. Prefix-based (not a
+// per-file list), so a brand-new file under an allowed root is automatically
+// covered without editing this script again.
+//
+// Most junk categories (node_modules, dist, release, .gradle, Android build/,
+// local.properties, keystores, *.apk/*.aab, *.log, IDE/OS files) are already
+// invisible to `git status` via .gitignore (root and
+// apps/umpire/android/.gitignore, an Android-template gitignore) — this list
+// is defense in depth, making that guarantee explicit here too rather than
+// relying solely on .gitignore staying correct.
+// ---------------------------------------------------------------------------
+const ALLOWED_SOURCE_ROOTS = ["apps/", "packages/", "scripts/", "docs/", "supabase/"];
+const ALLOWED_ROOT_FILES = ["package.json", "package-lock.json"];
+
+// CLAUDE.md §7 — legacy PickleLive material that must never be swept into a
+// release automatically, even though it's real tracked source.
+const LEGACY_PROTECTED_PATHS = [
+  "src/", "index.html", "vite.config.js", "legacy/",
+  "supabase/migrations-applied/",
+  "supabase/functions/submit-match/", "supabase/functions/dupr-webhook-receiver/",
+  "supabase/functions/link-dupr-account/", "supabase/functions/_shared/",
+];
+
+const GENERATED_OUTPUT_PATHS = [
+  "dist/", "dist-slim/", "dist-ssr/", "release/", "node_modules/", "node_modules.broken/",
+  "apps/operator/dist/", "apps/operator/release/", "apps/umpire/dist/",
+  "apps/umpire/android/.gradle/", "apps/umpire/android/build/", "apps/umpire/android/app/build/",
+  "apps/umpire/android/capacitor-cordova-android-plugins/",
+  "apps/umpire/android/app/src/main/assets/public/",
+  ".gradle/", ".turbo/", ".cache/", "coverage/",
+];
+const GENERATED_FILE_PATTERN = /\.(apk|aab|aar|ap_|dex|class|exe|msi|dll|blockmap|hprof|log)$/i;
+const MACHINE_OR_IDE_JUNK = [".vscode/", ".idea/", "local.properties", ".DS_Store", "Thumbs.db", "desktop.ini"];
+
+function startsWithAny(p, prefixes) {
+  return prefixes.some((d) => p === d.replace(/\/$/, "") || p.startsWith(d));
+}
+
+function isReleasableSourcePath(p) {
+  const underRoot = ALLOWED_ROOT_FILES.includes(p) || ALLOWED_SOURCE_ROOTS.some((r) => p.startsWith(r));
+  if (!underRoot) return false;
+  if (startsWithAny(p, LEGACY_PROTECTED_PATHS)) return false;
+  if (startsWithAny(p, GENERATED_OUTPUT_PATHS)) return false;
+  if (GENERATED_FILE_PATTERN.test(p)) return false;
+  if (startsWithAny(p, MACHINE_OR_IDE_JUNK)) return false;
+  return true;
+}
 
 const allowedFiles = new Set(RELEASE_TOOLING_FILES);
 const allowedDirs = [];
@@ -127,7 +189,11 @@ for (const raw of flags.allow) {
   if (p.endsWith("/")) allowedDirs.push(p);
   else allowedFiles.add(p);
 }
-const isAllowedPath = (p) => allowedFiles.has(p) || allowedDirs.some((d) => p.startsWith(d));
+const isAllowedPath = (p) => allowedFiles.has(p) || allowedDirs.some((d) => p.startsWith(d)) || isReleasableSourcePath(p);
+// A rename is only in-bounds when BOTH sides of it are — moving a file INTO
+// or OUT OF a protected/legacy/generated path is still unexpected even if
+// the other side looks fine.
+const isAllowedEntry = (e) => isAllowedPath(e.path) && (!e.renamedFrom || isAllowedPath(e.renamedFrom));
 
 // ---------------------------------------------------------------------------
 // State tracking + failure handling
@@ -415,15 +481,15 @@ check("Working tree contains only changes allowed for this release", () => {
   if (sensitive.length) throw new Error(`Sensitive-looking path(s) — refusing to commit:\n${sensitive.map((e) => `  ${e.path}`).join("\n")}`);
   const versionDirty = initialEntries.filter((e) => VERSION_FILES.includes(e.path));
   if (versionDirty.length) throw new Error(`Version file(s) already modified:\n${versionDirty.map((e) => `  ${e.path}`).join("\n")}\nThe release rewrites these itself; commit or discard those edits first.`);
-  const unexpected = initialEntries.filter((e) => e.renamedFrom || !isAllowedPath(e.path));
+  const unexpected = initialEntries.filter((e) => !isAllowedEntry(e));
   if (unexpected.length) {
     throw new Error(
-      `Unexpected change(s) that this release is not allowed to commit:\n${unexpected.map((e) => `  ${e.code} ${e.path}`).join("\n")}\n` +
-        "Commit or stash them separately first, or — if they really belong in this release — pass each one explicitly with --allow=<path> (or --allow=<dir/>).\n" +
-        `Allowed by default: ${RELEASE_TOOLING_FILES.join(", ")}`
+      `Unexpected change(s) that this release is not allowed to commit:\n${unexpected.map((e) => `  ${e.code} ${e.path}${e.renamedFrom ? ` (from ${e.renamedFrom})` : ""}`).join("\n")}\n` +
+        `This path is outside the recognized Tournament source tree (${ALLOWED_SOURCE_ROOTS.join(", ")}${ALLOWED_ROOT_FILES.length ? `, or one of: ${ALLOWED_ROOT_FILES.join(", ")}` : ""}), or matches a protected/legacy/generated pattern this release never auto-includes.\n` +
+        "Commit or stash it separately first, or — if it really belongs in this release — pass it explicitly with --allow=<path> (or --allow=<dir/>)."
     );
   }
-  return "all changes are on the allowlist";
+  return "all changes are auto-included source, or on the explicit allowlist";
 });
 
 check("Version files are consistent", () => {
@@ -652,7 +718,8 @@ logStep("Commit (explicit allowlist)");
 if (git(["rev-parse", "HEAD"]).trim() !== state.baseSha) fail("Commit", "HEAD moved since preflight — refusing to commit on top of an unexpected state.");
 const postBuildEntries = readWorkingTree();
 const allowedPost = (p) => VERSION_FILES.includes(p) || isAllowedPath(p);
-const strays = postBuildEntries.filter((e) => e.renamedFrom || !allowedPost(e.path));
+const isAllowedPostEntry = (e) => allowedPost(e.path) && (!e.renamedFrom || allowedPost(e.renamedFrom));
+const strays = postBuildEntries.filter((e) => !isAllowedPostEntry(e));
 if (strays.length) {
   fail("Commit", `Unexpected working-tree change(s) appeared after preflight — nothing was staged:\n${strays.map((e) => `  ${e.code} ${e.path}`).join("\n")}`);
 }

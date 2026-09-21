@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Button, Card, EmptyState, SectionHeader, Select, StandingsTable, StatusBadge, Table } from "@tournament/ui";
-import { placementsForDivision, resultFor, scoreLine, sideOf, teamEliminationStandings } from "../lib.js";
+import { placementsForDivision, resultFor, scoreLine, sideOf, teamEliminationStandings, teamStandings } from "../lib.js";
 
 function PodiumCard({ division, placements }) {
   if (!placements.champion) {
@@ -73,6 +73,33 @@ export function ResultsPanel({ data }) {
           <PodiumCard key={d.id} division={d} placements={placementsForDivision(d, data)} />
         ))}
       </div>
+
+      {shownDivisions.filter((d) => d.format === "team_elimination").map((d) => {
+        const teamRows = teamStandings(d, data);
+        if (!teamRows.length) return null;
+        return (
+          <div key={d.id}>
+            <h3>{d.name} — team standings</h3>
+            <p className="muted" style={{ marginTop: 0 }}>Round-robin qualification stage only — semifinal, bronze, and final results aren't included here.</p>
+            <StandingsTable
+              nameHeader="Team"
+              rows={teamRows.map((row) => ({
+                id: row.teamId,
+                rank: row.rank,
+                name: row.teamName,
+                wins: row.wins,
+                losses: row.losses,
+                pointDiff: row.pointDiff,
+              }))}
+              extraColumns={[
+                { key: "matchesPlayed", header: "MP" },
+                { key: "pointsFor", header: "PF" },
+                { key: "pointsAgainst", header: "PA" },
+              ]}
+            />
+          </div>
+        );
+      })}
 
       {shownDivisions.filter((d) => d.format === "team_elimination").map((d) => {
         const standings = teamEliminationStandings(d, data);

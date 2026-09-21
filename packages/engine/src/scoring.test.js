@@ -52,6 +52,40 @@ describe("checkGameWin", () => {
   });
 });
 
+// The "Normal / Juice / All-10" rule: first to reach the game target wins
+// immediately, with no requirement to reach target+1 (deuce). This is
+// winBy: "none" — already implemented generically by checkGameWin above for
+// any winTo — exercised here explicitly at both target 11 and target 15
+// (the Semifinal/Final target choice), since a division's configured winTo
+// is what apps/operator's DivisionsPanel.jsx now lets an organizer set.
+describe("checkGameWin — immediate win at target, no deuce (winBy: none)", () => {
+  test("target 11: 10-10 -> 11-10 wins immediately", () => {
+    expect(checkGameWin(10, 10, 11, "none")).toBe(null);
+    expect(checkGameWin(11, 10, 11, "none")).toBe("A");
+  });
+
+  test("target 11: 10-9 -> 11-9 wins immediately", () => {
+    expect(checkGameWin(10, 9, 11, "none")).toBe(null);
+    expect(checkGameWin(11, 9, 11, "none")).toBe("A");
+  });
+
+  test("target 15: 14-14 -> 15-14 wins immediately", () => {
+    expect(checkGameWin(14, 14, 15, "none")).toBe(null);
+    expect(checkGameWin(15, 14, 15, "none")).toBe("A");
+  });
+
+  test("target 15: 14-12 -> 15-12 wins immediately", () => {
+    expect(checkGameWin(14, 12, 15, "none")).toBe(null);
+    expect(checkGameWin(15, 12, 15, "none")).toBe("A");
+  });
+
+  test("target 15 with winBy 'two' still requires a 2-point lead (unaffected by target choice)", () => {
+    expect(checkGameWin(15, 14, 15)).toBe(null);
+    expect(checkGameWin(16, 14, 15)).toBe("A");
+    expect(checkGameWin(15, 13, 15)).toBe("A");
+  });
+});
+
 describe("createInitialScoreState", () => {
   test("defaults serving team A, bestOf 1, winBy two", () => {
     const st = createInitialScoreState({ winTo: 11, isDoubles: false });
@@ -106,6 +140,36 @@ describe("applyScoreEvent — side-out singles", () => {
     st = pressUntil(st, "a", s => s.status === "completed");
     expect(st.winner).toBe("A");
     expect(st.scoreA).toBe(11);
+  });
+});
+
+describe("applyScoreEvent — immediate win at target via the real scoring path", () => {
+  // Deterministically reaches an exact prior score via a "correction" event
+  // (the same engine primitive an organizer/umpire correction uses) so the
+  // very next point lands on the exact score the product owner specified,
+  // without depending on side-out rally sequencing to happen to land there.
+  function stateAt(scoreA, scoreB, overrides) {
+    const st0 = createInitialScoreState({ winTo: 11, winBy: "none", bestOf: 1, isDoubles: false, ...overrides });
+    const { state } = applyScoreEvent(st0, ev("c1", "correction", 1, { scoreA, scoreB }));
+    return state;
+  }
+
+  test("target 11, race-to (none): 10-10, next point finishes the game at 11-10", () => {
+    const before = stateAt(10, 10);
+    expect(before.status).toBe("in_progress");
+    const team = before.servingTeam.toLowerCase();
+    const after = applyPoint(before, team, 2).state;
+    expect(after.status).toBe("completed");
+    expect(after.winner).toBe(before.servingTeam);
+  });
+
+  test("target 15, race-to (none): 14-14, next point finishes the game at 15-14", () => {
+    const before = stateAt(14, 14, { winTo: 15 });
+    expect(before.status).toBe("in_progress");
+    const team = before.servingTeam.toLowerCase();
+    const after = applyPoint(before, team, 2).state;
+    expect(after.status).toBe("completed");
+    expect(after.winner).toBe(before.servingTeam);
   });
 });
 

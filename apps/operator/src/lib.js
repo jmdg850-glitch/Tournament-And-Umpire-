@@ -1,4 +1,4 @@
-import { rankIndividualPairsForSemifinals } from "@tournament/engine";
+import { rankIndividualPairsForSemifinals, buildTeamStandingsFromRoundRobin } from "@tournament/engine";
 
 export const TOURNAMENT_FLOW = [
   "draft",
@@ -213,6 +213,16 @@ export function stageTitle(label) {
   return String(label).replaceAll("_", " ");
 }
 
+// The recommended default shown in the "Match scoring" confirmation dialog
+// before a match starts — the operator can still change it. Falls back to
+// the division's configured target for non-elimination-stage matches. The
+// server independently validates whatever target is actually submitted
+// (see ALLOWED_MATCH_SCORING_TARGETS in packages/api/src/handleCommand.js).
+export function recommendedScoringTarget(match, division) {
+  if (["semifinal", "final", "bronze"].includes(match?.stage_label)) return 15;
+  return Number(division?.config?.winTo) || 11;
+}
+
 export function membersOfParticipant(participantId, participantMembers = []) {
   return participantMembers.filter((m) => m.participant_id === participantId).sort((a, b) => a.slot - b.slot);
 }
@@ -268,11 +278,12 @@ export function resolvePersonByName(text, persons = []) {
   return { text: trimmed, existingPerson };
 }
 
-// Round-robin qualification standings for a team_elimination division — the single
-// source of truth reused by the Brackets tab, the Results tab, and the Excel export
-// (packages/engine's rankIndividualPairsForSemifinals does the actual ranking; this
-// just reshapes this app's persisted rows into what that function expects).
-export function teamEliminationStandings(division, data) {
+// Shared reshaping of this app's persisted rows into what packages/engine's
+// team-elimination round-robin functions expect — used by both
+// teamEliminationStandings (individual pair ranking) and teamStandings
+// (team-level Wins/Losses/Points For/Against) below, so there's exactly one
+// place that reads teams/matches/match_participants/results for this.
+function teamEliminationRoundRobinInputs(division, data) {
   const teams = (data.teams || [])
     .filter((t) => t.division_id === division.id)
     .map((t) => ({
@@ -281,11 +292,20 @@ export function teamEliminationStandings(division, data) {
       pairs: (data.participants || []).filter((p) => p.team_id === t.id).map((p) => ({ id: p.id })),
     }));
   const parents = (data.matches || []).filter((m) => m.division_id === division.id && !m.parent_match_id);
-  const teamMatchups = parents.map((m) => ({
-    id: m.id,
-    stage: m.stage_label === "round_robin" || m.bracket_side === "round_robin" ? "round_robin" : m.stage_label,
-    status: m.status,
-  }));
+  const teamMatchups = parents.map((m) => {
+    const a = (data.matchParticipants || []).find((p) => p.match_id === m.id && p.slot === "A");
+    const b = (data.matchParticipants || []).find((p) => p.match_id === m.id && p.slot === "B");
+    return {
+      id: m.id,
+      stage: m.stage_label === "round_robin" || m.bracket_side === "round_robin" ? "round_robin" : m.stage_label,
+      status: m.status,
+      teamAId: a?.team_id,
+      teamBId: b?.team_id,
+      teamAWins: m.team_a_wins ?? 0,
+      teamBWins: m.team_b_wins ?? 0,
+      winnerTeamId: m.winner === "A" ? a?.team_id : m.winner === "B" ? b?.team_id : null,
+    };
+  });
   const pairMatches = (data.matches || [])
     .filter((m) => m.division_id === division.id && m.parent_match_id)
     .map((m) => {
@@ -305,8 +325,33 @@ export function teamEliminationStandings(division, data) {
         },
       };
     });
+  return { teams, teamMatchups, pairMatches };
+}
+
+// Round-robin qualification standings for a team_elimination division — the single
+// source of truth reused by the Brackets tab, the Results tab, and the Excel export
+// (packages/engine's rankIndividualPairsForSemifinals does the actual ranking; this
+// just reshapes this app's persisted rows into what that function expects).
+export function teamEliminationStandings(division, data) {
+  const { teams, teamMatchups, pairMatches } = teamEliminationRoundRobinInputs(division, data);
   try {
     return rankIndividualPairsForSemifinals(teams, teamMatchups, pairMatches);
+  } catch {
+    return [];
+  }
+}
+
+// Team-level round-robin standings (Wins/Losses/Matches Played/Points For/
+// Against/Diff) for a team_elimination division — round-robin stage only,
+// same scope as teamEliminationStandings above (semifinal/bronze/final
+// results are deliberately excluded, matching this app's existing standings
+// convention — see publicLive/PublicStandingsTab.jsx). Reuses packages/engine's
+// buildTeamStandingsFromRoundRobin, the same tested aggregator the legacy
+// root app already used — not a new ranking algorithm.
+export function teamStandings(division, data) {
+  const { teams, teamMatchups, pairMatches } = teamEliminationRoundRobinInputs(division, data);
+  try {
+    return buildTeamStandingsFromRoundRobin(teams, teamMatchups, pairMatches);
   } catch {
     return [];
   }

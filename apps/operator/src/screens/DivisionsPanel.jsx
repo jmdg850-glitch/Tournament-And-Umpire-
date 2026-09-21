@@ -6,6 +6,7 @@ import { FORMAT_LABEL } from "../lib.js";
 export function DivisionsPanel({ data, busy, run }) {
   const [name, setName] = useState("");
   const [format, setFormat] = useState("single_elim");
+  const [winTo, setWinTo] = useState("11");
   const [qualifierMode, setQualifierMode] = useState("top_x");
   const [qualifierCount, setQualifierCount] = useState("4");
   const [sameTeamPolicy, setSameTeamPolicy] = useState("avoid_semis");
@@ -17,7 +18,7 @@ export function DivisionsPanel({ data, busy, run }) {
       <SectionHeader title="Divisions" description="Group players into competitions, then generate each division's bracket." />
       <Card as="form" className="stack" onSubmit={(e) => {
         e.preventDefault();
-        const config = { winTo: 11, bestOf: 1, winBy: "two", isDoubles: true, bronzeMatch: true };
+        const config = { winTo: Number(winTo) || 11, bestOf: 1, winBy: "none", isDoubles: true, bronzeMatch: true };
         if (format === "team_elimination") {
           config.qualifierMode = qualifierMode;
           config.qualifierCount = progressionMode === "direct_semifinals" ? 4 : Number(qualifierCount) || 4;
@@ -39,6 +40,12 @@ export function DivisionsPanel({ data, busy, run }) {
             <option value="team_elimination">Team elimination</option>
           </Select>
           <Button type="submit" disabled={!!busy}>Add division</Button>
+        </div>
+        <div className="row">
+          <Select label="Game target" value={winTo} onChange={(e) => setWinTo(e.target.value)} hint="This match ends as soon as a team reaches this number.">
+            <option value="11">Race to 11</option>
+            <option value="15">Race to 15</option>
+          </Select>
         </div>
         {format === "team_elimination" && (
           <div className="row">
@@ -91,6 +98,7 @@ export function DivisionsPanel({ data, busy, run }) {
           qualifierCount: String(d.config?.qualifierCount ?? 4),
           sameTeamPolicy: d.config?.sameTeamPolicy || "avoid_semis",
           progressionMode: d.config?.progressionMode || "playoffs",
+          winTo: String(d.config?.winTo ?? 11),
         };
         return (
           <Card className="stack" key={d.id}>
@@ -118,6 +126,27 @@ export function DivisionsPanel({ data, busy, run }) {
                 )}
               </div>
             </div>
+            <form className="row" onSubmit={(e) => {
+              e.preventDefault();
+              run("Update division", "update_division", {
+                division_id: d.id,
+                config: {
+                  winTo: Number(cfg.winTo) || 11,
+                  winBy: "none",
+                },
+              });
+            }}>
+              <Select
+                label="Game target"
+                value={cfg.winTo}
+                onChange={(e) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, winTo: e.target.value } }))}
+                hint="This match ends as soon as a team reaches this number. Applies to newly started matches — this is the default an operator/umpire is shown when starting a match, and can still be confirmed or changed per match."
+              >
+                <option value="11">Race to 11</option>
+                <option value="15">Race to 15</option>
+              </Select>
+              <Button type="submit" variant="secondary" disabled={!!busy}>Save scoring</Button>
+            </form>
             {d.format === "team_elimination" && (
               <form className="row" onSubmit={(e) => {
                 e.preventDefault();

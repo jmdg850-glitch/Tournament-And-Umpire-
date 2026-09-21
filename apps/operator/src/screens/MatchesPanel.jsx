@@ -9,6 +9,7 @@ import {
   normalizePersonName,
   personLabel,
   playableMatches,
+  recommendedScoringTarget,
   resolvePersonByName,
   resultFor,
   scoreLine,
@@ -358,8 +359,10 @@ const OVERRIDE_START_REASONS = [
 function OverrideStartModal({ match, data, command, onClose, onSaved }) {
   const a = sideOf(match.id, "A", data);
   const b = sideOf(match.id, "B", data);
+  const division = (data.divisions || []).find((d) => d.id === match.division_id);
   const [reasonChoice, setReasonChoice] = useState("");
   const [customReason, setCustomReason] = useState("");
+  const [winTo, setWinTo] = useState(() => recommendedScoringTarget(match, division));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -373,7 +376,7 @@ function OverrideStartModal({ match, data, command, onClose, onSaved }) {
     setBusy(true);
     setError("");
     try {
-      await command("start_match", { match_id: match.id, override: true, reason }, { durable: true });
+      await command("start_match", { match_id: match.id, override: true, reason, scoring_override: { winTo } }, { durable: true });
       await onSaved?.();
       onClose();
     } catch (err) {
@@ -388,6 +391,16 @@ function OverrideStartModal({ match, data, command, onClose, onSaved }) {
       <div className="stack">
         <Alert>This bypasses the normal umpire start flow. Use only when the umpire cannot start the match.</Alert>
         <p className="muted" style={{ margin: 0 }}>{a.name} vs {b.name}</p>
+        <Select
+          label="How many points?"
+          value={String(winTo)}
+          onChange={(e) => setWinTo(Number(e.target.value))}
+          disabled={busy}
+          hint="This match ends as soon as a team reaches this number."
+        >
+          <option value="11">Race to 11</option>
+          <option value="15">Race to 15</option>
+        </Select>
         <Select label="Reason" value={reasonChoice} onChange={(e) => setReasonChoice(e.target.value)} disabled={busy}>
           <option value="">Select a reason…</option>
           {OVERRIDE_START_REASONS.map((r) => <option key={r} value={r}>{r}</option>)}

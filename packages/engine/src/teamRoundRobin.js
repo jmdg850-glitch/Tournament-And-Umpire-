@@ -51,8 +51,13 @@ export function assertNoRepeatPairOpponents(pairMatches) {
   }
 }
 
-export function buildTeamStandingsFromRoundRobin(teams, teamMatchups){
-  const rows = new Map(teams.map(t => [t.teamId, { teamId:t.teamId, teamName:t.teamName, wins:0, losses:0, matchesPlayed:0, pairMatchWins:0, pairMatchLosses:0, pairWinMargin:0 }]));
+// `pairMatches` is optional (third param) — when provided (the same
+// per-pair round-robin match rows rankIndividualPairsForSemifinals reads),
+// raw rally points are aggregated up to each pair's team, purely additive:
+// Points For/Against/Diff. Team rank/tiebreak order (wins -> head-to-head ->
+// pairWinMargin -> stable) is completely unchanged either way.
+export function buildTeamStandingsFromRoundRobin(teams, teamMatchups, pairMatches){
+  const rows = new Map(teams.map(t => [t.teamId, { teamId:t.teamId, teamName:t.teamName, wins:0, losses:0, matchesPlayed:0, pairMatchWins:0, pairMatchLosses:0, pairWinMargin:0, pointsFor:0, pointsAgainst:0, pointDiff:0 }]));
   const completed = (teamMatchups||[]).filter(m => m.stage === "round_robin" && m.status === "completed" && m.teamAId && m.teamBId);
 
   for (const m of completed){
@@ -64,6 +69,22 @@ export function buildTeamStandingsFromRoundRobin(teams, teamMatchups){
     a.pairWinMargin += (m.teamAWins - m.teamBWins); b.pairWinMargin += (m.teamBWins - m.teamAWins);
     if (m.winnerTeamId === m.teamAId){ a.wins++; b.losses++; }
     else if (m.winnerTeamId === m.teamBId){ b.wins++; a.losses++; }
+  }
+
+  if (pairMatches && pairMatches.length) {
+    const registrationToTeam = new Map();
+    for (const team of teams) for (const pair of team.pairs) registrationToTeam.set(pair.id, team.teamId);
+    const roundRobinMatchupIds = new Set(completed.map(m => m.id));
+    for (const pm of pairMatches){
+      if (pm.status !== "completed" || !roundRobinMatchupIds.has(pm.teamMatchupId)) continue;
+      const a = rows.get(registrationToTeam.get(pm.registrationAId));
+      const b = rows.get(registrationToTeam.get(pm.registrationBId));
+      if (!a || !b) continue;
+      const ptsA = pm.score?.scoreA ?? 0, ptsB = pm.score?.scoreB ?? 0;
+      a.pointsFor += ptsA; a.pointsAgainst += ptsB;
+      b.pointsFor += ptsB; b.pointsAgainst += ptsA;
+    }
+    for (const r of rows.values()) r.pointDiff = r.pointsFor - r.pointsAgainst;
   }
 
   const headToHeadWinner = (idA, idB) => {

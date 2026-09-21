@@ -1442,6 +1442,73 @@ describe.skipIf(!live)("Operator Override Start (start_match by organizer, not t
   }, 90_000);
 });
 
+describe.skipIf(!live)("start_match scoring_override (per-match target confirmation)", () => {
+  let organizer;
+  let umpire;
+
+  beforeAll(async () => {
+    organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+    umpire = await signIn("umpire.dev@tournament.local", "dev-umpire-pass");
+  }, 30_000);
+
+  async function setupScoringOverrideMatch(divisionWinTo) {
+    let r = await expectOk(organizer.token, "create_tournament", { name: `SO ${Date.now()}` });
+    const tournamentId = r.body.result.tournament.id;
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+    r = await expectOk(organizer.token, "create_division", {
+      tournament_id: tournamentId, name: "Scoring Override", format: "single_elim",
+      config: { winTo: divisionWinTo, winBy: "two", bestOf: 1, isDoubles: true },
+    });
+    const divisionId = r.body.result.division.id;
+    const persons = [];
+    for (const n of ["SO Ada", "SO Bea", "SO Cy", "SO Dee"]) {
+      r = await expectOk(organizer.token, "add_person", { tournament_id: tournamentId, display_name: n });
+      persons.push(r.body.result.person);
+    }
+    for (const [i, p] of persons.entries()) {
+      await expectOk(organizer.token, "register_participant", {
+        division_id: divisionId, kind: "doubles", display_name: p.display_name, seed: i + 1, person_ids: [p.id],
+      });
+    }
+    await expectOk(organizer.token, "add_member", { tournament_id: tournamentId, user_id: umpire.user.id, role: "umpire" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration_closed" });
+    await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "ready" });
+    await expectOk(organizer.token, "generate_bracket", { division_id: divisionId });
+    const { data: matches } = await organizer.client.from("matches").select("*").eq("division_id", divisionId).eq("status", "scheduled");
+    const matchId = matches[0].id;
+    const courtR = await expectOk(organizer.token, "create_court", { tournament_id: tournamentId, name: "SO Court" });
+    await expectOk(organizer.token, "assign_court", { match_id: matchId, court_id: courtR.body.result.court.id });
+    await expectOk(organizer.token, "assign_umpire", { match_id: matchId, user_id: umpire.user.id });
+    return { matchId };
+  }
+
+  test("a scoring_override at start overrides the division's default target, and is always immediate-win (winBy: none)", async () => {
+    const { matchId } = await setupScoringOverrideMatch(11);
+    const r = await expectOk(umpire.token, "start_match", { match_id: matchId, scoring_override: { winTo: 15 } });
+    expect(r.body.result.match.score_state.winTo).toBe(15);
+    expect(r.body.result.match.score_state.winBy).toBe("none");
+  }, 60_000);
+
+  test("an invalid scoring_override.winTo is rejected and the match is not started", async () => {
+    const { matchId } = await setupScoringOverrideMatch(11);
+    const badR = await send(umpire.token, "start_match", { match_id: matchId, scoring_override: { winTo: 13 } });
+    expect(badR.body.ok).toBe(false);
+    expect(badR.body.error.code).toBe("INVALID_COMMAND");
+    const { data: after } = await organizer.client.from("matches").select("*").eq("id", matchId).maybeSingle();
+    expect(after.status).not.toBe("in_progress");
+  }, 60_000);
+
+  test("omitting scoring_override falls back to the division's configured target, still immediate-win (winBy: none)", async () => {
+    const { matchId } = await setupScoringOverrideMatch(11);
+    const r = await expectOk(umpire.token, "start_match", { match_id: matchId });
+    expect(r.body.result.match.score_state.winTo).toBe(11);
+    // The division was created with winBy: "two" (legacy-looking config), but
+    // this product no longer honors deuce — scoringSettings() always returns
+    // winBy: "none" regardless of what a division's config says.
+    expect(r.body.result.match.score_state.winBy).toBe("none");
+  }, 60_000);
+});
+
 describe.skipIf(!live)("Match integrity: self-match and cross-team protection (update_match_participant)", () => {
   let organizer;
 

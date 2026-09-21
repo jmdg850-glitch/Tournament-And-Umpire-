@@ -143,6 +143,7 @@ export default function LiveMatchWindow({ supabase, session, tournamentId, match
           <>
             <div className="game">Game {score.gameNumber || 1}</div>
             <div className="muted">{match.stage_label ? String(match.stage_label).replaceAll("_", " ") : `Round ${match.round}`}</div>
+            {score.winTo ? <div className="muted">Race to {score.winTo}</div> : null}
           </>
         )}
       />

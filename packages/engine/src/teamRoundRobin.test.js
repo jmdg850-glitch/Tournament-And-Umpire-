@@ -90,6 +90,83 @@ describe("buildTeamStandingsFromRoundRobin", () => {
   });
 });
 
+describe("buildTeamStandingsFromRoundRobin — Points For/Against/Diff", () => {
+  test("aggregates raw pair-match points up to each pair's team; existing wins/losses/margin fields and rank order are unaffected", () => {
+    const teams = buildTeams(3, 2);
+    const [A, B, C] = teams.map((t) => t.teamId);
+    const teamMatchups = [
+      { id: "m1", stage: "round_robin", status: "completed", teamAId: A, teamBId: B, teamAWins: 2, teamBWins: 0, winnerTeamId: A },
+      { id: "m2", stage: "round_robin", status: "completed", teamAId: A, teamBId: C, teamAWins: 1, teamBWins: 1, winnerTeamId: null },
+      { id: "m3", stage: "round_robin", status: "completed", teamAId: B, teamBId: C, teamAWins: 0, teamBWins: 2, winnerTeamId: C },
+    ];
+    const pairMatches = [
+      { teamMatchupId: "m1", status: "completed", registrationAId: "team0-r0", registrationBId: "team1-r0", score: { scoreA: 11, scoreB: 6 } },
+      { teamMatchupId: "m1", status: "completed", registrationAId: "team0-r1", registrationBId: "team1-r1", score: { scoreA: 11, scoreB: 8 } },
+      { teamMatchupId: "m2", status: "completed", registrationAId: "team0-r0", registrationBId: "team2-r0", score: { scoreA: 11, scoreB: 9 } },
+      { teamMatchupId: "m2", status: "completed", registrationAId: "team0-r1", registrationBId: "team2-r1", score: { scoreA: 7, scoreB: 11 } },
+      { teamMatchupId: "m3", status: "completed", registrationAId: "team1-r0", registrationBId: "team2-r0", score: { scoreA: 4, scoreB: 11 } },
+      { teamMatchupId: "m3", status: "completed", registrationAId: "team1-r1", registrationBId: "team2-r1", score: { scoreA: 9, scoreB: 11 } },
+    ];
+    const withPoints = buildTeamStandingsFromRoundRobin(teams, teamMatchups, pairMatches);
+    const withoutPoints = buildTeamStandingsFromRoundRobin(teams, teamMatchups);
+    const a = withPoints.find((s) => s.teamId === A);
+    const b = withPoints.find((s) => s.teamId === B);
+    const c = withPoints.find((s) => s.teamId === C);
+
+    expect(a.pointsFor).toBe(40); // 11+11+11+7
+    expect(a.pointsAgainst).toBe(34); // 6+8+9+11
+    expect(a.pointDiff).toBe(6);
+
+    expect(b.pointsFor).toBe(27); // 6+8+4+9
+    expect(b.pointsAgainst).toBe(44); // 11+11+11+11
+    expect(b.pointDiff).toBe(-17);
+
+    expect(c.pointsFor).toBe(42); // 9+11+11+11
+    expect(c.pointsAgainst).toBe(31); // 11+7+4+9
+    expect(c.pointDiff).toBe(11);
+
+    // Adding points is purely additive — rank order, wins/losses/margin identical either way.
+    expect(withPoints.map((s) => [s.teamId, s.wins, s.losses, s.pairWinMargin, s.rank])).toEqual(
+      withoutPoints.map((s) => [s.teamId, s.wins, s.losses, s.pairWinMargin, s.rank])
+    );
+  });
+
+  test("omitting pairMatches leaves Points For/Against/Diff at zero", () => {
+    const teams = buildTeams(2, 2);
+    const [A, B] = teams.map((t) => t.teamId);
+    const teamMatchups = [
+      { id: "m1", stage: "round_robin", status: "completed", teamAId: A, teamBId: B, teamAWins: 2, teamBWins: 0, winnerTeamId: A },
+    ];
+    const standings = buildTeamStandingsFromRoundRobin(teams, teamMatchups);
+    for (const row of standings) {
+      expect(row.pointsFor).toBe(0);
+      expect(row.pointsAgainst).toBe(0);
+      expect(row.pointDiff).toBe(0);
+    }
+  });
+
+  test("excludes non-round-robin-stage and non-completed pair matches from Points For/Against", () => {
+    const teams = buildTeams(2, 1);
+    const [A, B] = teams.map((t) => t.teamId);
+    const teamMatchups = [
+      { id: "rr1", stage: "round_robin", status: "completed", teamAId: A, teamBId: B, teamAWins: 1, teamBWins: 0, winnerTeamId: A },
+      { id: "sf1", stage: "semifinal", status: "completed", teamAId: A, teamBId: B, teamAWins: 1, teamBWins: 0, winnerTeamId: A },
+    ];
+    const pairMatches = [
+      { teamMatchupId: "rr1", status: "completed", registrationAId: "team0-r0", registrationBId: "team1-r0", score: { scoreA: 11, scoreB: 5 } },
+      // Same pair, but the "semifinal" matchup — must not be pulled into round-robin standings.
+      { teamMatchupId: "sf1", status: "completed", registrationAId: "team0-r0", registrationBId: "team1-r0", score: { scoreA: 15, scoreB: 2 } },
+    ];
+    const standings = buildTeamStandingsFromRoundRobin(teams, teamMatchups, pairMatches);
+    const a = standings.find((s) => s.teamId === A);
+    const b = standings.find((s) => s.teamId === B);
+    expect(a.pointsFor).toBe(11);
+    expect(a.pointsAgainst).toBe(5);
+    expect(b.pointsFor).toBe(5);
+    expect(b.pointsAgainst).toBe(11);
+  });
+});
+
 describe("isTeamRoundRobinComplete", () => {
   test("false with no round-robin rows, false while any is incomplete, true once all are completed", () => {
     expect(isTeamRoundRobinComplete([])).toBe(false);
@@ -222,6 +299,20 @@ describe("end-to-end: round robin -> Team Standings (unchanged) + Individual ran
 
     const standings = buildTeamStandingsFromRoundRobin(teams, completedMatchups);
     expect(standings.map(s => s.teamId)).toEqual(["team0","team1","team2","team3","team4"]);
+
+    // Points For/Against: team0 is the lowest-numbered team, so per the
+    // winner rule above it wins every pair match 11-5 against all 4 other
+    // teams — each team-matchup has 5*4=20 cross pair matches (see
+    // generateTeamRoundRobinMatchups' own "10 * 20" assertion above), so
+    // team0 plays 4 team-matchups * 20 = 80 pair matches, all won 11-5.
+    // team4, the highest-numbered, loses all of its 80 the same way.
+    const standingsWithPoints = buildTeamStandingsFromRoundRobin(teams, completedMatchups, completedPairMatches);
+    const team0 = standingsWithPoints.find(s => s.teamId === "team0");
+    const team4 = standingsWithPoints.find(s => s.teamId === "team4");
+    expect(team0.pointsFor).toBe(880); expect(team0.pointsAgainst).toBe(400); expect(team0.pointDiff).toBe(480);
+    expect(team4.pointsFor).toBe(400); expect(team4.pointsAgainst).toBe(880); expect(team4.pointDiff).toBe(-480);
+    // Adding points doesn't change rank/wins/losses — same order as the points-less call above.
+    expect(standingsWithPoints.map(s => s.teamId)).toEqual(standings.map(s => s.teamId));
 
     const ranked = rankIndividualPairsForSemifinals(teams, completedMatchups, completedPairMatches);
     expect(ranked.length).toBe(25);
