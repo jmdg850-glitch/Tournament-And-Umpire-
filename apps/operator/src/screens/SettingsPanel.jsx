@@ -1,20 +1,19 @@
 import { useState } from "react";
-import { Button, Card, Checkbox, Input, SectionHeader } from "@tournament/ui";
-import { liveShareUrl } from "../lib.js";
-import { UrlQr } from "../urlQr.jsx";
+import { Badge, Button, Card, Checkbox, Input, Modal, SectionHeader } from "@tournament/ui";
+import { liveShareUrl, resolveShareOrigin } from "../lib.js";
+import { UrlQr, buildQrSvg } from "../urlQr.jsx";
 
 export function SettingsPanel({ t, busy, run }) {
   const [name, setName] = useState(t.name);
   const dirty = name.trim() !== t.name;
-  const [showQr, setShowQr] = useState(false);
+  const [showQrModal, setShowQrModal] = useState(false);
   const [copied, setCopied] = useState(false);
-  // A spectator link only makes sense in a real browser at a real origin —
-  // window.location.origin under Electron's file:// load isn't shareable, so
-  // the copy-link/QR controls are hidden there rather than showing a broken
-  // or guessed URL (see publicLive/route.js for the /live/<slug> route this
-  // links to).
-  const httpOrigin = typeof window !== "undefined" && /^https?:$/.test(window.location.protocol);
-  const shareUrl = httpOrigin && t.slug ? liveShareUrl(window.location.origin, t.slug) : null;
+  // Works in both the web app (real http(s) origin) and the Electron desktop
+  // app (file://, which falls back to the production web origin) — see
+  // resolveShareOrigin in lib.js and publicLive/route.js for the /live/<slug>
+  // route this links to. The Operator app never needs the separate website
+  // just to obtain this link/QR.
+  const shareUrl = t.slug ? liveShareUrl(resolveShareOrigin(typeof window !== "undefined" ? window : null), t.slug) : null;
 
   async function copyLink() {
     if (!shareUrl) return;
@@ -24,6 +23,24 @@ export function SettingsPanel({ t, busy, run }) {
       window.setTimeout(() => setCopied(false), 2000);
     } catch {
       // Clipboard API unavailable — the share-link field itself is still selectable/copyable by hand.
+    }
+  }
+
+  function downloadQr() {
+    if (!shareUrl) return;
+    try {
+      const svg = buildQrSvg(shareUrl, { alt: "Live tournament page QR code" });
+      const blob = new Blob([svg], { type: "image/svg+xml" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${t.slug}-live-qr.svg`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      // Best-effort — UrlQr already surfaces a "QR unavailable" fallback inline.
     }
   }
 
@@ -48,21 +65,38 @@ export function SettingsPanel({ t, busy, run }) {
           />
           <span>{t.is_public ? "Public — anyone with the link can view" : "Private — not visible to spectators"}</span>
         </label>
-        {t.is_public && t.slug ? (
-          httpOrigin ? (
-            <div className="stack" style={{ gap: 10 }}>
-              <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+        {t.is_public && shareUrl ? (
+          <div className="stack" style={{ gap: 10 }}>
+            <Badge tone="live">● LIVE</Badge>
+            <p className="muted">Share this tournament publicly — scan the QR code or copy the link to view the live tournament.</p>
+            <div className="row" style={{ gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+              <UrlQr url={shareUrl} size={140} />
+              <div className="stack" style={{ gap: 10, flex: "1 1 260px", minWidth: 220 }}>
                 <Input label="Share link" value={shareUrl} readOnly onFocus={(e) => e.target.select()} />
-                <Button variant="secondary" type="button" onClick={copyLink}>{copied ? "Copied!" : "Copy link"}</Button>
-                <Button variant="secondary" type="button" onClick={() => setShowQr((v) => !v)}>{showQr ? "Hide QR" : "Show QR"}</Button>
+                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                  <Button variant="secondary" type="button" onClick={copyLink}>{copied ? "Copied!" : "Copy Link"}</Button>
+                  <Button variant="secondary" type="button" onClick={() => setShowQrModal(true)}>Show QR</Button>
+                </div>
               </div>
-              {showQr ? <UrlQr url={shareUrl} /> : null}
             </div>
-          ) : (
-            <p className="muted">Open the Tournament Operator website (not the desktop app) to copy the shareable link or QR code.</p>
-          )
+          </div>
         ) : null}
       </Card>
+
+      {showQrModal && shareUrl ? (
+        <Modal title="Public Live" onClose={() => setShowQrModal(false)}>
+          <div className="stack" style={{ gap: 12, alignItems: "center", textAlign: "center" }}>
+            <UrlQr url={shareUrl} size={280} />
+            <p className="muted">Scan to view the live tournament</p>
+            <Input label="Share link" value={shareUrl} readOnly onFocus={(e) => e.target.select()} />
+            <div className="row" style={{ gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
+              <Button variant="secondary" type="button" onClick={copyLink}>{copied ? "Copied!" : "Copy Link"}</Button>
+              <Button variant="secondary" type="button" onClick={downloadQr}>Download QR</Button>
+              <Button type="button" onClick={() => setShowQrModal(false)}>Close</Button>
+            </div>
+          </div>
+        </Modal>
+      ) : null}
     </div>
   );
 }

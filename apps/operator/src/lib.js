@@ -357,3 +357,17 @@ export function pairingQrText(payload) {
 export function liveShareUrl(origin, slugOrId) {
   return `${origin}/live/${slugOrId}`;
 }
+
+// The deployed web origin, used as a fallback below. Also asserted directly
+// in lib.test.js so a drift between the two is caught.
+export const PUBLIC_LIVE_PRODUCTION_ORIGIN = "https://tournament-operator.vercel.app";
+
+// Electron loads the UI from file://, which has no real, shareable origin —
+// window.location.origin there is useless for a link/QR a phone can open.
+// Fall back to the production web origin so the desktop app can still show a
+// working Public Live share link/QR instead of punting to "open the website".
+export function resolveShareOrigin(win) {
+  const protocol = win?.location?.protocol;
+  const origin = win?.location?.origin;
+  return /^https?:$/.test(protocol || "") && origin ? origin : PUBLIC_LIVE_PRODUCTION_ORIGIN;
+}

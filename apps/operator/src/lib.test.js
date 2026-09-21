@@ -6,7 +6,7 @@
 // of resolvePersonByName/normalizePersonName, fully exercised below.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizePersonName, resolvePersonByName, liveShareUrl } from "./lib.js";
+import { normalizePersonName, resolvePersonByName, liveShareUrl, resolveShareOrigin, PUBLIC_LIVE_PRODUCTION_ORIGIN } from "./lib.js";
 
 const persons = [
   { id: "p1", display_name: "Rem" },
@@ -84,4 +84,18 @@ test("liveShareUrl: builds the share link for a slug", () => {
 test("liveShareUrl: builds the share link for a raw uuid", () => {
   const id = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
   assert.equal(liveShareUrl("https://tournament-operator.vercel.app", id), `https://tournament-operator.vercel.app/live/${id}`);
+});
+
+test("resolveShareOrigin: uses the real origin in a browser (http/https)", () => {
+  assert.equal(resolveShareOrigin({ location: { protocol: "https:", origin: "https://tournament-operator.vercel.app" } }), "https://tournament-operator.vercel.app");
+  assert.equal(resolveShareOrigin({ location: { protocol: "http:", origin: "http://localhost:5174" } }), "http://localhost:5174");
+});
+
+test("resolveShareOrigin: falls back to the production origin under Electron (file:)", () => {
+  assert.equal(resolveShareOrigin({ location: { protocol: "file:", origin: "file://" } }), PUBLIC_LIVE_PRODUCTION_ORIGIN);
+});
+
+test("resolveShareOrigin: falls back to the production origin when there is no window", () => {
+  assert.equal(resolveShareOrigin(null), PUBLIC_LIVE_PRODUCTION_ORIGIN);
+  assert.equal(resolveShareOrigin(undefined), PUBLIC_LIVE_PRODUCTION_ORIGIN);
 });
