@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld("tournamentDesktop", {
   onAuthCallback: (cb) => {
     ipcRenderer.on("auth-callback", (_event, url) => cb(url));
   },
+  getLicenseDevice: () => ipcRenderer.invoke("license:get-device"),
   openLiveWindow: (payload) => ipcRenderer.invoke("open-live-window", {
     tournamentId: payload?.tournamentId,
     matchId: payload?.matchId,

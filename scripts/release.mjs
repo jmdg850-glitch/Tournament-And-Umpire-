@@ -3,11 +3,12 @@
 // or `npm run release -- minor` / `npm run release -- major`.
 //
 // Any working-tree change under a recognized Tournament source root (apps/,
-// packages/, scripts/, docs/, supabase/ minus its legacy subpaths) or the
-// root package.json/package-lock.json is auto-included — see
-// isReleasableSourcePath() below. No --allow= is needed for ordinary
-// Tournament development. --allow= remains available for genuine exceptions
-// (a path outside those roots that really belongs in this release).
+// packages/, scripts/, docs/, supabase/ minus its legacy subpaths) or one of
+// the named root files (package.json, package-lock.json, CLAUDE.md) is
+// auto-included — see isReleasableSourcePath() below. No --allow= is needed
+// for ordinary Tournament development. --allow= remains available for
+// genuine exceptions (a path outside those roots that really belongs in this
+// release).
 //
 //   npm run release -- --preflight-only        run every preflight check, change nothing
 //   npm run release -- --allow=<path-or-dir/>  explicitly allow one more dirty path
@@ -134,7 +135,11 @@ const isSuspicious = (path) => !/\.env\.example$/i.test(path) && SUSPICIOUS_PATT
 // relying solely on .gitignore staying correct.
 // ---------------------------------------------------------------------------
 const ALLOWED_SOURCE_ROOTS = ["apps/", "packages/", "scripts/", "docs/", "supabase/"];
-const ALLOWED_ROOT_FILES = ["package.json", "package-lock.json"];
+// Named exceptions only — never a wildcard for "any root file". Each entry
+// here is a specific, tracked, non-sensitive project file; everything else at
+// the repo root still needs --allow= or a separate commit. Still subject to
+// isSuspicious() like any other path (see the sensitive-path check above).
+const ALLOWED_ROOT_FILES = ["package.json", "package-lock.json", "CLAUDE.md"];
 
 // CLAUDE.md §7 — legacy PickleLive material that must never be swept into a
 // release automatically, even though it's real tracked source.
@@ -354,6 +359,31 @@ function readPackageVersion(pkgPath) {
   return match[1];
 }
 
+// The specific field(s) inside a VERSION_FILES entry that the release itself
+// owns — as opposed to the rest of the file (scripts, deps, other JSON keys),
+// which is ordinary source content and may legitimately be dirty going into a
+// release (e.g. a new test script). Returns a stable string so two extracts
+// can be compared with ===.
+function protectedVersionFieldsOf(rel, raw) {
+  if (rel === "apps/umpire/android/app/build.gradle") {
+    const code = raw.match(/versionCode\s+(\d+)/);
+    const name = raw.match(/versionName\s+"([^"]+)"/);
+    return `versionCode=${code ? code[1] : "<missing>"} versionName=${name ? name[1] : "<missing>"}`;
+  }
+  const match = raw.match(/"version":\s*"([^"]+)"/);
+  return `version=${match ? match[1] : "<missing>"}`;
+}
+
+// True if a dirty VERSION_FILES entry's protected field(s) differ from what's
+// committed at HEAD — i.e. someone hand-edited the version instead of letting
+// the release bump it. Unrelated edits to the same file (scripts, deps, ...)
+// do not trip this.
+function protectedVersionFieldChanged(rel) {
+  const headRaw = git(["show", `HEAD:${rel}`]);
+  const workingRaw = readFileSync(resolve(root, rel), "utf8");
+  return protectedVersionFieldsOf(rel, headRaw) !== protectedVersionFieldsOf(rel, workingRaw);
+}
+
 // `git status --porcelain=v1 -z`: NUL-separated, never quoted, untracked
 // directories expanded to individual files. A rename/copy entry is followed by
 // an extra NUL field holding the original path.
@@ -479,8 +509,27 @@ check("Working tree contains only changes allowed for this release", () => {
   for (const e of initialEntries) console.log(`           ${e.code} ${e.path}${e.renamedFrom ? ` (from ${e.renamedFrom})` : ""}`);
   const sensitive = initialEntries.filter((e) => isSuspicious(e.path));
   if (sensitive.length) throw new Error(`Sensitive-looking path(s) — refusing to commit:\n${sensitive.map((e) => `  ${e.path}`).join("\n")}`);
+  // VERSION_FILES may be dirty going in for reasons unrelated to the version
+  // itself (new scripts, deps, licensing changes, ...) — the release rewrites
+  // only the version field(s), so only a manual edit to those specific fields
+  // is rejected here. Everything else in the file is ordinary source content,
+  // checked like any other path below.
   const versionDirty = initialEntries.filter((e) => VERSION_FILES.includes(e.path));
-  if (versionDirty.length) throw new Error(`Version file(s) already modified:\n${versionDirty.map((e) => `  ${e.path}`).join("\n")}\nThe release rewrites these itself; commit or discard those edits first.`);
+  const versionFieldEdited = versionDirty.filter((e) => {
+    if (e.code === "??" || /^A/.test(e.code)) throw new Error(`${e.path} is untracked/newly added — this is one of the release's own version files and must already be tracked with committed history.`);
+    if (e.renamedFrom) throw new Error(`${e.path} was renamed (from ${e.renamedFrom}) — this is one of the release's own version files and must not be renamed.`);
+    try {
+      return protectedVersionFieldChanged(e.path);
+    } catch (err) {
+      throw new Error(`Could not read the committed version field of ${e.path} to compare against the working tree: ${err.message}`);
+    }
+  });
+  if (versionFieldEdited.length) {
+    throw new Error(
+      `Version field manually changed in protected file(s):\n${versionFieldEdited.map((e) => `  ${e.path}`).join("\n")}\n` +
+        "The release bumps these itself; revert the version (and, for the Android file, versionCode/versionName) field(s) before running it. Other edits in the same file (scripts, dependencies, etc.) are fine and do not need to be reverted."
+    );
+  }
   const unexpected = initialEntries.filter((e) => !isAllowedEntry(e));
   if (unexpected.length) {
     throw new Error(

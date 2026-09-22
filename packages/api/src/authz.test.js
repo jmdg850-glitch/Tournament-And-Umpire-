@@ -1,10 +1,12 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   requireOrganizer,
   canScoreMatch,
   canScoreAsStation,
   assertStationMayIssue,
   assertAllowedScoreEventType,
+  requireLicense,
+  requireOrganizerLicensed,
   STATION_COMMANDS,
   STATION_FORBIDDEN_COMMANDS,
 } from "./authz.js";
@@ -83,5 +85,159 @@ describe("httpError", () => {
     const err = httpError(409, "ILLEGAL_TRANSITION", "nope");
     expect(err.status).toBe(409);
     expect(err.code).toBe("ILLEGAL_TRANSITION");
+  });
+});
+
+// Fresh, never-reused email per test — requireLicense caches *positive*
+// results in a module-level singleton, so sharing an email across tests
+// would leak cache state between them.
+let licenseEmailCounter = 0;
+function freshEmail() {
+  licenseEmailCounter += 1;
+  return `license-test-${licenseEmailCounter}@example.com`;
+}
+
+function mockLicensesAdmin(rows) {
+  const state = { calls: 0, eqArgs: [] };
+  const admin = {
+    from(table) {
+      if (table !== "licenses") throw new Error(`unexpected table ${table}`);
+      return {
+        select: () => ({
+          eq: (col, val) => {
+            state.eqArgs.push([col, val]);
+            return {
+              order: async () => {
+                state.calls += 1;
+                return { data: rows, error: null };
+              },
+            };
+          },
+        }),
+      };
+    },
+  };
+  return { admin, state };
+}
+
+const throwingAdmin = {
+  from() {
+    throw new Error("licenses table should not have been queried");
+  },
+};
+
+describe("requireLicense", () => {
+  test("station actors are never license-gated and never query the DB", async () => {
+    await expect(requireLicense(throwingAdmin, { kind: "station", deviceId: "d1" })).resolves.toBeUndefined();
+  });
+
+  test("no license row for the email -> LICENSE_REQUIRED", async () => {
+    const { admin } = mockLicensesAdmin([]);
+    await expect(requireLicense(admin, { kind: "user", email: freshEmail() }))
+      .rejects.toMatchObject({ status: 403, code: "LICENSE_REQUIRED" });
+  });
+
+  test("status unused -> LICENSE_REQUIRED", async () => {
+    const { admin } = mockLicensesAdmin([{ status: "unused", expires_at: null }]);
+    await expect(requireLicense(admin, { kind: "user", email: freshEmail() }))
+      .rejects.toMatchObject({ status: 403, code: "LICENSE_REQUIRED" });
+  });
+
+  test("status revoked -> LICENSE_INVALID", async () => {
+    const { admin } = mockLicensesAdmin([{ status: "revoked", expires_at: null }]);
+    await expect(requireLicense(admin, { kind: "user", email: freshEmail() }))
+      .rejects.toMatchObject({ status: 403, code: "LICENSE_INVALID" });
+  });
+
+  test("status active but expired -> LICENSE_INVALID", async () => {
+    const { admin } = mockLicensesAdmin([{ status: "active", expires_at: "2000-01-01T00:00:00.000Z" }]);
+    await expect(requireLicense(admin, { kind: "user", email: freshEmail() }))
+      .rejects.toMatchObject({ status: 403, code: "LICENSE_INVALID" });
+  });
+
+  test("status active with no expiry or a future expiry passes", async () => {
+    const { admin: noExpiry } = mockLicensesAdmin([{ status: "active", expires_at: null }]);
+    await expect(requireLicense(noExpiry, { kind: "user", email: freshEmail() })).resolves.toBeUndefined();
+
+    const { admin: futureExpiry } = mockLicensesAdmin([{ status: "active", expires_at: "2999-01-01T00:00:00.000Z" }]);
+    await expect(requireLicense(futureExpiry, { kind: "user", email: freshEmail() })).resolves.toBeUndefined();
+  });
+
+  test("picks the current row the same way the license edge function does: first non-revoked, else latest revoked", async () => {
+    const { admin } = mockLicensesAdmin([
+      { status: "revoked", expires_at: null },
+      { status: "active", expires_at: null },
+    ]);
+    await expect(requireLicense(admin, { kind: "user", email: freshEmail() })).resolves.toBeUndefined();
+  });
+
+  test("normalizes the actor's email (trim + lowercase) before querying", async () => {
+    const { admin, state } = mockLicensesAdmin([{ status: "active", expires_at: null }]);
+    await requireLicense(admin, { kind: "user", email: "  Mixed.Case@Example.com  " });
+    expect(state.eqArgs).toEqual([["email", "mixed.case@example.com"]]);
+  });
+
+  test("caches only positive results, per email, for the TTL window", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const email = freshEmail();
+      const { admin, state } = mockLicensesAdmin([{ status: "active", expires_at: null }]);
+      await requireLicense(admin, { kind: "user", email });
+      await requireLicense(admin, { kind: "user", email });
+      expect(state.calls).toBe(1); // second call served from cache, no DB round trip
+
+      vi.setSystemTime(61_000); // past the 60s TTL
+      await requireLicense(admin, { kind: "user", email });
+      expect(state.calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("never caches a denied result — every call re-checks the DB", async () => {
+    const email = freshEmail();
+    const { admin, state } = mockLicensesAdmin([]);
+    await expect(requireLicense(admin, { kind: "user", email })).rejects.toMatchObject({ code: "LICENSE_REQUIRED" });
+    await expect(requireLicense(admin, { kind: "user", email })).rejects.toMatchObject({ code: "LICENSE_REQUIRED" });
+    expect(state.calls).toBe(2);
+  });
+
+  test("a DB error surfaces as a generic INTERNAL error, never the raw DB error", async () => {
+    const admin = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            order: async () => ({ data: null, error: new Error("connection refused") }),
+          }),
+        }),
+      }),
+    };
+    await expect(requireLicense(admin, { kind: "user", email: freshEmail() }))
+      .rejects.toMatchObject({ status: 500, code: "INTERNAL" });
+  });
+});
+
+describe("requireOrganizerLicensed", () => {
+  test("rejects a non-organizer before ever touching the licenses table", async () => {
+    await expect(requireOrganizerLicensed(throwingAdmin, { kind: "user", email: freshEmail() }, { role: "umpire" }))
+      .rejects.toThrow(/Organizer/);
+  });
+
+  test("rejects a licensed-but-non-organizer member with the organizer error, not a license error", async () => {
+    await expect(requireOrganizerLicensed(throwingAdmin, { kind: "user", email: freshEmail() }, null))
+      .rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  test("passes an organizer with an active license", async () => {
+    const { admin } = mockLicensesAdmin([{ status: "active", expires_at: null }]);
+    await expect(requireOrganizerLicensed(admin, { kind: "user", email: freshEmail() }, { role: "organizer" }))
+      .resolves.toBeUndefined();
+  });
+
+  test("blocks an organizer with no license", async () => {
+    const { admin } = mockLicensesAdmin([]);
+    await expect(requireOrganizerLicensed(admin, { kind: "user", email: freshEmail() }, { role: "admin" }))
+      .rejects.toMatchObject({ code: "LICENSE_REQUIRED" });
   });
 });

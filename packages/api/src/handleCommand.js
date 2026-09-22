@@ -27,6 +27,8 @@ import { ensureUniqueSlug } from "./slug.js";
 import {
   loadMember,
   requireOrganizer,
+  requireOrganizerLicensed,
+  requireLicense,
   requireProfile,
   requireScoreAccess,
   requireStationScoreAccess,
@@ -123,6 +125,12 @@ async function authorizeMatchOperation(admin, actor, match) {
   const member = await loadMember(admin, match.tournament_id, actor.id);
   const ump = await matchUmpire(admin, match.id);
   requireScoreAccess(member, ump?.user_id, actor.id);
+  // Only the organizer/admin-capability path consumes a license seat here —
+  // an umpire scoring their own assigned match never needs one (see
+  // docs/LICENSING.md: Umpire's own login doesn't consume an Operator seat).
+  if (member.role === "organizer" || member.role === "admin") {
+    await requireLicense(admin, actor);
+  }
   return { member, ump, courtAsg };
 }
 
@@ -575,6 +583,7 @@ async function handleCreateTournament(admin, actor, payload, envelope) {
   const name = String(payload.name || "").trim();
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
   await requireProfile(admin, actor.id);
+  await requireLicense(admin, actor);
   const id = uuid();
   const ts = nowIso();
   const tournament = {
@@ -607,7 +616,7 @@ async function handleCreateTournament(admin, actor, payload, envelope) {
 async function handleUpdateTournament(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const next = {
     ...tournament,
     name: payload.name != null ? String(payload.name).trim() : tournament.name,
@@ -639,7 +648,7 @@ async function handleUpdateTournament(admin, actor, payload, envelope) {
 async function handleTransitionTournament(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   try {
     assertTransitionTournament(tournament.status, payload.status);
   } catch (err) {
@@ -659,7 +668,7 @@ async function handleTransitionTournament(admin, actor, payload, envelope) {
 async function handleCreateDivision(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const name = String(payload.name || "").trim();
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
   const format = payload.format || "single_elim";
@@ -693,7 +702,7 @@ async function handleCreateDivision(admin, actor, payload, envelope) {
 async function handleUpdateDivision(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const next = {
     ...division,
     name: payload.name != null ? String(payload.name).trim() : division.name,
@@ -726,7 +735,7 @@ async function handleUpdateDivision(admin, actor, payload, envelope) {
 async function handleDeleteDivision(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const { data: liveMatches } = await admin
     .from("matches")
     .select("id")
@@ -753,7 +762,7 @@ async function handleDeleteDivision(admin, actor, payload, envelope) {
 async function handleAddPerson(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const display_name = String(payload.display_name || "").trim();
   if (!display_name) throw httpError(400, "INVALID_COMMAND", "display_name is required");
   const person = {
@@ -778,7 +787,7 @@ async function handleUpdatePerson(admin, actor, payload, envelope) {
   const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
   if (!person) throw httpError(404, "NOT_FOUND", "Person not found");
   const member = await loadMember(admin, person.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const display_name = String(payload.display_name || "").trim();
   if (!display_name) throw httpError(400, "INVALID_COMMAND", "display_name is required");
   const next = { ...person, display_name };
@@ -797,7 +806,7 @@ async function handleRemovePerson(admin, actor, payload, envelope) {
   const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
   if (!person) throw httpError(404, "NOT_FOUND", "Person not found");
   const member = await loadMember(admin, person.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const { data: used } = await admin.from("participant_members").select("id").eq("person_id", person.id).limit(1);
   if (used?.length) throw httpError(409, "PERSON_IN_USE", "Cannot remove a player who is already registered into a division");
   const batch = createBatch();
@@ -813,7 +822,7 @@ async function handleRemovePerson(admin, actor, payload, envelope) {
 async function handleCreateTeam(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const name = String(payload.name || "").trim();
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
   const team = {
@@ -840,7 +849,7 @@ async function handleAddTeamMember(admin, actor, payload, envelope) {
   if (error) throw error;
   if (!team) throw httpError(404, "NOT_FOUND", "Team not found");
   const member = await loadMember(admin, team.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   if (!isUuid(payload.person_id)) throw httpError(400, "INVALID_COMMAND", "person_id must be a UUID");
   const { data: person } = await admin.from("persons").select("*").eq("id", payload.person_id).maybeSingle();
   if (!person || person.tournament_id !== team.tournament_id) {
@@ -896,7 +905,7 @@ async function handleRemoveTeamMember(admin, actor, payload, envelope) {
   const { data: team } = await admin.from("teams").select("*").eq("id", row.team_id).maybeSingle();
   if (!team) throw httpError(404, "NOT_FOUND", "Team not found");
   const member = await loadMember(admin, team.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const batch = createBatch();
   batch.delete("team_members", row.id);
   return commit(admin, batch, {
@@ -910,7 +919,7 @@ async function handleRemoveTeamMember(admin, actor, payload, envelope) {
 async function handleRegisterParticipant(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const display_name = String(payload.display_name || "").trim();
   if (!display_name) throw httpError(400, "INVALID_COMMAND", "display_name is required");
   const personIds = (payload.person_ids || []).filter(Boolean);
@@ -984,7 +993,7 @@ async function handleRemoveParticipant(admin, actor, payload, envelope) {
   const { data: participant } = await admin.from("participants").select("*").eq("id", payload.participant_id).maybeSingle();
   if (!participant) throw httpError(404, "NOT_FOUND", "Participant not found");
   const member = await loadMember(admin, participant.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const { data: used } = await admin.from("match_participants").select("id").eq("participant_id", participant.id).limit(1);
   if (used?.length) throw httpError(409, "PARTICIPANT_IN_USE", "Cannot remove a participant that is already in a match");
   const { data: members } = await admin.from("participant_members").select("id").eq("participant_id", participant.id);
@@ -1013,7 +1022,7 @@ async function handleUpdateMatchParticipant(admin, actor, payload, envelope) {
   requireUserActor(actor);
   const match = await getMatch(admin, payload.match_id);
   const member = await loadMember(admin, match.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
 
   const slot = payload.slot;
   if (slot !== "A" && slot !== "B") throw httpError(400, "INVALID_COMMAND", "slot must be A or B");
@@ -1172,7 +1181,7 @@ async function loadDivisionAssignment(admin, divisionId) {
 async function handleCreateCourt(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const name = String(payload.name || "").trim();
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
   const court = {
@@ -1196,7 +1205,7 @@ async function handleCreateCourt(admin, actor, payload, envelope) {
 async function handleAddMember(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   if (!["admin", "umpire", "viewer"].includes(payload.role)) {
     throw httpError(400, "INVALID_COMMAND", "role must be admin, umpire, or viewer");
   }
@@ -1231,7 +1240,7 @@ async function handleAddMember(admin, actor, payload, envelope) {
 async function handleGenerateBracket(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const { data: existingMatches } = await admin.from("matches").select("id").eq("division_id", division.id).limit(1);
   if (existingMatches?.length) throw httpError(409, "BRACKET_EXISTS", "Division already has matches");
   const { data: participants, error } = await admin
@@ -1312,7 +1321,7 @@ async function handleGenerateBracket(admin, actor, payload, envelope) {
 async function handleGenerateTeamElimination(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const { data: existingMatches } = await admin.from("matches").select("id").eq("division_id", division.id).limit(1);
   if (existingMatches?.length) throw httpError(409, "BRACKET_EXISTS", "Division already has matches");
   const { data: teams } = await admin.from("teams").select("*").eq("division_id", division.id);
@@ -1345,7 +1354,7 @@ async function handleGenerateTeamElimination(admin, actor, payload, envelope) {
 async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   if (division.format !== "team_elimination") {
     throw httpError(400, "INVALID_COMMAND", "Division is not team elimination");
   }
@@ -1446,7 +1455,7 @@ async function handleAssignCourt(admin, actor, payload, envelope) {
   requireUserActor(actor);
   const match = await getMatch(admin, payload.match_id);
   const member = await loadMember(admin, match.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const { data: court } = await admin.from("courts").select("*").eq("id", payload.court_id).maybeSingle();
   if (!court || court.tournament_id !== match.tournament_id) {
     throw httpError(400, "INVALID_COMMAND", "Court does not belong to this tournament");
@@ -1484,7 +1493,7 @@ async function handleAssignCourt(admin, actor, payload, envelope) {
 async function handleAssignUmpire(admin, actor, payload, envelope) {
   const match = await getMatch(admin, payload.match_id);
   const member = await loadMember(admin, match.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const umpireMember = await loadMember(admin, match.tournament_id, payload.user_id);
   if (!umpireMember || !["umpire", "organizer", "admin"].includes(umpireMember.role)) {
     throw httpError(400, "INVALID_COMMAND", "User is not an umpire for this tournament");
@@ -1517,10 +1526,13 @@ async function handleTransitionMatch(admin, actor, payload, envelope) {
   const match = await getMatch(admin, payload.match_id);
   const member = await loadMember(admin, match.tournament_id, actor.id);
   const isOrganizer = Boolean(member) && ["organizer", "admin"].includes(member.role);
-  if (!isOrganizer) {
+  if (isOrganizer) {
+    await requireLicense(admin, actor);
+  } else {
     // The one self-service transition a non-organizer may make is putting
     // their own currently-live match on hold (Umpire Cancel/Hold) — anything
-    // else falls through to the exact original organizer-only error.
+    // else falls through to the exact original organizer-only error. Never
+    // license-gated: an umpire's own login doesn't consume an Operator seat.
     if (payload.status !== "postponed" || match.status !== "in_progress") {
       requireOrganizer(member);
     }
@@ -1845,7 +1857,7 @@ async function handleOpenCourtPairing(admin, actor, payload, envelope) {
   const { data: court } = await admin.from("courts").select("*").eq("id", payload.court_id).maybeSingle();
   if (!court) throw httpError(404, "NOT_FOUND", "Court not found");
   const member = await loadMember(admin, court.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const { data: openGrants } = await admin
     .from("court_pairing_grants")
     .select("*")
@@ -1892,7 +1904,7 @@ async function handleRevokeCourtDevice(admin, actor, payload, envelope) {
   const { data: court } = await admin.from("courts").select("*").eq("id", payload.court_id).maybeSingle();
   if (!court) throw httpError(404, "NOT_FOUND", "Court not found");
   const member = await loadMember(admin, court.tournament_id, actor.id);
-  requireOrganizer(member);
+  await requireOrganizerLicensed(admin, actor, member);
   const { data: device } = await admin
     .from("court_devices")
     .select("*")

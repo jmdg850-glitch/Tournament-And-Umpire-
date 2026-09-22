@@ -1,5 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
+import { repoRoot } from "./lib/repoGuard.mjs";
+
+function findEntryBundle(distAssetsDir) {
+  if (!fs.existsSync(distAssetsDir)) {
+    throw new Error(`${distAssetsDir} does not exist — run the relevant build first (see docs/BUILD_WORKFLOW.md).`);
+  }
+  const match = fs.readdirSync(distAssetsDir).find((f) => /^index-.*\.js$/.test(f));
+  if (!match) throw new Error(`No index-*.js bundle found in ${distAssetsDir}.`);
+  return path.join(distAssetsDir, match);
+}
 
 function audit(label, file) {
   const s = fs.readFileSync(file, "utf8");
@@ -20,6 +30,7 @@ function audit(label, file) {
   }, null, 2));
 }
 
-audit("operator-web", "E:\\.1\\apps\\operator\\dist\\assets\\index-B47x5xBo.js");
-audit("umpire-web", "E:\\.1\\apps\\umpire\\dist\\assets\\index-C8TpiYa4.js");
-audit("android-assets", "E:\\.1\\apps\\umpire\\android\\app\\src\\main\\assets\\public\\assets\\index-C8TpiYa4.js");
+const root = repoRoot();
+audit("operator-web", findEntryBundle(path.resolve(root, "apps/operator/dist/assets")));
+audit("umpire-web", findEntryBundle(path.resolve(root, "apps/umpire/dist/assets")));
+audit("android-assets", findEntryBundle(path.resolve(root, "apps/umpire/android/app/src/main/assets/public/assets")));

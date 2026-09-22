@@ -123,3 +123,75 @@ export async function requireProfile(admin, userId) {
   }
   return data;
 }
+
+// Server-side Operator license entitlement (see docs/LICENSING.md). The
+// Operator app's LicenseGate is a client-side UI gate only — a modified
+// client, or any caller holding a stolen-but-valid Supabase JWT, could
+// otherwise call /command directly and bypass it entirely. This is the
+// authoritative check: it must fail closed and must never leak license
+// details (email/code/other rows) in its errors.
+//
+// Selection of the "current" license row mirrors
+// supabase/functions/license/license.js's own check() action exactly, so
+// both independently-deployed functions agree on what a customer's active
+// license is: the first non-revoked row, else the latest revoked one.
+const LICENSE_CACHE_TTL_MS = 60_000;
+// Warm-instance-local cache of *positive* results only, keyed by lowercased
+// email. Denials are never cached, so a revoke takes effect on an account's
+// very next command — tighter than LicenseGate's existing 6-hour poll.
+const licenseAllowCache = new Map();
+
+function licenseDecision(rows, nowMs) {
+  const current = (rows || []).find((l) => l.status !== "revoked") ?? (rows || [])[0] ?? null;
+  if (!current || current.status === "unused") return { ok: false, code: "LICENSE_REQUIRED" };
+  if (current.status === "revoked") return { ok: false, code: "LICENSE_INVALID" };
+  if (current.expires_at && Date.parse(current.expires_at) <= nowMs) {
+    return { ok: false, code: "LICENSE_INVALID" };
+  }
+  return { ok: true };
+}
+
+export async function requireLicense(admin, actor) {
+  // Court stations are anonymous devices with no email/customer identity —
+  // never license-gated (docs/LICENSING.md).
+  if (actor?.kind === "station") return;
+  const email = String(actor?.email || "").trim().toLowerCase();
+  if (!email) {
+    // Defensive only: every "user" actor is resolved from a verified
+    // Supabase JWT (stationAuth.resolveActor), which always sets email.
+    // Fail closed rather than let an unidentifiable actor through.
+    const err = new Error("An active Operator license is required for this action");
+    err.status = 403;
+    err.code = "LICENSE_REQUIRED";
+    throw err;
+  }
+  const now = Date.now();
+  const cachedUntil = licenseAllowCache.get(email);
+  if (cachedUntil && cachedUntil > now) return;
+
+  const { data, error } = await admin
+    .from("licenses")
+    .select("status, expires_at")
+    .eq("email", email)
+    .order("created_at", { ascending: false });
+  if (error) {
+    const err = new Error("License lookup failed");
+    err.status = 500;
+    err.code = "INTERNAL";
+    throw err;
+  }
+
+  const decision = licenseDecision(data, now);
+  if (!decision.ok) {
+    const err = new Error("An active Operator license is required for this action");
+    err.status = 403;
+    err.code = decision.code;
+    throw err;
+  }
+  licenseAllowCache.set(email, now + LICENSE_CACHE_TTL_MS);
+}
+
+export async function requireOrganizerLicensed(admin, actor, member) {
+  requireOrganizer(member);
+  await requireLicense(admin, actor);
+}

@@ -1,6 +1,7 @@
 const { app, BrowserWindow, shell, ipcMain } = require("electron");
 const path = require("path");
 const { createDesktopUpdater } = require("./updater.cjs");
+const { getLicenseDevice } = require("./licenseDevice.cjs");
 
 const PROTOCOL = "tournament-operator";
 const ICON = path.join(__dirname, "..", "build", "icon.ico");
@@ -245,6 +246,9 @@ if (!gotLock) {
     version: app.getVersion(),
     packaged: app.isPackaged,
   }));
+
+  // Stable install id + computer name (label only) for license device registration.
+  ipcMain.handle("license:get-device", () => getLicenseDevice({ userDataDir: app.getPath("userData") }));
 
   ipcMain.handle("open-live-window", (_event, payload = {}) => {
     return createLiveWindow({

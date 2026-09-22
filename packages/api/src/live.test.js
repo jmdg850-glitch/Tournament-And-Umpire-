@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { createApp } from "./src/server.js";
-import { describe, expect, test, beforeAll, vi } from "vitest";
+import { describe, expect, test, beforeAll, afterAll, vi } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -67,6 +67,97 @@ async function send(token, type, payload, command_id = crypto.randomUUID()) {
   });
   return { status: res.status, body: await res.json() };
 }
+
+// Server-side license entitlement (packages/api/src/authz.js requireLicense)
+// now gates every organizer-only command. organizer.dev@tournament.local is
+// the shared dev account every describe block below signs in as "organizer",
+// so it must carry an active license for the rest of this file's existing
+// coverage to keep passing once this ships — this fixture makes that true
+// without assuming anything about whatever license state already exists on
+// this account, and restores exactly what it found afterward.
+const CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTVWXYZ"; // matches licenses.access_code's check constraint alphabet
+function randomLicenseCode() {
+  const group = () => Array.from({ length: 4 }, () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]).join("");
+  return `${group()}-${group()}-${group()}`;
+}
+
+function adminForFixtures() {
+  if (!service) throw new Error("RUN_LIVE_API_TESTS=1 requires SUPABASE_SERVICE_ROLE_KEY to manage the license fixture");
+  return createClient(url, service, { auth: { persistSession: false } });
+}
+
+async function ensureActiveLicense(email) {
+  const admin = adminForFixtures();
+  const { data: rows, error } = await admin
+    .from("licenses")
+    .select("*")
+    .eq("email", email)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  const current = (rows || []).find((l) => l.status !== "revoked") ?? null;
+  const isUsable = current && current.status === "active" && (!current.expires_at || new Date(current.expires_at) > new Date());
+  if (isUsable) return null; // already licensed — nothing to change, nothing to restore
+
+  if (current) {
+    // A non-revoked row already exists (unused, or active-but-expired) —
+    // update it in place rather than inserting a second non-revoked row,
+    // which licenses_one_live_per_email (one non-revoked row per email)
+    // would reject.
+    const { error: updateErr } = await admin
+      .from("licenses")
+      .update({
+        status: "active",
+        device_id: current.device_id || "livetest-fixture-device",
+        device_label: current.device_label || "live.test.js fixture",
+        activated_at: current.activated_at || new Date().toISOString(),
+        expires_at: null,
+      })
+      .eq("id", current.id);
+    if (updateErr) throw updateErr;
+    return { id: current.id, restore: current };
+  }
+
+  const { data: inserted, error: insertErr } = await admin
+    .from("licenses")
+    .insert({
+      email,
+      access_code: randomLicenseCode(),
+      status: "active",
+      device_id: "livetest-fixture-device",
+      device_label: "live.test.js fixture",
+      activated_at: new Date().toISOString(),
+    })
+    .select()
+    .single();
+  if (insertErr) throw insertErr;
+  return { id: inserted.id, restore: null };
+}
+
+async function restoreLicenseFixture(fixture) {
+  if (!fixture) return;
+  const admin = adminForFixtures();
+  if (fixture.restore) {
+    const r = fixture.restore;
+    await admin
+      .from("licenses")
+      .update({ status: r.status, device_id: r.device_id, device_label: r.device_label, activated_at: r.activated_at, expires_at: r.expires_at })
+      .eq("id", r.id);
+  } else {
+    await admin.from("licenses").delete().eq("id", fixture.id);
+  }
+}
+
+let organizerLicenseFixture = null;
+
+beforeAll(async () => {
+  if (!live) return;
+  organizerLicenseFixture = await ensureActiveLicense("organizer.dev@tournament.local");
+}, 30_000);
+
+afterAll(async () => {
+  if (!live) return;
+  await restoreLicenseFixture(organizerLicenseFixture);
+});
 
 describe.skipIf(!live)("live tournament path", () => {
   let organizer;
@@ -1697,4 +1788,95 @@ describe.skipIf(!live)("Division deletion (delete_division)", () => {
     expect(again.body.ok).toBe(false);
     expect(again.status).toBe(404);
   }, 60_000);
+});
+
+// Server-side Operator license entitlement (packages/api/src/authz.js
+// requireLicense / requireOrganizerLicensed, wired into handleCommand.js).
+// The Operator app's LicenseGate is a client-side UI gate only; these tests
+// prove the /command endpoint itself now refuses organizer-capability
+// actions for an unlicensed or revoked account, independent of any client.
+//
+// Coverage this block intentionally does NOT duplicate, because it is
+// already exercised elsewhere in this file and remains unaffected by this
+// feature by design:
+//   - "court station pairing" above: a paired court device has no email/
+//     customer identity and is never license-gated — that whole flow keeps
+//     succeeding with zero license rows for anyone.
+//   - "Umpire Cancel/Hold" above: the assigned umpire's own scoring/hold
+//     actions never require a license (organizer.dev's fixture above is the
+//     only account this suite grants a license to; umpire.dev is not).
+describe.skipIf(!live)("Operator license entitlement (server-side)", () => {
+  let outsider;
+
+  beforeAll(async () => {
+    outsider = await signIn("outsider.dev@tournament.local", "dev-outsider-pass");
+  }, 30_000);
+
+  test("an account with no license row cannot create a tournament (the bootstrap organizer command is gated too)", async () => {
+    const { data: rows } = await adminForFixtures().from("licenses").select("id").eq("email", "outsider.dev@tournament.local");
+    if (rows && rows.length) {
+      throw new Error(
+        "outsider.dev@tournament.local unexpectedly already has a licenses row — this test assumes a clean, unlicensed dev account",
+      );
+    }
+    const r = await send(outsider.token, "create_tournament", { name: `LIC-UNLICENSED ${Date.now()}` });
+    expect(r.body.ok).toBe(false);
+    expect(r.status).toBe(403);
+    expect(r.body.error.code).toBe("LICENSE_REQUIRED");
+  }, 30_000);
+
+  test("a revoked license blocks organizer-only commands with LICENSE_INVALID, and never leaks license details", async () => {
+    const admin = adminForFixtures();
+    const email = "outsider.dev@tournament.local";
+    const { data: inserted, error } = await admin
+      .from("licenses")
+      .insert({
+        email,
+        access_code: randomLicenseCode(),
+        status: "revoked",
+        revoked_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+    expect(error).toBeFalsy();
+    try {
+      const r = await send(outsider.token, "create_tournament", { name: `LIC-REVOKED ${Date.now()}` });
+      expect(r.body.ok).toBe(false);
+      expect(r.status).toBe(403);
+      expect(r.body.error.code).toBe("LICENSE_INVALID");
+      expect(r.body.error.message).not.toMatch(new RegExp(email.replace(".", "\\.")));
+      expect(JSON.stringify(r.body)).not.toContain(inserted.access_code);
+    } finally {
+      await admin.from("licenses").delete().eq("id", inserted.id);
+    }
+  }, 30_000);
+
+  test("a licensed organizer's organizer-only commands still succeed (regression guard)", async () => {
+    // organizer.dev@tournament.local is guaranteed an active license by the
+    // top-level beforeAll fixture above, exactly like every other describe
+    // block in this file relies on.
+    const organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+    const r = await expectOk(organizer.token, "create_tournament", { name: `LIC-OK ${Date.now()}` });
+    expect(r.body.result.tournament).toBeTruthy();
+  }, 30_000);
+
+  test("an organizer transitioning a match (not the umpire hold carve-out) requires a license", async () => {
+    const admin = adminForFixtures();
+    const email = "outsider.dev@tournament.local";
+    // outsider needs organizer membership on *some* tournament to reach the
+    // license check at all (a non-member is rejected with FORBIDDEN first,
+    // by design — see requireLicense's ordering in authz.js). Grant it via
+    // a licensed organizer, then revoke outsider's own license and confirm
+    // the organizer-branch transition is blocked before ever reaching
+    // assertTransitionMatch.
+    const organizer = await signIn("organizer.dev@tournament.local", "dev-organizer-pass");
+    const t = await expectOk(organizer.token, "create_tournament", { name: `LIC-TRANSITION ${Date.now()}` });
+    const tournamentId = t.body.result.tournament.id;
+    await expectOk(organizer.token, "add_member", { tournament_id: tournamentId, user_id: outsider.user.id, role: "organizer" });
+
+    const r = await send(outsider.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
+    expect(r.body.ok).toBe(false);
+    expect(r.status).toBe(403);
+    expect(r.body.error.code).toBe("LICENSE_REQUIRED");
+  }, 30_000);
 });

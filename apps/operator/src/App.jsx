@@ -35,6 +35,7 @@ import AttentionPanel from "./AttentionPanel.jsx";
 import { buildDeskHash, parseDeskHash } from "./deskHash.js";
 import { firstQueryError, isToday } from "./lib.js";
 import { version as APP_VERSION } from "../package.json";
+import { LicenseGate, useLicense } from "./LicenseGate.jsx";
 
 function useConfig() {
   return useMemo(() => envConfig(), []);
@@ -142,6 +143,9 @@ export default function App() {
     return body;
   }
 
+  // Licensing: the server decides whether this account's license is activated on this PC.
+  const license = useLicense({ commandUrl: cfg.commandUrl, publishableKey: cfg.publishableKey, session });
+
   if (session === undefined) {
     return (
       <>
@@ -204,13 +208,19 @@ export default function App() {
   return (
     <ToastProvider>
       <UpdateBanner />
-      <SignedIn
-        supabase={supabase}
-        session={session}
-        command={command}
-        pendingSync={pendingSync}
+      <LicenseGate
+        license={license}
+        email={session.user?.email}
         onSignOut={() => supabase.auth.signOut({ scope: "local" })}
-      />
+      >
+        <SignedIn
+          supabase={supabase}
+          session={session}
+          command={command}
+          pendingSync={pendingSync}
+          onSignOut={() => supabase.auth.signOut({ scope: "local" })}
+        />
+      </LicenseGate>
     </ToastProvider>
   );
 }

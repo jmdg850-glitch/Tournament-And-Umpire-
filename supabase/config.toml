@@ -32,3 +32,8 @@ verify_jwt = false
 
 [functions.pair-station]
 verify_jwt = false
+
+[functions.license]
+# The Supabase JWT is verified inside the function (admin.auth.getUser) and
+# admin rights are checked against public.license_admins on every request.
+verify_jwt = false

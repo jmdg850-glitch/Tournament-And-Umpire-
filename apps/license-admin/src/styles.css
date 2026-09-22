@@ -1,0 +1,80 @@
+/* License Admin - Tournament brand: courtTeal + ballChartreuse, Inter. */
+:root {
+  --courtTeal: #12a3a6;
+  --courtTealDeep: #04191c;
+  --courtTealMid: #0a2f34;
+  --courtTealLine: #14464d;
+  --ballChartreuse: #c9f31d;
+  --ink: #e9f7f6;
+  --muted: #8db4b5;
+  --good: #52e0a1;
+  --warn: #f3b93d;
+  --bad: #ff6f61;
+  --info: #5cc8ff;
+  --font: "Inter Variable", Inter, "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SFMono-Regular", Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--courtTealDeep); color: var(--ink); font: 16px/1.45 var(--font); -webkit-font-smoothing: antialiased; }
+h1, h2 { margin: 0 0 12px; letter-spacing: -0.01em; }
+h1 { font-size: 1.6rem; } h2 { font-size: 1.15rem; }
+.muted { color: var(--muted); } .mono { font-family: var(--mono); letter-spacing: 0.04em; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.row.between { justify-content: space-between; } .row.end { justify-content: flex-end; margin-top: 16px; }
+.grow { flex: 1 1 220px; }
+
+.center { min-height: 100dvh; display: grid; place-items: center; padding: 16px;
+  background: radial-gradient(circle at 20% 10%, rgba(18,163,166,.28), transparent 45%), radial-gradient(circle at 85% 90%, rgba(201,243,29,.12), transparent 40%), var(--courtTealDeep); }
+.ball { display: inline-block; width: 30px; height: 30px; border-radius: 50%; background: radial-gradient(circle at 34% 30%, #eaff7a, var(--ballChartreuse) 45%, #93b80f); box-shadow: 0 0 0 3px rgba(201,243,29,.15); }
+.brand { display: flex; align-items: center; gap: 10px; font-size: 1.05rem; }
+
+.card { background: var(--courtTealMid); border: 1px solid var(--courtTealLine); border-radius: 16px; padding: 20px; }
+.login { width: min(400px, 100%); display: grid; gap: 14px; }
+label { display: grid; gap: 6px; font-size: .85rem; font-weight: 600; color: var(--muted); }
+input { min-height: 46px; padding: 8px 14px; border-radius: 12px; border: 1px solid var(--courtTealLine); background: var(--courtTealDeep); color: var(--ink); font: inherit; }
+input:focus, button:focus-visible { outline: 2px solid var(--ballChartreuse); outline-offset: 1px; }
+
+.cta { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; padding: 0 22px; border: 0; border-radius: 12px; background: var(--ballChartreuse); color: #0b1c06; font: 700 1rem var(--font); cursor: pointer; }
+.cta:disabled { opacity: .55; cursor: not-allowed; }
+.btn { display: inline-flex; align-items: center; gap: 6px; min-height: 40px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--courtTealLine); background: transparent; color: var(--ink); font: 600 .88rem var(--font); cursor: pointer; }
+.btn:hover { background: rgba(255,255,255,.06); }
+.btn.danger { color: var(--bad); border-color: rgba(255,111,97,.5); }
+.link { background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; min-height: 40px; }
+
+.alert { padding: 10px 14px; border-radius: 10px; margin-top: 12px; border: 1px solid; }
+.alert.bad { color: var(--bad); border-color: rgba(255,111,97,.5); background: rgba(255,111,97,.1); font-weight: 700; }
+.alert.good { color: var(--good); border-color: rgba(82,224,161,.5); background: rgba(82,224,161,.1); }
+
+.page header { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px clamp(16px, 3vw, 40px); border-bottom: 1px solid var(--courtTealLine); }
+main { max-width: 1180px; margin: 0 auto; padding: 24px clamp(16px, 3vw, 40px) 60px; display: grid; gap: 20px; }
+.gen { align-items: end; }
+.made { margin-top: 16px; padding: 18px; border-radius: 14px; border: 2px dashed var(--ballChartreuse); background: var(--courtTealDeep); display: grid; gap: 12px; justify-items: start; }
+.code { font: 700 clamp(1.5rem, 5vw, 2.4rem) var(--mono); letter-spacing: .08em; color: var(--ballChartreuse); word-break: break-all; }
+.made p { margin: 0; }
+
+.search { position: relative; display: block; }
+.search svg { position: absolute; left: 12px; top: 14px; color: var(--muted); }
+.search input { padding-left: 34px; min-width: 260px; }
+table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+th { text-align: left; padding: 8px 10px; font-size: .72rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--courtTealLine); }
+td { padding: 12px 10px; border-bottom: 1px solid rgba(20,70,77,.55); vertical-align: middle; }
+td.actions { text-align: right; }
+.acts { display: inline-flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+td.mono { white-space: nowrap; font-size: .9rem; }
+td.email { word-break: break-all; }
+.badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: .72rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; border: 1px solid currentColor; }
+.badge.active { color: var(--good); } .badge.unused { color: var(--info); } .badge.expired { color: var(--warn); } .badge.revoked { color: var(--bad); }
+
+.overlay { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px; background: rgba(2,12,14,.72); }
+.dialog { width: min(460px, 100%); }
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); padding: 12px 20px; border-radius: 999px; background: var(--ballChartreuse); color: #0b1c06; font-weight: 700; z-index: 80; }
+
+@media (max-width: 800px) {
+  thead { display: none; }
+  table, tbody, tr, td { display: block; width: 100%; }
+  tr { margin-bottom: 10px; padding: 10px 12px; border: 1px solid var(--courtTealLine); border-radius: 14px; background: var(--courtTealDeep); }
+  td { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border: 0; text-align: right; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: .7rem; letter-spacing: .08em; text-transform: uppercase; text-align: left; }
+  td.actions { display: block; text-align: left; } td.actions::before { display: none; } .acts { justify-content: flex-start; } td.mono { white-space: normal; }
+  .search input { min-width: 0; width: 100%; } .search { width: 100%; }
+}

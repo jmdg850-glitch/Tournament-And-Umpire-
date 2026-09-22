@@ -102,6 +102,18 @@ Before modifying important logic, run the smallest relevant existing test suite.
 
 Never claim tests pass unless they were actually run. If a test cannot run, report **BLOCKED** and explain why.
 
+## 12a. Dependency operations
+
+This repository is portable across PCs and drive letters by design (see `scripts/lib/repoGuard.mjs`) — never assume a fixed repo path, and never assume or require an external dependency mirror (e.g. a cross-drive `node_modules` junction). The correct dependency location is always `<repo_root>/node_modules`, where `<repo_root>` is discovered dynamically, never hardcoded.
+
+A missing or incomplete `node_modules` is never by itself permission to run `npm install`, `npm ci`, `npm rebuild`, `npm dedupe`, `npm prune`, `npm cache clean`, or any dependency-reset script. Before any dependency operation:
+
+1. Run the existing read-only check: `node scripts/check-dependencies.mjs` (or `npm run check:dependencies`). It discovers the repo root dynamically, never installs anything, and reports the exact missing packages/workspace links.
+2. If it passes, continue — no install needed.
+3. If it fails, report a **DEPENDENCY BLOCKER**: the exact command attempted, the exact missing package/executable, Node/npm versions, and whether `package-lock.json` declares it. Then continue with any source-level work that doesn't require the missing dependency.
+4. Only install if the specific blocked task genuinely requires it. State plainly what is missing and that installation may take a long time, then wait for explicit confirmation before starting it — do not launch it in the background unprompted.
+5. If installation is approved, use `scripts/reset-dependencies.mjs` (the repo's sanctioned recovery path — it deletes only `node_modules`/`node_modules.broken` under the dynamically-resolved repo root, verifies protected paths before and after, and runs a single `npm ci`) rather than an ad hoc `npm install` from an assumed path. Never start a second install while one is already running; never install into or reference a path outside the current repo root.
+
 ## 13. Failure handling
 
 If something breaks during implementation: identify the regression, determine which change caused it, revert the unrelated change if necessary, fix the root cause, re-run relevant tests. Do not immediately rewrite unrelated code to make a failure "go away." Never hide failures.

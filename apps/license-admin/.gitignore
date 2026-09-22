@@ -1,0 +1,7 @@
+.vercel
+.env*
+!.env.example
+dist
+release
+android/keystore.properties
+android/keystores/
