@@ -1,0 +1,6 @@
+{
+  "appId": "app.tournament.licenseadmin",
+  "appName": "Tournament License Admin",
+  "webDir": "dist",
+  "server": { "androidScheme": "https" }
+}

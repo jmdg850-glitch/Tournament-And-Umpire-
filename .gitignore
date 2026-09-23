@@ -36,6 +36,7 @@ baseline
 *.keystore
 keystore.properties
 apps/umpire/android/keystores/
+apps/license-admin/android/keystores/
 
 # Local agent/tooling config — session-specific, not app config
 .claude/
