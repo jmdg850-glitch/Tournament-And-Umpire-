@@ -19,8 +19,9 @@
 // bump -> Windows build -> Android build -> verify both -> commit (explicit
 // allowlist only) -> push -> publish GitHub release -> verify the release.
 // Any failing step stops the pipeline and reports which stage failed and what
-// state the repo is in — see fail() below. The Android APK is built and
-// verified locally only; nothing here uploads it anywhere.
+// state the repo is in — see fail() below. The GitHub release carries both
+// Windows desktop updates (Operator latest.yml, License Admin license-admin.yml).
+// The Android APKs are built and verified locally only; nothing here uploads them.
 //
 // Nothing here bypasses the existing build, test, or publish tooling; it
 // orchestrates the same npm scripts a human would run by hand (see
@@ -804,7 +805,11 @@ if (laGradleStatus !== 0) fail("Android build (License Admin, Gradle)", "`gradle
 // 4. Verify both artifacts directly (an exit code alone is not enough)
 // ---------------------------------------------------------------------------
 stage = "verify";
-logStep("Verify Windows build");
+// verifyWindowsInstaller() runs `publish-desktop-update.mjs --check`, which
+// verifies BOTH apps' update artifacts: Operator latest.yml and License Admin
+// license-admin.yml (version == bumped version, path == expected installer,
+// sha512/size match the .exe, .blockmap present, channels distinct).
+logStep("Verify Windows build (Operator + License Admin update artifacts)");
 const winResult = verifyWindowsInstaller({ root, operatorDir, version: ctx.nextOperator, notOlderThanMs: buildStartMs });
 if (!winResult.ok) fail("Verify Windows build", winResult.error);
 console.log(`Installer:            ${winResult.path} (${winResult.size} bytes, ${winResult.mtime.toISOString()})`);
@@ -829,12 +834,16 @@ console.log(`Package: ${apkResult.appId} versionName ${apkResult.versionName} ve
 console.log(`Signer:  ${apkResult.signerDn} SHA-256 ${apkResult.signerSha256 ?? "(n/a)"}`);
 
 logStep("Verify Windows build — License Admin");
+// skipUpdateCheck: its license-admin.yml/.blockmap were already verified by the
+// publish-desktop-update.mjs --check run in the Operator step above (which
+// covers both apps); running it twice would only repeat the same checks.
 const laWinResult = verifyWindowsInstaller({
   root, operatorDir: licenseAdminDir, version: ctx.nextLicenseAdmin, notOlderThanMs: buildStartMs,
   artifactNamePattern: "Tournament-License-Admin-Setup", skipUpdateCheck: true,
 });
 if (!laWinResult.ok) fail("Verify Windows build (License Admin)", laWinResult.error);
 console.log(`Installer:            ${laWinResult.path} (${laWinResult.size} bytes, ${laWinResult.mtime.toISOString()})`);
+console.log(`Update channel:       license-admin (license-admin.yml verified above)`);
 console.log(`NSIS installer:       yes (MZ header + Nullsoft/NSIS stub)`);
 console.log(`ProductVersion:       ${laWinResult.productVersion ?? "(not readable)"}`);
 console.log(`Windows Authenticode: ${laWinResult.authenticode.label}`);
@@ -952,6 +961,9 @@ const releaseFiles = [
   resolve(operatorDir, `release/Tournament-Operator-Setup-${ctx.nextOperator}.exe`),
   resolve(operatorDir, `release/Tournament-Operator-Setup-${ctx.nextOperator}.exe.blockmap`),
   resolve(operatorDir, "release/latest.yml"),
+  resolve(licenseAdminDir, `release/Tournament-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe`),
+  resolve(licenseAdminDir, `release/Tournament-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe.blockmap`),
+  resolve(licenseAdminDir, "release/license-admin.yml"),
 ];
 const view = tryCapture("gh", ["release", "view", state.tag, "--repo", ctx.releaseSlug, "--json", "tagName,isDraft,url,assets"]);
 if (!view.ok) fail("Verify published release", `gh could not read release ${state.tag}: ${errText(view)}`);
@@ -1003,7 +1015,7 @@ ${apkResult.size} bytes - ${apkResult.appId} ${apkResult.versionName} (${apkResu
 Signer SHA-256: ${apkResult.signerSha256 ?? "n/a"}
 
 Windows — License Admin:
-PASS (LOCAL ONLY — no auto-update channel)
+PASS (published in ${state.tag}, update channel license-admin -> license-admin.yml)
 ${laWinResult.path}
 ${laWinResult.size} bytes, NSIS installer, ProductVersion ${laWinResult.productVersion ?? "n/a"}
 Windows Authenticode: ${laWinResult.authenticode.label}
@@ -1030,6 +1042,7 @@ Published: YES, verified (${ctx.releaseSlug}) ${published.url}
 
 MANUAL TEST REQUIRED:
 - Windows old-version -> new-version auto-update (install/detect/download/restart)
+- License Admin Windows auto-update (the first updater-enabled version must be installed manually once)
 - Android physical-device installation
 - Android live scoring on-device
 ========================================`);

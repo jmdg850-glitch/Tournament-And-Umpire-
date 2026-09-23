@@ -263,6 +263,38 @@ function Licenses({ refreshKey, onChanged, notify }) {
   );
 }
 
+// Desktop (Electron) only: a downloaded update also installs on its own when
+// the app quits, so this is just a shortcut to restart now.
+function UpdateNotice() {
+  const updates = typeof window !== "undefined" ? window.licenseAdminDesktop?.updates : undefined;
+  const [update, setUpdate] = useState(null);
+  const [restarting, setRestarting] = useState(false);
+
+  useEffect(() => {
+    if (!updates) return undefined;
+    let live = true;
+    updates.getState().then((s) => live && setUpdate(s)).catch(() => {});
+    const off = updates.onStatus((s) => live && setUpdate(s));
+    return () => { live = false; off?.(); };
+  }, [updates]);
+
+  if (!updates || update?.status !== "ready") return null;
+
+  async function restart() {
+    setRestarting(true);
+    const res = await updates.install().catch(() => ({ ok: false }));
+    if (!res?.ok) setRestarting(false);
+  }
+
+  return (
+    <div className="update-notice" role="status">
+      <span>Update {update.availableVersion ? `v${update.availableVersion} ` : ""}ready</span>
+      <button className="btn" onClick={restart} disabled={restarting}>{restarting ? "Restarting…" : "Restart"}</button>
+      <button className="link" onClick={() => updates.later().then(setUpdate).catch(() => {})}>Later</button>
+    </div>
+  );
+}
+
 export default function App() {
   const [session, setSession] = useState(undefined);
   const [recovering, setRecovering] = useState(false);
@@ -323,6 +355,7 @@ export default function App() {
       <header>
         <div className="brand"><span className="ball" aria-hidden="true" /><b>License Admin</b></div>
         <div className="row">
+          <UpdateNotice />
           <span className="muted who">{session.user.email}</span>
           <button className="btn" onClick={signOut}><LogOut size={14} /> Sign out</button>
         </div>
@@ -338,4 +371,4 @@ export default function App() {
 
 // Named exports exist only so tests can render each piece directly; App's own
 // behavior is unchanged (still the sole default export used by main.jsx).
-export { Login, Recovery, Confirm, Generate, Licenses };
+export { Login, Recovery, Confirm, Generate, Licenses, UpdateNotice };

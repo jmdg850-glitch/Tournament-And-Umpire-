@@ -1,15 +1,19 @@
-// Publishes the built Windows desktop update (installer + .blockmap + latest.yml)
-// to a GitHub Release on the owner/repo configured in apps/operator/package.json
-// (build.publish). That repository also contains the application source — it is
+// Publishes the built Windows desktop updates to ONE GitHub Release on the
+// owner/repo configured in apps/operator/package.json (build.publish):
+//   Operator:      installer + .blockmap + latest.yml         (channel "latest")
+//   License Admin: installer + .blockmap + license-admin.yml  (channel "license-admin")
+// Both apps are required: every published (= "Latest") release must carry both
+// update-info files, since electron-updater reads `${channel}.yml` from the
+// latest release. That repository also contains the application source — it is
 // not a separate releases-only repo. See apps/operator/electron/updatePolicy.cjs
-// for the owner/repo the running app itself checks.
+// and apps/license-admin/electron/updatePolicy.cjs for what each running app checks.
 //
 // Auth: uses the `gh` CLI's own credential store (gh auth login), or the
 // GH_TOKEN / GITHUB_TOKEN environment variable if set — gh picks either up
 // automatically. This script never reads, prints, or stores a token itself.
 //
 // Safety: the release is created as a DRAFT, assets are uploaded one at a
-// time (installer, blockmap, then latest.yml last), and the release is only
+// time (installers and blockmaps, then the .yml files last), and the release is only
 // flipped to published after every asset upload succeeds. If an upload fails
 // partway, the draft is left in place with whatever partial assets it has —
 // electron-updater never sees a draft release, so a partial/failed publish
@@ -23,7 +27,6 @@ import { execFileSync } from "node:child_process";
 
 const root = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 const operatorDir = resolve(root, "apps/operator");
-const releaseDir = resolve(operatorDir, "release");
 const checkOnly = process.argv.includes("--check");
 
 function run(cmd, args, opts = {}) {
@@ -39,9 +42,38 @@ function tryRun(cmd, args, opts = {}) {
 }
 
 // --- Resolve owner/repo from the single source of truth (electron-builder config) ---
-const pkgPath = resolve(operatorDir, "package.json");
-const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-const version = pkg.version;
+// Operator's build.publish is the release target. License Admin must point at
+// the SAME owner/repo but a different channel, so both apps' assets live in
+// one GitHub Release while each app reads only its own update-info file:
+//   Operator      -> latest.yml         (default channel)
+//   License Admin -> license-admin.yml  (channel "license-admin")
+const DESKTOP_APPS = [
+  {
+    label: "Operator",
+    workspace: "@tournament/operator",
+    dir: operatorDir,
+    artifactPrefix: "Tournament-Operator-Setup",
+    channel: "latest",
+  },
+  {
+    label: "License Admin",
+    workspace: "@tournament/license-admin",
+    dir: resolve(root, "apps/license-admin"),
+    artifactPrefix: "Tournament-License-Admin-Setup",
+    channel: "license-admin",
+  },
+];
+
+for (const desktopApp of DESKTOP_APPS) {
+  desktopApp.pkg = JSON.parse(readFileSync(resolve(desktopApp.dir, "package.json"), "utf8"));
+  desktopApp.version = desktopApp.pkg.version;
+  desktopApp.releaseDir = resolve(desktopApp.dir, "release");
+  desktopApp.channelFile = `${desktopApp.channel}.yml`;
+}
+const [operatorApp, licenseAdminApp] = DESKTOP_APPS;
+
+const pkg = operatorApp.pkg;
+const version = operatorApp.version;
 const publishCfg = pkg.build?.publish;
 
 if (!publishCfg || publishCfg.provider !== "github" || !publishCfg.owner || !publishCfg.repo) {
@@ -52,8 +84,32 @@ if (!publishCfg || publishCfg.provider !== "github" || !publishCfg.owner || !pub
 const { owner, repo } = publishCfg;
 const ghRepo = `${owner}/${repo}`;
 
-// Cross-check against the runtime updater config so the packaged app and the
-// publisher can never silently drift apart.
+// Channel safety: Operator must stay on the default channel (latest.yml), and
+// License Admin must publish to the same repo under its own channel.
+if (publishCfg.channel != null && publishCfg.channel !== "latest") {
+  console.error(`apps/operator/package.json build.publish.channel is "${publishCfg.channel}" — Operator must stay on the default "latest" channel (latest.yml).`);
+  process.exit(1);
+}
+const laPublishCfg = licenseAdminApp.pkg.build?.publish;
+if (
+  !laPublishCfg ||
+  laPublishCfg.provider !== "github" ||
+  laPublishCfg.owner !== owner ||
+  laPublishCfg.repo !== repo ||
+  laPublishCfg.channel !== licenseAdminApp.channel
+) {
+  console.error("apps/license-admin/package.json build.publish must be the same GitHub owner/repo as Operator with its own channel:");
+  console.error(`  expected: { provider: "github", owner: "${owner}", repo: "${repo}", channel: "${licenseAdminApp.channel}" }`);
+  console.error(`  actual:   ${JSON.stringify(laPublishCfg ?? null)}`);
+  process.exit(1);
+}
+if (operatorApp.channelFile === licenseAdminApp.channelFile || operatorApp.artifactPrefix === licenseAdminApp.artifactPrefix) {
+  console.error("Operator and License Admin must use distinct update channels and installer names.");
+  process.exit(1);
+}
+
+// Cross-check against each app's runtime updater config so a packaged app and
+// the publisher can never silently drift apart.
 const updatePolicy = await import(pathToFileURL(resolve(operatorDir, "electron/updatePolicy.cjs")));
 const runtimeCfg = updatePolicy.githubPublishConfig();
 if (runtimeCfg.owner !== owner || runtimeCfg.repo !== repo) {
@@ -61,6 +117,14 @@ if (runtimeCfg.owner !== owner || runtimeCfg.repo !== repo) {
   console.error(`  apps/operator/package.json build.publish -> ${owner}/${repo}`);
   console.error(`  apps/operator/electron/updatePolicy.cjs   -> ${runtimeCfg.owner}/${runtimeCfg.repo}`);
   console.error("Fix one of these before publishing — a packaged app must check the same repo this script publishes to.");
+  process.exit(1);
+}
+const laUpdatePolicy = await import(pathToFileURL(resolve(licenseAdminApp.dir, "electron/updatePolicy.cjs")));
+const laRuntimeCfg = laUpdatePolicy.githubPublishConfig();
+if (laRuntimeCfg.owner !== owner || laRuntimeCfg.repo !== repo || laRuntimeCfg.channel !== licenseAdminApp.channel) {
+  console.error("Inconsistent GitHub target between License Admin's build config and its runtime updater:");
+  console.error(`  expected -> ${owner}/${repo} channel ${licenseAdminApp.channel}`);
+  console.error(`  apps/license-admin/electron/updatePolicy.cjs -> ${laRuntimeCfg.owner}/${laRuntimeCfg.repo} channel ${laRuntimeCfg.channel}`);
   process.exit(1);
 }
 
@@ -71,65 +135,99 @@ if (!version) {
 const tag = `v${version}`;
 
 // --- Verify local release artifacts exist and are internally consistent ---
-const latestPath = resolve(releaseDir, "latest.yml");
-if (!existsSync(latestPath)) {
-  console.error(`Missing ${latestPath}. Run npm run build:desktop -w @tournament/operator first.`);
-  process.exit(1);
-}
-const latestRaw = readFileSync(latestPath, "utf8");
-const latestVersion = (latestRaw.match(/^version:\s*(.+)$/m) || [])[1]?.trim();
-const setupName = (latestRaw.match(/^path:\s*(.+)$/m) || [])[1]?.trim();
-const declaredSha512 = (latestRaw.match(/^sha512:\s*(.+)$/m) || [])[1]?.trim();
-
-if (!latestVersion || !setupName || !declaredSha512) {
-  console.error("Could not parse version/path/sha512 from latest.yml.");
-  process.exit(1);
-}
-if (latestVersion !== version) {
-  console.error(`Version mismatch: apps/operator/package.json is ${version}, but latest.yml says ${latestVersion}.`);
-  console.error("Rebuild with npm run build:desktop -w @tournament/operator before publishing.");
-  process.exit(1);
-}
-
-const installerPath = resolve(releaseDir, setupName);
-const blockmapPath = resolve(releaseDir, `${setupName}.blockmap`);
-const expectedName = `Tournament-Operator-Setup-${version}.exe`;
-if (setupName !== expectedName) {
-  console.error(`latest.yml points at "${setupName}", expected "${expectedName}" for version ${version}.`);
-  process.exit(1);
-}
-
-const files = [installerPath, blockmapPath, latestPath];
-for (const file of files) {
-  if (!existsSync(file)) {
-    console.error(`Missing release artifact: ${file}`);
+function verifyDesktopArtifacts(desktopApp) {
+  const { label, workspace, releaseDir, channelFile, artifactPrefix } = desktopApp;
+  const rebuild = `npm run build:desktop -w ${workspace}`;
+  if (!desktopApp.version) {
+    console.error(`${label} package.json has no version.`);
     process.exit(1);
   }
+  // A foreign channel file in this app's release dir means the build config
+  // drifted — refuse rather than risk publishing the wrong metadata.
+  for (const other of DESKTOP_APPS) {
+    if (other !== desktopApp && existsSync(resolve(releaseDir, other.channelFile))) {
+      console.error(`${label}'s release folder contains ${other.channelFile}, which belongs to ${other.label}'s update channel. Check ${label}'s build.publish config and rebuild with ${rebuild}.`);
+      process.exit(1);
+    }
+  }
+  const latestPath = resolve(releaseDir, channelFile);
+  if (!existsSync(latestPath)) {
+    console.error(`Missing ${latestPath}. Run ${rebuild} first.`);
+    process.exit(1);
+  }
+  const latestRaw = readFileSync(latestPath, "utf8");
+  const latestVersion = (latestRaw.match(/^version:\s*(.+)$/m) || [])[1]?.trim();
+  const setupName = (latestRaw.match(/^path:\s*(.+)$/m) || [])[1]?.trim();
+  const declaredSha512 = (latestRaw.match(/^sha512:\s*(.+)$/m) || [])[1]?.trim();
+
+  if (!latestVersion || !setupName || !declaredSha512) {
+    console.error(`Could not parse version/path/sha512 from ${label} ${channelFile}.`);
+    process.exit(1);
+  }
+  if (latestVersion !== desktopApp.version) {
+    console.error(`Version mismatch: ${label} package.json is ${desktopApp.version}, but ${channelFile} says ${latestVersion}.`);
+    console.error(`Rebuild with ${rebuild} before publishing.`);
+    process.exit(1);
+  }
+
+  const installerPath = resolve(releaseDir, setupName);
+  const blockmapPath = resolve(releaseDir, `${setupName}.blockmap`);
+  const expectedName = `${artifactPrefix}-${desktopApp.version}.exe`;
+  if (setupName !== expectedName) {
+    console.error(`${channelFile} points at "${setupName}", expected "${expectedName}" for ${label} ${desktopApp.version}.`);
+    process.exit(1);
+  }
+
+  const files = [installerPath, blockmapPath, latestPath];
+  for (const file of files) {
+    if (!existsSync(file)) {
+      console.error(`Missing release artifact: ${file}`);
+      process.exit(1);
+    }
+  }
+
+  // Recompute the installer's sha512 locally and cross-check against the
+  // channel file rather than trusting the file electron-builder wrote.
+  const installerBytes = readFileSync(installerPath);
+  const actualSha512 = createHash("sha512").update(installerBytes).digest("base64");
+  if (actualSha512 !== declaredSha512) {
+    console.error(`${label} ${channelFile} sha512 does not match the actual installer bytes on disk.`);
+    console.error(`  ${channelFile}: ${declaredSha512}`);
+    console.error(`  computed (.exe): ${actualSha512}`);
+    console.error(`Rebuild with ${rebuild} before publishing.`);
+    process.exit(1);
+  }
+  const declaredSize = Number((latestRaw.match(/^\s*size:\s*(\d+)$/m) || [])[1]);
+  const actualSize = statSync(installerPath).size;
+  if (declaredSize && declaredSize !== actualSize) {
+    console.error(`${label} ${channelFile} declares size ${declaredSize} but the installer on disk is ${actualSize} bytes.`);
+    process.exit(1);
+  }
+
+  console.log(`${label}:`);
+  console.log(`  Version:    ${desktopApp.version}`);
+  console.log(`  Channel:    ${desktopApp.channel} (${channelFile})`);
+  console.log(`  Installer:  ${basename(installerPath)} (${actualSize} bytes)`);
+  console.log(`  sha512 verified against ${channelFile}.`);
+  return files;
 }
 
-// Recompute the installer's sha512 locally and cross-check against latest.yml
-// rather than trusting the file electron-builder wrote.
-const installerBytes = readFileSync(installerPath);
-const actualSha512 = createHash("sha512").update(installerBytes).digest("base64");
-if (actualSha512 !== declaredSha512) {
-  console.error("latest.yml sha512 does not match the actual installer bytes on disk.");
-  console.error(`  latest.yml:      ${declaredSha512}`);
-  console.error(`  computed (.exe): ${actualSha512}`);
-  console.error("Rebuild with npm run build:desktop -w @tournament/operator before publishing.");
-  process.exit(1);
-}
-const declaredSize = Number((latestRaw.match(/^\s*size:\s*(\d+)$/m) || [])[1]);
-const actualSize = statSync(installerPath).size;
-if (declaredSize && declaredSize !== actualSize) {
-  console.error(`latest.yml declares size ${declaredSize} but the installer on disk is ${actualSize} bytes.`);
-  process.exit(1);
-}
-
-console.log(`Version:    ${version}`);
 console.log(`Tag:        ${tag}`);
 console.log(`Repository: ${ghRepo}`);
-console.log(`Installer:  ${basename(installerPath)} (${actualSize} bytes)`);
-console.log(`sha512 verified against latest.yml.`);
+const operatorFiles = verifyDesktopArtifacts(operatorApp);
+const licenseAdminFiles = verifyDesktopArtifacts(licenseAdminApp);
+// Installers and blockmaps first, update-info files last (Operator's latest.yml
+// at the very end). The release stays a draft until every upload succeeds.
+const files = [
+  ...operatorFiles.slice(0, 2),
+  ...licenseAdminFiles.slice(0, 2),
+  licenseAdminFiles[2],
+  operatorFiles[2],
+];
+if (new Set(files.map((f) => basename(f))).size !== files.length) {
+  console.error("Duplicate asset names across Operator and License Admin — refusing to publish.");
+  process.exit(1);
+}
 
 // --- Auth check ---
 const ghVersion = tryRun("gh", ["--version"]);
@@ -191,7 +289,7 @@ const create = tryRun("gh", [
   "--repo", ghRepo,
   "--draft",
   "--title", tag,
-  "--notes", `Tournament Operator ${version} — Windows desktop update.`,
+  "--notes", `Tournament Operator ${version} and Tournament License Admin ${licenseAdminApp.version} — Windows desktop updates.`,
 ]);
 if (!create.ok) {
   console.error(`Failed to create draft release ${tag}: ${create.error.message}`);
@@ -277,4 +375,4 @@ for (const file of files) {
 
 console.log("");
 console.log(`Release ${tag} published: ${verify.url}`);
-console.log("Installed Operator apps will see this version on the next update check.");
+console.log(`Installed Operator apps will see ${version} (latest.yml) and installed License Admin apps will see ${licenseAdminApp.version} (license-admin.yml) on their next update check.`);
