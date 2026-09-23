@@ -78,3 +78,13 @@ td.email { word-break: break-all; }
   td.actions { display: block; text-align: left; } td.actions::before { display: none; } .acts { justify-content: flex-start; } td.mono { white-space: normal; }
   .search input { min-width: 0; width: 100%; } .search { width: 100%; }
 }
+.list-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.btn.refresh { flex: none; }
+.btn.refresh:disabled { opacity: .7; cursor: progress; }
+.spin { animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+@media (max-width: 800px) {
+  .list-tools { width: 100%; flex-wrap: nowrap; }
+  .list-tools .search { flex: 1 1 auto; min-width: 0; }
+}

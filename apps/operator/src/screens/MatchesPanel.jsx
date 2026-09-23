@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Alert, Badge, Button, Card, Dropdown, EmptyState, Input, Modal, SectionHeader, Select, ServeIndicator, Stat, StatusBadge, Table } from "@tournament/ui";
 import { ExternalLink } from "lucide-react";
+import { validateFinalScore } from "@tournament/engine";
 import { openLiveMatchWindow, openMatchDisplayWindow } from "../useRealtimeChannel.js";
 import {
   courtFor,
@@ -9,7 +10,8 @@ import {
   normalizePersonName,
   personLabel,
   playableMatches,
-  recommendedScoringTarget,
+  nextSeqAfterOutOfOrder,
+  scoringTargetFor,
   resolvePersonByName,
   resultFor,
   scoreLine,
@@ -23,8 +25,9 @@ import {
 // packages/engine/src/scoring.js applyScoreEvent's "correction" case and
 // packages/api/src/handleCommand.js handleScoreEvent). Only reachable for
 // live (in-progress) matches from this entry point.
-function EditScoreModal({ match, nameA, nameB, command, onClose, onSaved }) {
+function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved }) {
   const state = match.score_state || {};
+  const winTo = target || 11;
   const [scoreA, setScoreA] = useState(String(state.scoreA ?? 0));
   const [scoreB, setScoreB] = useState(String(state.scoreB ?? 0));
   const [reason, setReason] = useState("");
@@ -42,19 +45,30 @@ function EditScoreModal({ match, nameA, nameB, command, onClose, onSaved }) {
   const nextB = Number.parseInt(scoreB, 10);
   const validNumbers = scoreA !== "" && scoreB !== "" && Number.isInteger(nextA) && Number.isInteger(nextB) && nextA >= 0 && nextB >= 0;
   const unchanged = validNumbers && nextA === (state.scoreA ?? 0) && nextB === (state.scoreB ?? 0);
-  const canContinue = validNumbers && !unchanged && !busy;
+  // Same rule the engine enforces: race to winTo, no deuce (e.g. 11–10 / 15–14 end the match).
+  const check = validNumbers ? validateFinalScore(nextA, nextB, winTo) : null;
+  const scoreError = check && !check.ok ? check.reason : "";
+  const canContinue = validNumbers && !unchanged && !scoreError && !busy;
 
   async function submit() {
     setBusy(true);
     setError("");
+    const send = (seq) => command("score_event", {
+      match_id: match.id,
+      event_id: crypto.randomUUID(),
+      seq,
+      type: "correction",
+      payload: { scoreA: nextA, scoreB: nextB, reason: reason.trim() || undefined },
+    }, { durable: true });
     try {
-      await command("score_event", {
-        match_id: match.id,
-        event_id: crypto.randomUUID(),
-        seq: (state.lastSeq || 0) + 1,
-        type: "correction",
-        payload: { scoreA: nextA, scoreB: nextB, reason: reason.trim() || undefined },
-      }, { durable: true });
+      try {
+        await send((state.lastSeq || 0) + 1);
+      } catch (err) {
+        // The umpire may have scored since this screen last refreshed.
+        const retrySeq = nextSeqAfterOutOfOrder(err);
+        if (retrySeq == null) throw err;
+        await send(retrySeq);
+      }
       await onSaved?.();
       onClose();
     } catch (err) {
@@ -67,7 +81,7 @@ function EditScoreModal({ match, nameA, nameB, command, onClose, onSaved }) {
   return (
     <Modal title="Edit score" onClose={() => !busy && onClose()}>
       <div className="stack">
-        <p className="muted" style={{ margin: 0 }}>Game {state.gameNumber || 1} · {nameA} vs {nameB}</p>
+        <p className="muted" style={{ margin: 0 }}>Game {state.gameNumber || 1} · {nameA} vs {nameB} · Race to {winTo}</p>
         <div className="row" style={{ alignItems: "flex-end" }}>
           <div className="stack" style={{ gap: 4 }}>
             <Input label={nameA} inputMode="numeric" value={scoreA} onChange={(e) => setScoreA(digitsOnly(e.target.value))} />
@@ -85,6 +99,10 @@ function EditScoreModal({ match, nameA, nameB, command, onClose, onSaved }) {
           </div>
         </div>
         <Input label="Reason (optional)" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why is this score being corrected?" />
+        {scoreError && <Alert>{scoreError}</Alert>}
+        {check?.ok && check.complete && !unchanged && (
+          <p className="muted" style={{ margin: 0 }}>This score ends the match — first to {winTo} wins.</p>
+        )}
         {error && <Alert>{error}</Alert>}
         {!confirming ? (
           <div className="row">
@@ -155,6 +173,7 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
       {editingMatch && (
         <EditScoreModal
           match={editingMatch}
+          target={scoringTargetFor(editingMatch, data.matches)}
           nameA={sideOf(editingMatch.id, "A", data).name}
           nameB={sideOf(editingMatch.id, "B", data).name}
           command={command}
@@ -359,10 +378,10 @@ const OVERRIDE_START_REASONS = [
 function OverrideStartModal({ match, data, command, onClose, onSaved }) {
   const a = sideOf(match.id, "A", data);
   const b = sideOf(match.id, "B", data);
-  const division = (data.divisions || []).find((d) => d.id === match.division_id);
   const [reasonChoice, setReasonChoice] = useState("");
   const [customReason, setCustomReason] = useState("");
-  const [winTo, setWinTo] = useState(() => recommendedScoringTarget(match, division));
+  // Decided by stage and enforced by the server — shown, not chosen.
+  const winTo = scoringTargetFor(match, data.matches);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -376,7 +395,7 @@ function OverrideStartModal({ match, data, command, onClose, onSaved }) {
     setBusy(true);
     setError("");
     try {
-      await command("start_match", { match_id: match.id, override: true, reason, scoring_override: { winTo } }, { durable: true });
+      await command("start_match", { match_id: match.id, override: true, reason }, { durable: true });
       await onSaved?.();
       onClose();
     } catch (err) {
@@ -391,16 +410,7 @@ function OverrideStartModal({ match, data, command, onClose, onSaved }) {
       <div className="stack">
         <Alert>This bypasses the normal umpire start flow. Use only when the umpire cannot start the match.</Alert>
         <p className="muted" style={{ margin: 0 }}>{a.name} vs {b.name}</p>
-        <Select
-          label="How many points?"
-          value={String(winTo)}
-          onChange={(e) => setWinTo(Number(e.target.value))}
-          disabled={busy}
-          hint="This match ends as soon as a team reaches this number."
-        >
-          <option value="11">Race to 11</option>
-          <option value="15">Race to 15</option>
-        </Select>
+        <p style={{ margin: 0 }}><strong>Race to {winTo}</strong> <span className="muted">— set by stage; the first team to {winTo} wins (no deuce).</span></p>
         <Select label="Reason" value={reasonChoice} onChange={(e) => setReasonChoice(e.target.value)} disabled={busy}>
           <option value="">Select a reason…</option>
           {OVERRIDE_START_REASONS.map((r) => <option key={r} value={r}>{r}</option>)}

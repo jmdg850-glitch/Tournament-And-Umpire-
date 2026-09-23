@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { Ban, Copy, LogOut, Monitor, Plus, Search } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Ban, Copy, LogOut, Monitor, Plus, RefreshCw, Search } from "lucide-react";
 import { callAdmin, configured, supabase } from "./api.js";
 import { copyText, endOfDayIso, fmtDate, statusOf } from "./format.js";
 
@@ -144,16 +144,54 @@ function Licenses({ refreshKey, onChanged, notify }) {
   const [error, setError] = useState("");
   const [confirm, setConfirm] = useState(null); // { kind: "revoke" | "release", license }
   const [busy, setBusy] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  // Only the newest list request may update the table, whether it came from
+  // typing, a create/revoke/release, or the Refresh button.
+  const latestRequest = useRef(0);
+  const refreshInFlight = useRef(false);
+
+  const fetchList = useCallback((term) => {
+    const id = ++latestRequest.current;
+    return callAdmin("list", { search: term })
+      .then((d) => { if (id === latestRequest.current) { setItems(d.items); setError(""); } })
+      .catch((e) => { if (id === latestRequest.current) setError(e.message); });
+  }, []);
 
   useEffect(() => {
-    let live = true;
-    const t = setTimeout(() => {
-      callAdmin("list", { search })
-        .then((d) => { if (live) { setItems(d.items); setError(""); } })
-        .catch((e) => live && setError(e.message));
-    }, search ? 250 : 0);
-    return () => { live = false; clearTimeout(t); };
-  }, [search, refreshKey]);
+    const t = setTimeout(() => { fetchList(search); }, search ? 250 : 0);
+    return () => { clearTimeout(t); latestRequest.current++; };
+  }, [search, refreshKey, fetchList]);
+
+  // Manual refresh: a fresh request to the license backend (not a re-render of
+  // cached rows). Keeps the current search and the rows on screen until the
+  // new data arrives; ignores clicks while a refresh is already running.
+  async function refresh() {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
+    setRefreshing(true);
+    try {
+      await fetchList(search);
+    } finally {
+      refreshInFlight.current = false;
+      setRefreshing(false);
+    }
+  }
+
+  // Android hardware back button: close an open confirm dialog instead of
+  // exiting the app. No-op on Web/Electron (no native Capacitor runtime there).
+  useEffect(() => {
+    if (!window.Capacitor?.isNativePlatform?.()) return undefined;
+    let handle;
+    let cancelled = false;
+    import("@capacitor/app").then(({ App: CapApp }) => {
+      if (cancelled) return;
+      CapApp.addListener("backButton", () => {
+        if (confirm) setConfirm(null);
+        else CapApp.exitApp();
+      }).then((h) => { handle = h; });
+    });
+    return () => { cancelled = true; handle?.remove(); };
+  }, [confirm]);
 
   async function run() {
     setBusy(true);
@@ -174,9 +212,14 @@ function Licenses({ refreshKey, onChanged, notify }) {
     <section className="card">
       <div className="row between">
         <h2>Licenses{items ? ` (${items.length})` : ""}</h2>
-        <label className="search"><Search size={16} aria-hidden="true" />
-          <input type="search" placeholder="Search email, code or PC" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search licenses" />
-        </label>
+        <div className="list-tools">
+          <label className="search"><Search size={16} aria-hidden="true" />
+            <input type="search" placeholder="Search email, code or PC" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search licenses" />
+          </label>
+          <button type="button" className="btn refresh" onClick={refresh} disabled={refreshing} aria-busy={refreshing}>
+            <RefreshCw size={14} aria-hidden="true" className={refreshing ? "spin" : undefined} /> {refreshing ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
       </div>
       {error ? <div className="alert bad" role="alert">{error}</div> : null}
       {!items ? <p className="muted">Loading…</p> : items.length === 0 ? <p className="muted">No licenses yet. Generate one above.</p> : (
@@ -292,3 +335,7 @@ export default function App() {
     </div>
   );
 }
+
+// Named exports exist only so tests can render each piece directly; App's own
+// behavior is unchanged (still the sole default export used by main.jsx).
+export { Login, Recovery, Confirm, Generate, Licenses };

@@ -1,18 +1,21 @@
-import test from "node:test";
-import assert from "node:assert/strict";
+import { describe, expect, it } from "vitest";
 import { endOfDayIso, statusOf } from "./format.js";
 
-test("status labels follow revoked > expired > activated > not activated", () => {
-  assert.equal(statusOf({ status: "unused" }).label, "Not activated");
-  assert.equal(statusOf({ status: "active" }).label, "Activated");
-  assert.equal(statusOf({ status: "revoked" }).label, "Revoked");
-  assert.equal(statusOf({ status: "active", expired: true }).label, "Expired");
-  assert.equal(statusOf({ status: "revoked", expired: true }).label, "Revoked");
+describe("statusOf", () => {
+  it("status labels follow revoked > expired > activated > not activated", () => {
+    expect(statusOf({ status: "unused" }).label).toBe("Not activated");
+    expect(statusOf({ status: "active" }).label).toBe("Activated");
+    expect(statusOf({ status: "revoked" }).label).toBe("Revoked");
+    expect(statusOf({ status: "active", expired: true }).label).toBe("Expired");
+    expect(statusOf({ status: "revoked", expired: true }).label).toBe("Revoked");
+  });
 });
 
-test("end-of-day expiry is a future-safe ISO instant, blank means no expiry", () => {
-  assert.equal(endOfDayIso(""), undefined);
-  const d = new Date(endOfDayIso("2030-06-15"));
-  assert.equal(d.getFullYear(), 2030);
-  assert.equal(d.getHours(), 23);
+describe("endOfDayIso", () => {
+  it("end-of-day expiry is a future-safe ISO instant, blank means no expiry", () => {
+    expect(endOfDayIso("")).toBeUndefined();
+    const d = new Date(endOfDayIso("2030-06-15"));
+    expect(d.getFullYear()).toBe(2030);
+    expect(d.getHours()).toBe(23);
+  });
 });

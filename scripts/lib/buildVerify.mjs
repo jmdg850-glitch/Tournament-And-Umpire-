@@ -126,12 +126,18 @@ export function getInstallerProductVersion(path) {
 // Returns { ok: true, path, size, mtime, productVersion, authenticode } or { ok: false, error }.
 // notOlderThanMs (optional): reject an installer whose mtime predates this build run,
 // so a stale artifact left over from an earlier build can never pass as the new one.
-export function verifyWindowsInstaller({ root, operatorDir, version, notOlderThanMs }) {
-  const checkStatus = run("node", [resolve(root, "scripts/publish-desktop-update.mjs"), "--check"], { cwd: root });
-  if (checkStatus !== 0) {
-    return { ok: false, error: "Windows release artifact verification failed (see scripts/publish-desktop-update.mjs --check output above)." };
+export function verifyWindowsInstaller({
+  root, operatorDir, version, notOlderThanMs,
+  artifactNamePattern = "Tournament-Operator-Setup",
+  skipUpdateCheck = false,
+}) {
+  if (!skipUpdateCheck) {
+    const checkStatus = run("node", [resolve(root, "scripts/publish-desktop-update.mjs"), "--check"], { cwd: root });
+    if (checkStatus !== 0) {
+      return { ok: false, error: "Windows release artifact verification failed (see scripts/publish-desktop-update.mjs --check output above)." };
+    }
   }
-  const installerPath = resolve(operatorDir, `release/Tournament-Operator-Setup-${version}.exe`);
+  const installerPath = resolve(operatorDir, `release/${artifactNamePattern}-${version}.exe`);
   if (!existsSync(installerPath)) {
     return { ok: false, error: `Expected installer not found at ${installerPath}` };
   }
@@ -153,7 +159,14 @@ export function verifyWindowsInstaller({ root, operatorDir, version, notOlderTha
 // androidSdk/javaHome are passed in (not re-resolved here) so callers that already
 // located them for the Gradle build reuse the same result.
 // notOlderThanMs (optional): reject an APK whose mtime predates this build run.
-export function verifyAndroidApk({ androidDir, androidSdk, javaHome, expectedAppId, expectedVersionCode, expectedVersionName, notOlderThanMs }) {
+// allowUnsigned (optional, default false): for an app whose release signing is
+// optional (License Admin), accept Gradle's unsigned release output. See
+// verifyUnsignedOrSignedApk below. Callers that don't pass it (Umpire) keep
+// the strict signed-APK path unchanged.
+export function verifyAndroidApk({ androidDir, androidSdk, javaHome, expectedAppId, expectedVersionCode, expectedVersionName, notOlderThanMs, allowUnsigned = false }) {
+  if (allowUnsigned) {
+    return verifyUnsignedOrSignedApk({ androidDir, androidSdk, javaHome, expectedAppId, expectedVersionCode, expectedVersionName, notOlderThanMs });
+  }
   const apkPath = resolve(androidDir, "app/build/outputs/apk/release/app-release.apk");
   if (!existsSync(apkPath)) return { ok: false, error: `Expected release APK not found at ${apkPath}` };
   const apkStat = statSync(apkPath);
@@ -214,5 +227,84 @@ export function verifyAndroidApk({ androidDir, androidSdk, javaHome, expectedApp
     versionName: versionNameOut?.[1],
     signerDn,
     signerSha256,
+  };
+}
+
+// For an app whose Android release signing is optional (License Admin: signed
+// only when apps/license-admin/android/keystore.properties is configured).
+// Gradle's own output-metadata.json names the artifact THIS build produced, so
+// a stale file from an earlier build can never be picked instead:
+//  - "app-release.apk"          → signed build: full strict verification above
+//                                  (signer present, not a debug certificate).
+//  - "app-release-unsigned.apk" → unsigned build: same identity checks (release
+//                                  variant, fresh, valid APK archive, applicationId,
+//                                  versionCode/versionName, not debuggable) but no
+//                                  signer is required.
+// Returns the same shape as verifyAndroidApk plus `signed: true|false`.
+function verifyUnsignedOrSignedApk({ androidDir, androidSdk, javaHome, expectedAppId, expectedVersionCode, expectedVersionName, notOlderThanMs }) {
+  const releaseDir = resolve(androidDir, "app/build/outputs/apk/release");
+  const metadataPath = resolve(releaseDir, "output-metadata.json");
+  if (!existsSync(metadataPath)) return { ok: false, error: `Missing ${metadataPath} — cannot confirm which release APK this build produced.` };
+  let metadata;
+  try {
+    metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
+  } catch (err) {
+    return { ok: false, error: `Could not parse ${metadataPath}: ${err.message}` };
+  }
+  if (metadata.variantName !== "release") return { ok: false, error: `output-metadata.json variantName is "${metadata.variantName}", expected "release".` };
+  const element = (metadata.elements || [])[0];
+  const outputFile = element?.outputFile;
+
+  if (outputFile === "app-release.apk") {
+    const signed = verifyAndroidApk({ androidDir, androidSdk, javaHome, expectedAppId, expectedVersionCode, expectedVersionName, notOlderThanMs });
+    return signed.ok ? { ...signed, signed: true } : signed;
+  }
+  if (outputFile !== "app-release-unsigned.apk") {
+    return { ok: false, error: `output-metadata.json names an unexpected release APK "${outputFile}" (expected app-release.apk or app-release-unsigned.apk).` };
+  }
+
+  const apkPath = resolve(releaseDir, outputFile);
+  if (!existsSync(apkPath)) return { ok: false, error: `Expected unsigned release APK not found at ${apkPath}` };
+  const apkStat = statSync(apkPath);
+  if (notOlderThanMs != null && apkStat.mtimeMs < notOlderThanMs) {
+    return { ok: false, error: `APK ${apkPath} (modified ${apkStat.mtime.toISOString()}) is older than this build run — refusing to accept a stale artifact.` };
+  }
+  // An APK is a ZIP archive: local file header magic "PK\x03\x04".
+  const head = readFileSync(apkPath).subarray(0, 4);
+  if (!(head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04)) {
+    return { ok: false, error: `${apkPath} is not a valid APK (ZIP) archive.` };
+  }
+  if (expectedVersionCode != null && element.versionCode != null && String(element.versionCode) !== String(expectedVersionCode)) {
+    return { ok: false, error: `output-metadata.json versionCode ${element.versionCode} does not match expected ${expectedVersionCode}` };
+  }
+
+  const buildTools = findLatestBuildTools(androidSdk);
+  if (!buildTools) return { ok: false, error: `No usable build-tools (with aapt.exe) found under ${androidSdk}/build-tools` };
+  const badging = tryCapture(resolve(buildTools, "aapt.exe"), ["dump", "badging", apkPath]);
+  if (!badging.ok) return { ok: false, error: `aapt dump badging failed (not a readable APK): ${badging.error.message}` };
+  const pkgLine = badging.output.split(/\r?\n/).find((l) => l.startsWith("package:"));
+  const appIdMatch = pkgLine?.match(/name='([^']+)'/);
+  const versionCodeOut = pkgLine?.match(/versionCode='([^']+)'/);
+  const versionNameOut = pkgLine?.match(/versionName='([^']+)'/);
+  if (appIdMatch?.[1] !== expectedAppId) return { ok: false, error: `Unexpected applicationId in APK: ${appIdMatch?.[1]}` };
+  if (expectedVersionCode != null && versionCodeOut?.[1] !== String(expectedVersionCode)) {
+    return { ok: false, error: `APK versionCode ${versionCodeOut?.[1]} does not match expected ${expectedVersionCode}` };
+  }
+  if (expectedVersionName != null && versionNameOut?.[1] !== expectedVersionName) {
+    return { ok: false, error: `APK versionName ${versionNameOut?.[1]} does not match expected ${expectedVersionName}` };
+  }
+  if (/^application-debuggable/m.test(badging.output)) return { ok: false, error: "APK is marked debuggable — this is not a release configuration." };
+
+  return {
+    ok: true,
+    signed: false,
+    path: apkPath,
+    size: apkStat.size,
+    mtime: apkStat.mtime,
+    appId: appIdMatch[1],
+    versionCode: versionCodeOut?.[1],
+    versionName: versionNameOut?.[1],
+    signerDn: null,
+    signerSha256: null,
   };
 }

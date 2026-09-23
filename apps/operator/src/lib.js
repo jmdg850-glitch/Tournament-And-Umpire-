@@ -1,4 +1,4 @@
-import { rankIndividualPairsForSemifinals, buildTeamStandingsFromRoundRobin } from "@tournament/engine";
+import { rankIndividualPairsForSemifinals, buildTeamStandingsFromRoundRobin, matchScoringTarget } from "@tournament/engine";
 
 export const TOURNAMENT_FLOW = [
   "draft",
@@ -213,14 +213,25 @@ export function stageTitle(label) {
   return String(label).replaceAll("_", " ");
 }
 
-// The recommended default shown in the "Match scoring" confirmation dialog
-// before a match starts — the operator can still change it. Falls back to
-// the division's configured target for non-elimination-stage matches. The
-// server independently validates whatever target is actually submitted
-// (see ALLOWED_MATCH_SCORING_TARGETS in packages/api/src/handleCommand.js).
-export function recommendedScoringTarget(match, division) {
-  if (["semifinal", "final", "bronze"].includes(match?.stage_label)) return 15;
-  return Number(division?.config?.winTo) || 11;
+// The race-to target for a match. Scoring targets are decided by stage and
+// enforced server-side (packages/api matchScoringSettings → engine
+// matchScoringTarget): once started, the persisted score_state.winTo is
+// authoritative; before start, the same engine rule is applied to the loaded
+// matches so the operator sees exactly what the server will use.
+export function scoringTargetFor(match, matches = []) {
+  const started = Number(match?.score_state?.winTo);
+  if (Number.isInteger(started) && started > 0) return started;
+  return matchScoringTarget(match, matches);
+}
+
+// A stale-seq correction is rejected by the engine with
+// "Events must be applied in seq order (lastSeq=N, got M)". Corrections set an
+// absolute score, so they can safely be resent once at lastSeq + 1.
+export function nextSeqAfterOutOfOrder(err) {
+  const code = err?.code || err?.body?.error?.code;
+  if (code !== "OUT_OF_ORDER") return null;
+  const m = /lastSeq=(\d+)/.exec(err?.message || err?.body?.error?.message || "");
+  return m ? Number(m[1]) + 1 : null;
 }
 
 export function membersOfParticipant(participantId, participantMembers = []) {

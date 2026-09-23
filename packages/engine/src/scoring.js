@@ -9,6 +9,73 @@ export const checkGameWin = (scoreA, scoreB, winTo, winBy = "two") => {
     : null;
 };
 
+// Product scoring rule: the target is decided by the match's stage, never by a
+// manual choice. Qualification (and any other round) is race to 11; semifinal,
+// final and bronze are race to 15. First side to reach the target wins
+// immediately — no deuce / win-by-2 (11–10 and 15–14 are final scores).
+export const SCORING_WIN_BY = "none";
+export const QUALIFICATION_TARGET = 11;
+export const PLAYOFF_TARGET = 15;
+const PLAYOFF_TARGET_STAGES = ["semifinal", "final", "bronze"];
+
+export function stageScoringTarget(stage) {
+  return PLAYOFF_TARGET_STAGES.includes(String(stage || "").toLowerCase()) ? PLAYOFF_TARGET : QUALIFICATION_TARGET;
+}
+
+// Resolves the stage that decides a match's scoring target, without relying
+// on stage_label alone (single-elim brackets never set it, and team pair
+// matches carry their stage on the parent matchup):
+//  1. the match's own stage_label, else its parent's (team pair match);
+//  2. bracket_side "bronze" → "bronze";
+//  3. single-elim main bracket: last round → "final", the one before → "semifinal".
+// `related` is any list of matches that includes the match's siblings/parent
+// (e.g. every match in the division); missing data falls back to "qualification".
+export function matchScoringStage(match, related = []) {
+  if (!match) return "qualification";
+  if (match.stage_label) return match.stage_label;
+  const list = Array.isArray(related) ? related : [];
+  if (match.parent_match_id) {
+    const parent = list.find((m) => m.id === match.parent_match_id);
+    return parent ? matchScoringStage(parent, list) : "qualification";
+  }
+  if (match.bracket_side === "bronze") return "bronze";
+  if (match.bracket_side === "final") return "final";
+  const mainSide = (side) => ["main", "winners"].includes(side || "main");
+  if (mainSide(match.bracket_side) && Number.isInteger(match.round)) {
+    const rounds = list
+      .filter((m) => !m.parent_match_id && (mainSide(m.bracket_side) || m.bracket_side === "final")
+        && (match.stage_id == null || m.stage_id === match.stage_id)
+        && (match.division_id == null || m.division_id === match.division_id))
+      .map((m) => m.round)
+      .filter(Number.isInteger);
+    if (!rounds.length) return "qualification";
+    const maxRound = Math.max(match.round, ...rounds);
+    if (match.round === maxRound) return "final";
+    if (match.round === maxRound - 1) return "semifinal";
+  }
+  return "qualification";
+}
+
+export function matchScoringTarget(match, related = []) {
+  return stageScoringTarget(matchScoringStage(match, related));
+}
+
+// Validates a manually entered game score against a race-to-N target with no
+// deuce. Valid: both sides 0..winTo and not both at winTo. Complete: exactly
+// one side is at winTo (e.g. 11–10, 10–11, 15–14).
+export function validateFinalScore(scoreA, scoreB, winTo) {
+  if (!Number.isInteger(scoreA) || !Number.isInteger(scoreB) || scoreA < 0 || scoreB < 0) {
+    return { ok: false, complete: false, reason: "Scores must be whole numbers of 0 or more." };
+  }
+  if (scoreA > winTo || scoreB > winTo) {
+    return { ok: false, complete: false, reason: `This match is race to ${winTo} — a score cannot exceed ${winTo}.` };
+  }
+  if (scoreA === winTo && scoreB === winTo) {
+    return { ok: false, complete: false, reason: `Both sides cannot have ${winTo} — the first to ${winTo} wins.` };
+  }
+  return { ok: true, complete: scoreA === winTo || scoreB === winTo, reason: null };
+}
+
 export const DEFAULT_TIMEOUTS_ALLOWED = 2;
 export const FIRST_SERVE = 1;
 export const SECOND_SERVE = 2;
@@ -101,8 +168,23 @@ export function scoreStateForMatchStart(match, settings = {}) {
     && (existing.scoreA ?? 0) === 0
     && (existing.scoreB ?? 0) === 0
     && !(existing.games || []).length;
-  if (unplayed) return { ...existing, server: SECOND_SERVE };
+  if (unplayed) return withRules({ ...existing, server: SECOND_SERVE }, settings);
+  // A coin toss (lastSeq 1) writes state before start without any rally
+  // played; the rules decided at start must still apply to it.
+  const noRallyYet = (existing.rally ?? 0) === 0
+    && (existing.scoreA ?? 0) === 0
+    && (existing.scoreB ?? 0) === 0
+    && !(existing.games || []).length
+    && !(existing.history || []).length;
+  if (noRallyYet) return withRules(existing, settings);
   return existing;
+}
+
+function withRules(state, settings) {
+  const next = { ...state };
+  if (settings.winTo != null) next.winTo = settings.winTo;
+  if (settings.winBy != null) next.winBy = settings.winBy;
+  return next;
 }
 
 export function createInitialScoreState(settings = {}) {
@@ -256,6 +338,10 @@ export function applyScoreEvent(state, event) {
     const scoreB = payload.scoreB;
     if (!Number.isInteger(scoreA) || !Number.isInteger(scoreB) || scoreA < 0 || scoreB < 0) {
       return { state, applied: false };
+    }
+    if (state.winBy === SCORING_WIN_BY && Number.isInteger(state.winTo)) {
+      const check = validateFinalScore(scoreA, scoreB, state.winTo);
+      if (!check.ok) return { state, applied: false, code: "INVALID_SCORE", reason: check.reason };
     }
     next = applyCorrection(state, scoreA, scoreB);
   } else if (event.type === "coin_toss") {

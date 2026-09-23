@@ -9,6 +9,11 @@
 //  - A customer can activate only a code issued to THEIR OWN verified email.
 //    Knowing someone else's code is useless without owning that mailbox.
 //  - Admin actions require a row in public.license_admins, checked on every call.
+//  - Code-first setup (claim / set_password) needs no session: possession of
+//    the admin-issued access code is the proof. It binds the code's license to
+//    this PC and may create the Supabase Auth account for the license's email
+//    (password hashed by Supabase Auth) — but never overwrites an existing
+//    account's password, and only from the PC the license is bound to.
 //  - The database is only reachable through this function (RLS: no client grants).
 
 const ALPHABET = "23456789ABCDEFGHJKMNPQRSTVWXYZ"; // 30 symbols: no 0/1/I/L/O/U
@@ -25,6 +30,10 @@ export const ERRORS = {
   EMAIL_NOT_VERIFIED: [403, "Please confirm your email address before activating a license."],
   INVALID_CODE_FORMAT: [400, "Invalid access code format."],
   INVALID_CODE: [404, "This access code is not valid for this account."],
+  UNKNOWN_CODE: [404, "This access code is not valid."],
+  ACCOUNT_EXISTS: [409, "An account already exists for this license. Sign in with its password, or reset it."],
+  WEAK_PASSWORD: [400, "Choose a password of 8 to 72 characters."],
+  NOT_BOUND_HERE: [409, "Activate this access code on this PC first."],
   REVOKED: [403, "This license has been revoked."],
   EXPIRED: [403, "This license has expired."],
   ALREADY_ACTIVATED: [409, "This license is already activated on another PC."],
@@ -151,6 +160,10 @@ export function customerView(license, deviceId, now) {
 // ---------------------------------------------------------------------------
 
 const CUSTOMER_ACTIONS = { activate: ["code", "device"], check: ["device"] };
+// No session required — the access code itself authorizes these.
+const PUBLIC_ACTIONS = { claim: ["code", "device"], set_password: ["code", "device", "password"] };
+export const PASSWORD_MIN = 8;
+export const PASSWORD_MAX = 72; // bcrypt's input limit in Supabase Auth
 const ADMIN_ACTIONS = {
   whoami: [],
   create: ["email", "expires_at"],
@@ -201,7 +214,15 @@ async function activate({ admin, actor, body, now }) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const d = decideActivation({ license, deviceId: device.id, now });
     if (!d.ok) throw new LicenseError(d.code);
-    if (d.action === "already_here") return customerView(license, device.id, now);
+    if (d.action === "already_here") {
+      // Bound by a code-first claim before this account existed: link it now.
+      if (!license.activated_user_id) {
+        const { error } = await admin.from("licenses").update({ activated_user_id: actor.id })
+          .eq("id", license.id).is("activated_user_id", null);
+        if (error) throw dbFail(error, "account link");
+      }
+      return customerView(license, device.id, now);
+    }
 
     // Atomic first-activation bind: only succeeds while still unbound, so two
     // PCs racing for the same license can never both win.
@@ -214,6 +235,89 @@ async function activate({ admin, actor, body, now }) {
     license = await findByEmailAndCode(admin, email, code); // lost a race: decide again on fresh state
   }
   throw new LicenseError("ALREADY_ACTIVATED");
+}
+
+// ----- code-first setup (no session) -----
+
+async function findByCode(admin, code) {
+  const { data, error } = await admin.from("licenses").select("*").eq("access_code", code).maybeSingle();
+  if (error) throw dbFail(error, "license lookup");
+  return data;
+}
+
+export function maskEmail(email) {
+  const [user, domain] = String(email || "").split("@");
+  if (!domain) return "";
+  const shown = user.length <= 2 ? user.slice(0, 1) : user.slice(0, 2);
+  return `${shown}${"•".repeat(Math.max(1, Math.min(user.length - shown.length, 6)))}@${domain}`;
+}
+
+// Step 1: validate the code and bind its license to this PC (same decision and
+// atomic bind as activate). Already bound here → no write, continue setup.
+async function claim({ admin, body, now }) {
+  const code = normalizeCode(body.code);
+  if (!code) throw new LicenseError("INVALID_CODE_FORMAT");
+  const device = validateDevice(body.device);
+
+  let license = await findByCode(admin, code);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const d = decideActivation({ license, deviceId: device.id, now });
+    if (!d.ok) throw new LicenseError(d.code === "INVALID_CODE" ? "UNKNOWN_CODE" : d.code);
+    if (d.action === "bind") {
+      const { data, error } = await admin.from("licenses").update({
+        status: "active", device_id: device.id, device_label: device.label || null,
+        activated_at: new Date(now).toISOString(), activated_user_id: null,
+      }).eq("id", license.id).eq("status", "unused").is("device_id", null).select("*");
+      if (error) throw dbFail(error, "activation");
+      if (!data || data.length !== 1) { license = await findByCode(admin, code); continue; }
+      license = data[0];
+    }
+    return {
+      ...customerView(license, device.id, now),
+      email_masked: maskEmail(license.email),
+      bound: d.action === "bind" ? "now" : "already_here",
+      // A license already linked to an account signs in; otherwise the buyer
+      // creates a password (set_password still refuses if an account exists).
+      next: license.activated_user_id ? "sign_in" : "set_password",
+    };
+  }
+  throw new LicenseError("ALREADY_ACTIVATED");
+}
+
+function isEmailExistsError(error) {
+  const text = `${error?.code || ""} ${error?.message || ""}`.toLowerCase();
+  return error?.code === "email_exists" || error?.code === "user_already_exists"
+    || text.includes("already been registered") || text.includes("already registered") || text.includes("already exists");
+}
+
+// Step 2: create the buyer's own account for the license's email. Only from the
+// PC the license is bound to, and never over an existing account.
+async function setPassword({ admin, body, now }) {
+  const code = normalizeCode(body.code);
+  if (!code) throw new LicenseError("INVALID_CODE_FORMAT");
+  const device = validateDevice(body.device);
+  const password = body.password;
+  if (typeof password !== "string" || password.length < PASSWORD_MIN || password.length > PASSWORD_MAX || !password.trim()) {
+    throw new LicenseError("WEAK_PASSWORD");
+  }
+
+  const license = await findByCode(admin, code);
+  const d = decideActivation({ license, deviceId: device.id, now });
+  if (!d.ok) throw new LicenseError(d.code === "INVALID_CODE" ? "UNKNOWN_CODE" : d.code);
+  if (d.action !== "already_here") throw new LicenseError("NOT_BOUND_HERE");
+  if (license.activated_user_id) throw new LicenseError("ACCOUNT_EXISTS");
+
+  const { data, error } = await admin.auth.admin.createUser({ email: license.email, password, email_confirm: true });
+  if (error || !data?.user?.id) {
+    if (isEmailExistsError(error)) throw new LicenseError("ACCOUNT_EXISTS");
+    // Log only the provider's error code/status — never the request body.
+    console.error("[license] account create:", error?.code, error?.status);
+    throw new LicenseError("INTERNAL", "account creation failed");
+  }
+  const { error: linkError } = await admin.from("licenses").update({ activated_user_id: data.user.id })
+    .eq("id", license.id).is("activated_user_id", null);
+  if (linkError) throw dbFail(linkError, "account link");
+  return { account: "created", email: license.email };
 }
 
 async function check({ admin, actor, body, now }) {
@@ -314,9 +418,18 @@ async function whoami({ actor }) {
   return { admin: true, user_id: actor.id, email: actor.email ?? null };
 }
 
-const HANDLERS = { activate, check, whoami, create, list, revoke, release };
+const HANDLERS = { activate, check, whoami, create, list, revoke, release, claim, set_password: setPassword };
+
+export function isPublicAction(body) {
+  return Boolean(body && typeof body === "object" && !Array.isArray(body)
+    && typeof body.action === "string" && Object.hasOwn(PUBLIC_ACTIONS, body.action));
+}
 
 export async function handleLicense({ admin, actor, body, now = Date.now() }) {
+  if (isPublicAction(body)) {
+    assertOnlyFields(body, PUBLIC_ACTIONS[body.action]);
+    return { ok: true, result: await HANDLERS[body.action]({ admin, body, now }) };
+  }
   if (!actor?.id) throw new LicenseError("UNAUTHENTICATED");
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new LicenseError("VALIDATION", "body must be an object");
   const action = body.action;

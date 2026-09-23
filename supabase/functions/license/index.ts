@@ -1,5 +1,5 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
-import { handleLicense } from "./license.js";
+import { handleLicense, isPublicAction } from "./license.js";
 
 // Licensing endpoint (email -> one code -> one PC). The caller's identity comes
 // ONLY from the verified Supabase JWT; admin rights are checked against
@@ -27,13 +27,25 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return fail("METHOD_NOT_ALLOWED", "Method not allowed.", 405);
 
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return fail("VALIDATION", "The request contains invalid data.", 400, "body must be JSON");
+  }
+
+  // Code-first setup (claim / set_password) is authorized by the access code
+  // itself and runs without a session; every other action needs a verified JWT.
+  const isPublic = isPublicAction(body);
   const jwt = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!jwt) return fail("UNAUTHENTICATED", "Please sign in to continue.", 401);
+  if (!jwt && !isPublic) return fail("UNAUTHENTICATED", "Please sign in to continue.", 401);
 
   try {
     const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
+
+    if (isPublic) return json(await handleLicense({ admin, actor: null, body }));
 
     const { data, error } = await admin.auth.getUser(jwt);
     if (error || !data?.user) return fail("UNAUTHENTICATED", "Please sign in to continue.", 401);
@@ -42,13 +54,6 @@ Deno.serve(async (req) => {
       email: data.user.email ?? null,
       emailConfirmed: Boolean(data.user.email_confirmed_at),
     };
-
-    let body: unknown;
-    try {
-      body = await req.json();
-    } catch {
-      return fail("VALIDATION", "The request contains invalid data.", 400, "body must be JSON");
-    }
 
     return json(await handleLicense({ admin, actor, body }));
   } catch (err) {

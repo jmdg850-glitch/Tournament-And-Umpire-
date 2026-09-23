@@ -372,3 +372,84 @@ input, select, textarea { background: #fff; }
   .spectator-header .kicker { font-size: 0.7rem; }
   .spectator-tabs { padding: 6px var(--space-3); }
 }
+
+/* ── Division settings ─────────────────────────────────────────────────────
+   Grouped sections on a single top-aligned grid so labels, controls and
+   buttons line up regardless of hint length; stacks to one column on phones. */
+.division-card { display: grid; gap: var(--space-4); min-width: 0; }
+.division-form { display: grid; gap: var(--space-4); min-width: 0; }
+.division-title { margin: 0; font-size: var(--text-md); overflow-wrap: anywhere; }
+.division-head {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: var(--space-3);
+}
+.division-head-title { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-width: 0; }
+.division-head-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.division-section {
+  display: grid; gap: var(--space-3); min-width: 0;
+  padding-top: var(--space-4); border-top: 1px solid var(--border);
+}
+.division-section-title {
+  margin: 0; font-size: var(--text-xs); font-weight: 800; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text);
+}
+.division-grid {
+  display: grid; gap: var(--space-3) var(--space-4); align-items: start;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+}
+.division-grid > label { min-width: 0; }
+.division-grid .hint, .division-note {
+  text-transform: none; letter-spacing: 0; font-weight: 500;
+  font-size: var(--text-xs); line-height: 1.4; color: var(--muted); margin: 0;
+}
+.division-rules {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; gap: var(--space-2);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr));
+}
+.division-rules li {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-2);
+  min-height: var(--touch); padding: 8px 12px;
+  background: var(--elevated); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.division-rules span { color: var(--muted); font-size: var(--text-xs); font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+.division-rules strong { white-space: nowrap; }
+.division-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
+.division-danger {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3);
+  padding-top: var(--space-3); border-top: 1px dashed color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+@media (max-width: 560px) {
+  .division-head-actions, .division-actions { width: 100%; }
+  .division-head-actions > .btn, .division-actions > .btn { flex: 1 1 100%; }
+  .division-danger > .btn { flex: 1 1 100%; }
+}
+
+/* ── Sign-in / activation ──────────────────────────────────────────────────
+   Four auth modes (Activate · Sign in · Create account · Reset) as a 2×2
+   grid; one column on phones. Activation stepper stays readable at 320px. */
+.auth-modes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 360px) {
+  .auth-modes { grid-template-columns: 1fr; }
+}
+.setup-steps {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-2);
+}
+.setup-steps li {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  font-size: var(--text-xs); font-weight: 700; color: var(--muted);
+  padding-bottom: 6px; border-bottom: 3px solid var(--border);
+}
+.setup-steps li > span:last-child { overflow-wrap: anywhere; }
+.setup-steps li.current { color: var(--text); border-bottom-color: var(--tape); }
+.setup-steps li.done { color: var(--text); border-bottom-color: var(--success); }
+.setup-step-num {
+  flex: none; display: inline-grid; place-items: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--elevated); border: 1px solid var(--border); font-size: 0.72rem;
+}
+.setup-steps li.current .setup-step-num { background: var(--tape); color: var(--tape-ink); border-color: var(--tape); }
+.setup-steps li.done .setup-step-num { background: var(--success); color: #0b1a14; border-color: var(--success); }
+.setup-copy { margin: 0; line-height: 1.45; }
+.setup-email { overflow-wrap: anywhere; color: var(--text); }

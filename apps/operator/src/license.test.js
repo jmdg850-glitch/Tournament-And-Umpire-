@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LicenseCallError, OFFLINE_ALLOWANCE_MS, callLicense, forgetActive, licenseUrl, offlineAllowed, rememberActive } from "./license.js";
+import { LicenseCallError, OFFLINE_ALLOWANCE_MS, callLicense, claimLicense, forgetActive, hasAccountHere, licenseUrl, offlineAllowed, rememberActive, rememberHasAccount, setupLicensePassword } from "./license.js";
 
 const mem = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
 const base = { commandUrl: "https://x.supabase.co/functions/v1/command", publishableKey: "pk", accessToken: "jwt" };
@@ -41,4 +41,34 @@ test("offline is allowed only within 7 days of a verified-active check", () => {
   assert.equal(offlineAllowed("u2", t, s), false, "other account");
   forgetActive("u1", s);
   assert.equal(offlineAllowed("u1", t, s), false);
+});
+
+test("code-first claim is sent without a bearer token, with the code and this PC", async () => {
+  let seen;
+  const fetchImpl = async (url, init) => { seen = { url, init }; return { ok: true, json: async () => ({ ok: true, result: { status: "active", next: "set_password", email: "b@x.com" } }) }; };
+  const r = await claimLicense({ commandUrl: base.commandUrl, publishableKey: "pk", code: "AB2D-3FGH-JK4M", device: { id: "win-x", label: "PC" }, fetchImpl });
+  assert.equal(r.next, "set_password");
+  assert.equal(seen.init.headers.Authorization, undefined);
+  assert.equal(seen.init.headers.apikey, "pk");
+  assert.deepEqual(JSON.parse(seen.init.body), { action: "claim", code: "AB2D-3FGH-JK4M", device: { id: "win-x", label: "PC" } });
+});
+
+test("password setup posts once to set_password and surfaces ACCOUNT_EXISTS", async () => {
+  let body;
+  const ok = async (url, init) => { body = JSON.parse(init.body); return { ok: true, json: async () => ({ ok: true, result: { account: "created", email: "b@x.com" } }) }; };
+  const r = await setupLicensePassword({ commandUrl: base.commandUrl, publishableKey: "pk", code: "AB2D-3FGH-JK4M", device: { id: "win-x" }, password: "secret-pass-1", fetchImpl: ok });
+  assert.deepEqual(r, { account: "created", email: "b@x.com" });
+  assert.equal(body.action, "set_password");
+  const exists = async () => ({ ok: false, status: 409, json: async () => ({ ok: false, error: { code: "ACCOUNT_EXISTS", message: "An account already exists for this license." } }) });
+  await assert.rejects(
+    setupLicensePassword({ commandUrl: base.commandUrl, publishableKey: "pk", code: "AB2D-3FGH-JK4M", device: { id: "win-x" }, password: "secret-pass-1", fetchImpl: exists }),
+    (e) => e.code === "ACCOUNT_EXISTS" && !e.message.includes("secret-pass-1"),
+  );
+});
+
+test("hasAccountHere remembers only that an account signed in on this install", () => {
+  const s = mem();
+  assert.equal(hasAccountHere(s), false);
+  rememberHasAccount(s);
+  assert.equal(hasAccountHere(s), true);
 });

@@ -20,6 +20,15 @@ Simple model: **one customer email -> one access code -> one PC.**
 - Two PCs activating at the same instant: exactly one wins (single conditional `UPDATE`).
 - Password reset uses the normal Supabase Auth flow and never touches a license (licenses are keyed by email, not password).
 
+## Code-first activation (new buyers)
+
+Operator's default screen for an install that has never signed in is **Activate license** (`apps/operator/src/ActivationSetup.jsx`): access code → license bound → create your password → account ready → signed in. Two session-less actions on the `license` function implement it; the access code itself is the proof (it is issued by the admin for that email):
+
+- `claim { code, device }` — looks the license up by code alone and runs the same `decideActivation` + atomic conditional bind as `activate` (another PC → `ALREADY_ACTIVATED`; revoked/expired rejected). `activated_user_id` stays null until an account exists. Returns the license email and `next: "set_password"` (no linked account) or `"sign_in"`. Already bound to this PC with no account → straight to password setup.
+- `set_password { code, device, password }` — only for a license `active` on **this** device with no linked account. Creates the Supabase Auth user for the license email via `auth.admin.createUser({ email_confirm: true })` (Supabase Auth hashes the password; nothing is stored or logged by us), then sets `activated_user_id`. If any account already exists for that email → `ACCOUNT_EXISTS` and the buyer is sent to Sign in / Reset password — **an existing password is never overwritten**. Password policy (8–72 chars) is enforced server-side.
+- Trade-off: `email_confirm: true` means possession of the code stands in for email verification for this path. The account-first path (sign up → confirm email → enter code via `activate`) still works unchanged; `activate` also links an account to a license bound code-first.
+- Later launches: the Supabase session persists; if signed out, the app opens on Sign in (a local "has account" flag) and the code is not needed again. `check`/`requireLicense` are unchanged (keyed by the account email).
+
 ## Server-side enforcement
 
 `LicenseGate.jsx` is a client-side UI gate only — by itself it cannot stop a modified Operator client, or any caller holding a stolen-but-valid Supabase JWT, from calling `/command` directly. The command layer is the actual authority:

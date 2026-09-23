@@ -6,7 +6,7 @@
 // of resolvePersonByName/normalizePersonName, fully exercised below.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizePersonName, resolvePersonByName, liveShareUrl, resolveShareOrigin, PUBLIC_LIVE_PRODUCTION_ORIGIN, recommendedScoringTarget, teamStandings } from "./lib.js";
+import { normalizePersonName, resolvePersonByName, liveShareUrl, resolveShareOrigin, PUBLIC_LIVE_PRODUCTION_ORIGIN, scoringTargetFor, nextSeqAfterOutOfOrder, teamStandings } from "./lib.js";
 
 const persons = [
   { id: "p1", display_name: "Rem" },
@@ -100,16 +100,35 @@ test("resolveShareOrigin: falls back to the production origin when there is no w
   assert.equal(resolveShareOrigin(undefined), PUBLIC_LIVE_PRODUCTION_ORIGIN);
 });
 
-test("recommendedScoringTarget: semifinal, final, and bronze recommend 15", () => {
-  assert.equal(recommendedScoringTarget({ stage_label: "semifinal" }, null), 15);
-  assert.equal(recommendedScoringTarget({ stage_label: "final" }, null), 15);
-  assert.equal(recommendedScoringTarget({ stage_label: "bronze" }, null), 15);
+test("scoringTargetFor: semifinal, final, and bronze race to 15", () => {
+  assert.equal(scoringTargetFor({ stage_label: "semifinal" }), 15);
+  assert.equal(scoringTargetFor({ stage_label: "final" }), 15);
+  assert.equal(scoringTargetFor({ stage_label: "bronze" }), 15);
 });
 
-test("recommendedScoringTarget: other stages fall back to the division's configured target, defaulting to 11", () => {
-  assert.equal(recommendedScoringTarget({ stage_label: "round_robin" }, { config: { winTo: 15 } }), 15);
-  assert.equal(recommendedScoringTarget({ stage_label: "round_robin" }, { config: { winTo: 11 } }), 11);
-  assert.equal(recommendedScoringTarget({ stage_label: null }, null), 11);
+test("scoringTargetFor: qualification/knockout race to 11 regardless of any stored division winTo", () => {
+  assert.equal(scoringTargetFor({ stage_label: "round_robin" }), 11);
+  assert.equal(scoringTargetFor({ stage_label: "knockout" }), 11);
+  assert.equal(scoringTargetFor({ stage_label: null }), 11);
+});
+
+test("scoringTargetFor: single-elim final/semifinal resolved from round position; started state wins", () => {
+  const ms = [
+    { id: "a", stage_id: "s", round: 1, bracket_side: "main" },
+    { id: "b", stage_id: "s", round: 2, bracket_side: "main" },
+    { id: "c", stage_id: "s", round: 3, bracket_side: "main" },
+  ];
+  assert.equal(scoringTargetFor(ms[0], ms), 11);
+  assert.equal(scoringTargetFor(ms[1], ms), 15);
+  assert.equal(scoringTargetFor(ms[2], ms), 15);
+  assert.equal(scoringTargetFor({ ...ms[0], score_state: { winTo: 15 } }, ms), 15);
+});
+
+test("nextSeqAfterOutOfOrder: parses the engine's lastSeq only for OUT_OF_ORDER", () => {
+  const err = Object.assign(new Error("Events must be applied in seq order (lastSeq=7, got 5)"), { code: "OUT_OF_ORDER" });
+  assert.equal(nextSeqAfterOutOfOrder(err), 8);
+  assert.equal(nextSeqAfterOutOfOrder(Object.assign(new Error("lastSeq=7"), { code: "INVALID_SCORE" })), null);
+  assert.equal(nextSeqAfterOutOfOrder(null), null);
 });
 
 // Fixture mirrors loadDeskData's real shape (see lib.js) for a team_elimination

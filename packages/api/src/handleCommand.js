@@ -7,6 +7,9 @@ import {
   scoreStateForMatchStart,
   applyScoreEvent,
   reduceScoreEvents,
+  matchScoringTarget,
+  QUALIFICATION_TARGET,
+  SCORING_WIN_BY,
   normalizeCoinTossPayload,
   readCoinToss,
   groupRegistrationsByTeam,
@@ -41,34 +44,37 @@ export { resolveActor } from "./stationAuth.js";
 
 function scoringSettings(config = {}) {
   return {
-    winTo: config.winTo ?? 11,
+    winTo: QUALIFICATION_TARGET,
     // This product's scoring rule: first to reach the target wins
     // immediately — no deuce/win-by-2. checkGameWin (scoring.js) still
     // generically supports "two"/"one" win-by modes, but this product only
     // ever uses "none", regardless of what a division's config may have
     // stored previously.
-    winBy: "none",
+    winBy: SCORING_WIN_BY,
     bestOf: config.bestOf ?? 1,
     isDoubles: config.isDoubles !== false,
     timeoutsAllowed: config.timeoutsAllowed ?? 2,
   };
 }
 
-// The only game targets a "Match Scoring" confirmation dialog (Operator or
-// Umpire, at Start Match) may select between — enforced server-side so a
-// per-match override can never smuggle in an arbitrary/invalid target.
-const ALLOWED_MATCH_SCORING_TARGETS = [11, 15];
-
-function applyScoringOverride(settings, override) {
-  if (override == null) return settings;
-  if (typeof override !== "object") {
-    throw httpError(400, "INVALID_COMMAND", "scoring_override must be an object");
+// The authoritative scoring rules for one match. The target is decided by the
+// match's stage (qualification 11; semifinal/final/bronze 15) — never by the
+// division's stored winTo or a client-chosen override — and is used for every
+// path that builds or re-reduces a match's score state (start, coin toss,
+// score events, complete), so a recompute can never silently change targets.
+async function matchScoringSettings(admin, division, match) {
+  let related = [];
+  if (!match.stage_label) {
+    const cols = "id, round, bracket_side, parent_match_id, stage_id, stage_label, division_id";
+    if (match.parent_match_id) {
+      const { data: parent } = await admin.from("matches").select(cols).eq("id", match.parent_match_id).maybeSingle();
+      related = parent ? [parent] : [];
+    } else if (match.stage_id) {
+      const { data: siblings } = await admin.from("matches").select(cols).eq("stage_id", match.stage_id);
+      related = siblings || [];
+    }
   }
-  const winTo = Number(override.winTo);
-  if (!ALLOWED_MATCH_SCORING_TARGETS.includes(winTo)) {
-    throw httpError(400, "INVALID_COMMAND", `scoring_override.winTo must be one of ${ALLOWED_MATCH_SCORING_TARGETS.join(", ")}`);
-  }
-  return { ...settings, winTo, winBy: "none" };
+  return { ...scoringSettings(division.config), winTo: matchScoringTarget(match, related), winBy: SCORING_WIN_BY };
 }
 
 async function commit(admin, batch, { command_id, type, actorId, actorDeviceId, tournamentId, matchId, result, detail }) {
@@ -672,7 +678,7 @@ async function handleCreateDivision(admin, actor, payload, envelope) {
   const name = String(payload.name || "").trim();
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
   const format = payload.format || "single_elim";
-  const config = { ...(payload.config || { winTo: 11, bestOf: 1, winBy: "two", isDoubles: true }) };
+  const config = { ...(payload.config || { bestOf: 1, winBy: "none", isDoubles: true }) };
   if (format === "team_elimination") {
     if (config.sameTeamPolicy == null) config.sameTeamPolicy = "avoid_semis";
     if (config.qualifierMode == null) config.qualifierMode = "top_x";
@@ -1581,7 +1587,9 @@ async function handleStartMatch(admin, actor, payload, envelope) {
     throw httpError(409, err.code || "ILLEGAL_TRANSITION", err.message);
   }
   const division = await getDivision(admin, match.division_id);
-  const settings = applyScoringOverride(scoringSettings(division.config), payload.scoring_override);
+  // payload.scoring_override (sent by older Operator/Umpire builds) is
+  // accepted but ignored: the target is always derived from the stage.
+  const settings = await matchScoringSettings(admin, division, match);
   const score_state = scoreStateForMatchStart(match, settings);
   const next = { ...match, status: "in_progress", started_at: nowIso(), score_state };
   const batch = createBatch();
@@ -1651,7 +1659,7 @@ async function handleCoinToss(admin, actor, payload, envelope) {
     type: "coin_toss",
     payload: toss,
   };
-  let state = reduceScoreEvents(scoringSettings(division.config), events || []);
+  let state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
   const applied = applyScoreEvent(state, event);
   state = applied.state;
   if (!applied.applied) {
@@ -1701,7 +1709,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
   const isCorrection = payload.type === "correction";
   const wasCompleted = match.status === "completed";
   const division = await getDivision(admin, match.division_id);
-  const settings = scoringSettings(division.config);
+  const settings = await matchScoringSettings(admin, division, match);
   // Event-specific fields (scoreA/scoreB, and for a correction: reason /
   // confirm_completed) live in the nested event payload, same place as every
   // other score_event type's fields (e.g. payload.payload.team for "point").
@@ -1726,7 +1734,10 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
   if (typeof payload.seq !== "number") throw httpError(400, "INVALID_COMMAND", "seq is required");
   const { data: dup } = await admin.from("score_events").select("id").eq("id", payload.event_id).maybeSingle();
   const cached = match.score_state && typeof match.score_state.lastSeq === "number" ? match.score_state : null;
-  const canFastForward = Boolean(cached) && payload.seq === cached.lastSeq + 1;
+  // A cached state built under different rules (e.g. before stage-based
+  // targets) is never fast-forwarded; it is re-reduced with this match's rules.
+  const canFastForward = Boolean(cached) && payload.seq === cached.lastSeq + 1
+    && cached.winTo === settings.winTo && cached.winBy === settings.winBy;
 
   async function reducedState() {
     const { data: events } = await admin.from("score_events").select("*").eq("match_id", match.id).order("seq");
@@ -1753,6 +1764,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     throw httpError(409, err.code || "OUT_OF_ORDER", err.message);
   }
   if (!applied.applied && !applied.duplicate) {
+    if (applied.code === "INVALID_SCORE") throw httpError(400, "INVALID_SCORE", applied.reason);
     throw httpError(400, "INVALID_COMMAND", "That score event could not be applied");
   }
   const state = applied.state;
@@ -1835,7 +1847,7 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
     return { match, already_complete: true };
   }
   const { data: events } = await admin.from("score_events").select("*").eq("match_id", match.id).order("seq");
-  const state = reduceScoreEvents(scoringSettings(division.config), events || []);
+  const state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
   if (state.status !== "completed") {
     throw httpError(409, "MATCH_NOT_WON", "Scoring has not produced a winner");
   }

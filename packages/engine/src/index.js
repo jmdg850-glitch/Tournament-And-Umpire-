@@ -9,6 +9,13 @@ export {
 
 export {
   checkGameWin,
+  SCORING_WIN_BY,
+  QUALIFICATION_TARGET,
+  PLAYOFF_TARGET,
+  stageScoringTarget,
+  matchScoringStage,
+  matchScoringTarget,
+  validateFinalScore,
   DEFAULT_TIMEOUTS_ALLOWED,
   FIRST_SERVE,
   SECOND_SERVE,

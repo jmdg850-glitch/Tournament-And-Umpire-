@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createBrowserClient, envConfig, sendCommand, sendCommandDurable, defaultStore, drainQueue, queueSize, isNetworkError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, readMatchSnapshot, writeMatchSnapshot } from "@tournament/client";
-import { applyOptimisticScore, mergeMatchFromResult, reconcileAuthoritativeScore, isCoinTossCommitted } from "@tournament/engine";
+import { applyOptimisticScore, mergeMatchFromResult, reconcileAuthoritativeScore, isCoinTossCommitted, stageScoringTarget, validateFinalScore } from "@tournament/engine";
 import { clearStation, parsePairingInput, readStation, writeStation } from "./stationSession.js";
 import PairingScanner from "./PairingScanner.jsx";
 import CoinTossPanel from "./CoinTossPanel.jsx";
@@ -406,8 +406,17 @@ function stageTitle(label) {
 // stage-based recommendation; the server independently validates whatever
 // target is actually submitted (see ALLOWED_MATCH_SCORING_TARGETS in
 // packages/api/src/handleCommand.js).
-function recommendedScoringTarget(match) {
-  return ["semifinal", "final", "bronze"].includes(match?.stage_label) ? 15 : 11;
+// The race-to target is decided by stage and enforced by the server (see
+// packages/api matchScoringSettings). Once started, score_state.winTo is
+// authoritative. Before start this device only sees the one match, so the
+// target is shown only when the stage is known from the match itself;
+// otherwise (e.g. an unlabeled single-elimination round) the server decides.
+function knownScoringTarget(match) {
+  const started = Number(match?.score_state?.winTo);
+  if (Number.isInteger(started) && started > 0) return started;
+  if (match?.stage_label) return stageScoringTarget(match.stage_label);
+  if (match?.bracket_side === "bronze" || match?.bracket_side === "final") return stageScoringTarget(match.bracket_side);
+  return null;
 }
 
 function MatchGroup({ title, rows, onOpen, nameFor }) {
@@ -572,7 +581,11 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose }) {
   const validNumbers = scoreA !== "" && scoreB !== "" && Number.isInteger(nextA) && Number.isInteger(nextB) && nextA >= 0 && nextB >= 0;
   const unchanged = validNumbers && nextA === (state.scoreA ?? 0) && nextB === (state.scoreB ?? 0);
   const reasonOk = !wasCompleted || reason.trim().length > 0;
-  const canContinue = validNumbers && !unchanged && reasonOk && !busy;
+  // Same rule the engine enforces: race to winTo, no deuce (11–10 / 15–14 end the match).
+  const winTo = Number(state.winTo) || null;
+  const check = validNumbers && winTo ? validateFinalScore(nextA, nextB, winTo) : null;
+  const scoreError = check && !check.ok ? check.reason : "";
+  const canContinue = validNumbers && !unchanged && reasonOk && !scoreError && !busy;
 
   async function submit() {
     setBusy(true);
@@ -600,7 +613,7 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose }) {
             This match is already completed. This correction updates the recorded score only — it cannot change the winner. Standings and bracket progression are not affected.
           </Alert>
         )}
-        <p className="muted" style={{ margin: 0 }}>Game {state.gameNumber || 1} · {nameA} vs {nameB}</p>
+        <p className="muted" style={{ margin: 0 }}>Game {state.gameNumber || 1} · {nameA} vs {nameB}{winTo ? ` · Race to ${winTo}` : ""}</p>
         <div className="row" style={{ alignItems: "flex-end" }}>
           <div className="stack" style={{ gap: 4 }}>
             <Input label={nameA} inputMode="numeric" value={scoreA} onChange={(e) => setScoreA(digitsOnly(e.target.value))} />
@@ -623,6 +636,10 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose }) {
           onChange={(e) => setReason(e.target.value)}
           placeholder="Why is this score being corrected?"
         />
+        {scoreError && <Alert>{scoreError}</Alert>}
+        {check?.ok && check.complete && !unchanged && !wasCompleted && (
+          <p className="muted" style={{ margin: 0 }}>This score ends the match — first to {winTo} wins.</p>
+        )}
         {error && <Alert>{error}</Alert>}
         {!confirming ? (
           <div className="row">
@@ -667,7 +684,6 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [showEditScore, setShowEditScore] = useState(false);
   const [showScoringConfirm, setShowScoringConfirm] = useState(false);
-  const [scoringTarget, setScoringTarget] = useState(11);
   const [showHold, setShowHold] = useState(false);
   const [holdReason, setHoldReason] = useState("");
   const [holding, setHolding] = useState(false);
@@ -1137,10 +1153,7 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         {canStart && (
           <Button
             disabled={busy}
-            onClick={() => {
-              setScoringTarget(recommendedScoringTarget(match));
-              setShowScoringConfirm(true);
-            }}
+            onClick={() => setShowScoringConfirm(true)}
           >
             Start match
           </Button>
@@ -1149,32 +1162,23 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         {showScoringConfirm && (
           <Modal title="Match scoring" onClose={() => setShowScoringConfirm(false)}>
             <div className="stack">
-              <p className="muted" style={{ margin: 0 }}>How many points? This match ends as soon as a team reaches this number.</p>
-              <div className="ump-choice-row">
-                <button
-                  type="button"
-                  className={`ump-choice ${scoringTarget === 11 ? "selected" : ""}`}
-                  aria-pressed={scoringTarget === 11}
-                  onClick={() => setScoringTarget(11)}
-                >
-                  11 Points
-                </button>
-                <button
-                  type="button"
-                  className={`ump-choice ${scoringTarget === 15 ? "selected" : ""}`}
-                  aria-pressed={scoringTarget === 15}
-                  onClick={() => setScoringTarget(15)}
-                >
-                  15 Points
-                </button>
-              </div>
+              {knownScoringTarget(match) ? (
+                <p style={{ margin: 0 }}>
+                  <strong>Race to {knownScoringTarget(match)}</strong>
+                  <span className="muted"> — set by stage. The first team to {knownScoringTarget(match)} wins immediately (no deuce).</span>
+                </p>
+              ) : (
+                <p className="muted" style={{ margin: 0 }}>
+                  The target is set automatically by stage (qualification: race to 11 · semifinal/final: race to 15) and shown once the match starts. No deuce.
+                </p>
+              )}
               <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
                 <Button variant="secondary" disabled={busy} onClick={() => setShowScoringConfirm(false)}>Cancel</Button>
                 <Button
                   disabled={busy}
                   onClick={async () => {
                     setShowScoringConfirm(false);
-                    await command("start_match", { match_id: match.id, scoring_override: { winTo: scoringTarget } });
+                    await command("start_match", { match_id: match.id });
                   }}
                 >
                   Start Match

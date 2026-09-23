@@ -20,10 +20,13 @@ export class LicenseCallError extends Error {
 
 export async function callLicense({ commandUrl, publishableKey, accessToken, action, body = {}, fetchImpl = (...a) => fetch(...a) }) {
   let res;
+  const headers = { "Content-Type": "application/json", apikey: publishableKey };
+  // Code-first setup actions run before any session exists: no bearer token.
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
   try {
     res = await fetchImpl(licenseUrl(commandUrl), {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}`, apikey: publishableKey },
+      headers,
       body: JSON.stringify({ action, ...body }),
     });
   } catch {
@@ -35,6 +38,30 @@ export async function callLicense({ commandUrl, publishableKey, accessToken, act
     throw new LicenseCallError(json?.error?.code || "INTERNAL", json?.error?.message || "Something went wrong. Please try again.", res.status);
   }
   return json.result;
+}
+
+// Code-first activation (no session). The access code proves the buyer; the
+// server binds the license to this PC, then creates the buyer's own account
+// for the license email with the password they choose (hashed by Supabase
+// Auth). The password is sent once, over HTTPS, and never stored here.
+export function claimLicense({ commandUrl, publishableKey, code, device, fetchImpl }) {
+  return callLicense({ commandUrl, publishableKey, action: "claim", body: { code, device }, fetchImpl });
+}
+
+export function setupLicensePassword({ commandUrl, publishableKey, code, device, password, fetchImpl }) {
+  return callLicense({ commandUrl, publishableKey, action: "set_password", body: { code, device, password }, fetchImpl });
+}
+
+// Remembers that this install has a signed-in account, so the sign-in screen
+// (not activation) is shown first on later launches. Not a security control.
+const HAS_ACCOUNT_KEY = "tournament.operator.hasAccount";
+
+export function rememberHasAccount(storage = globalThis.localStorage) {
+  try { storage?.setItem(HAS_ACCOUNT_KEY, "1"); } catch { /* storage unavailable */ }
+}
+
+export function hasAccountHere(storage = globalThis.localStorage) {
+  try { return storage?.getItem(HAS_ACCOUNT_KEY) === "1"; } catch { return false; }
 }
 
 const cacheKey = (userId) => `tournament.license.lastActive.${userId}`;

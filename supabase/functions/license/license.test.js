@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LicenseError, customerView, decideActivation, generateCode, normalizeCode, normalizeEmail, validateDevice } from "./license.js";
+import { LicenseError, customerView, decideActivation, generateCode, handleLicense, maskEmail, normalizeCode, normalizeEmail, validateDevice } from "./license.js";
 
 const CODE_RE = /^[2-9A-HJKMNP-TV-Z]{4}(-[2-9A-HJKMNP-TV-Z]{4}){2}$/;
 const NOW = Date.parse("2026-09-22T12:00:00Z");
@@ -90,4 +90,163 @@ test("customerView tells the app the truth and never leaks the code", () => {
   assert.equal(customerView(lic({ expires_at: iso(NOW - 1) }), "pc-1-aaaaaaaa", NOW).status, "expired");
   assert.equal(customerView(null, "pc-1-aaaaaaaa", NOW).status, "none");
   assert.ok(!JSON.stringify(customerView(bound, "pc-1-aaaaaaaa", NOW)).includes("AB2D"));
+});
+
+// ---------------------------------------------------------------------------
+// Code-first setup: claim (bind) → set_password (create the buyer's account)
+// ---------------------------------------------------------------------------
+
+// Minimal in-memory stand-in for the service-role client: just the query
+// shapes license.js uses (select/eq/is/maybeSingle, update/eq/is/select) plus
+// auth.admin.createUser. Records every createUser call for assertions.
+function fakeAdmin(rows, { existingEmails = [] } = {}) {
+  const db = { licenses: rows.map((r) => ({ ...r })) };
+  const users = new Map(existingEmails.map((e, i) => [e, { id: `existing-${i}`, email: e }]));
+  const createCalls = [];
+  function query(table) {
+    const filters = [];
+    let patch = null;
+    const match = (r) => filters.every(([k, v]) => r[k] === v);
+    const api = {
+      select() { return api; },
+      update(p) { patch = p; return api; },
+      eq(k, v) { filters.push([k, v]); return api; },
+      is(k, v) { filters.push([k, v]); return api; },
+      order() { return api; },
+      async maybeSingle() { return { data: db[table].find(match) || null, error: null }; },
+      then(resolve, reject) {
+        let result;
+        if (patch) {
+          const hit = db[table].filter(match);
+          for (const r of hit) Object.assign(r, patch);
+          result = { data: hit.map((r) => ({ ...r })), error: null };
+        } else {
+          result = { data: db[table].filter(match), error: null };
+        }
+        return Promise.resolve(result).then(resolve, reject);
+      },
+    };
+    return api;
+  }
+  return {
+    db, users, createCalls,
+    from: query,
+    auth: {
+      admin: {
+        async createUser(args) {
+          createCalls.push(args);
+          if (users.has(args.email)) {
+            return { data: { user: null }, error: { code: "email_exists", status: 422, message: "A user with this email address has already been registered" } };
+          }
+          const user = { id: `user-${users.size + 1}`, email: args.email };
+          users.set(args.email, user);
+          return { data: { user }, error: null };
+        },
+      },
+    },
+  };
+}
+
+const PC1 = { id: "win-pc1-aaaaaaaaaa", label: "FRONT-DESK" };
+const PC2 = { id: "win-pc2-bbbbbbbbbb", label: "OTHER" };
+const CODE = "AB2D-3FGH-JK4M";
+const call = (admin, body) => handleLicense({ admin, actor: null, body, now: NOW });
+const rejects = (p, code) => assert.rejects(p, (e) => e instanceof LicenseError && e.code === code);
+
+test("claim: a valid code binds the license to this PC, then asks for a password (no session needed)", async () => {
+  const admin = fakeAdmin([lic({ email: "buyer@example.com" })]);
+  const r = await call(admin, { action: "claim", code: "ab2d 3fgh jk4m", device: PC1 });
+  assert.equal(r.ok, true);
+  assert.equal(r.result.status, "active");
+  assert.equal(r.result.bound, "now");
+  assert.equal(r.result.next, "set_password");
+  assert.equal(r.result.email, "buyer@example.com");
+  assert.equal(r.result.email_masked, "bu•••@example.com");
+  assert.ok(!JSON.stringify(r.result).includes(CODE), "never echoes the code");
+  assert.equal(admin.db.licenses[0].device_id, PC1.id);
+  assert.equal(admin.db.licenses[0].activated_user_id, null);
+});
+
+test("claim: already bound to THIS PC without an account → continue password setup (not a fresh activation)", async () => {
+  const admin = fakeAdmin([lic({ status: "active", device_id: PC1.id, activated_user_id: null })]);
+  const r = await call(admin, { action: "claim", code: CODE, device: PC1 });
+  assert.equal(r.result.bound, "already_here");
+  assert.equal(r.result.next, "set_password");
+});
+
+test("claim: already bound here with an account → sign in", async () => {
+  const admin = fakeAdmin([lic({ status: "active", device_id: PC1.id, activated_user_id: "user-9" })]);
+  const r = await call(admin, { action: "claim", code: CODE, device: PC1 });
+  assert.equal(r.result.next, "sign_in");
+});
+
+test("claim: rejects another PC, revoked, expired, unknown and malformed codes", async () => {
+  await rejects(call(fakeAdmin([lic({ status: "active", device_id: PC1.id })]), { action: "claim", code: CODE, device: PC2 }), "ALREADY_ACTIVATED");
+  await rejects(call(fakeAdmin([lic({ status: "revoked" })]), { action: "claim", code: CODE, device: PC1 }), "REVOKED");
+  await rejects(call(fakeAdmin([lic({ expires_at: iso(NOW - 1) })]), { action: "claim", code: CODE, device: PC1 }), "EXPIRED");
+  await rejects(call(fakeAdmin([]), { action: "claim", code: CODE, device: PC1 }), "UNKNOWN_CODE");
+  await rejects(call(fakeAdmin([]), { action: "claim", code: "nope", device: PC1 }), "INVALID_CODE_FORMAT");
+  await rejects(call(fakeAdmin([lic()]), { action: "claim", code: CODE, device: { id: "x" } }), "VALIDATION");
+  await rejects(call(fakeAdmin([lic()]), { action: "claim", code: CODE, device: PC1, email: "x@y.com" }), "VALIDATION");
+});
+
+test("set_password: after binding, creates the buyer's own confirmed account and links it", async () => {
+  const admin = fakeAdmin([lic({ email: "buyer@example.com" })]);
+  await call(admin, { action: "claim", code: CODE, device: PC1 });
+  const r = await call(admin, { action: "set_password", code: CODE, device: PC1, password: "correct horse 1" });
+  assert.deepEqual(r.result, { account: "created", email: "buyer@example.com" });
+  assert.equal(admin.createCalls.length, 1);
+  assert.deepEqual(admin.createCalls[0], { email: "buyer@example.com", password: "correct horse 1", email_confirm: true });
+  assert.equal(admin.db.licenses[0].activated_user_id, "user-1");
+  assert.ok(!JSON.stringify(r).includes("correct horse 1"), "password never returned");
+  // A second attempt cannot replace the password.
+  await rejects(call(admin, { action: "set_password", code: CODE, device: PC1, password: "another pass 2" }), "ACCOUNT_EXISTS");
+  assert.equal(admin.createCalls.length, 1);
+});
+
+test("set_password: never overwrites an existing account for the license email", async () => {
+  const admin = fakeAdmin([lic({ email: "buyer@example.com", status: "active", device_id: PC1.id })], { existingEmails: ["buyer@example.com"] });
+  await rejects(call(admin, { action: "set_password", code: CODE, device: PC1, password: "long enough 1" }), "ACCOUNT_EXISTS");
+  assert.equal(admin.db.licenses[0].activated_user_id, undefined);
+});
+
+test("set_password: only from the PC the license is bound to, and only after binding", async () => {
+  await rejects(call(fakeAdmin([lic()]), { action: "set_password", code: CODE, device: PC1, password: "long enough 1" }), "NOT_BOUND_HERE");
+  const bound = fakeAdmin([lic({ status: "active", device_id: PC1.id })]);
+  await rejects(call(bound, { action: "set_password", code: CODE, device: PC2, password: "long enough 1" }), "ALREADY_ACTIVATED");
+  await rejects(call(fakeAdmin([lic({ status: "revoked", device_id: PC1.id })]), { action: "set_password", code: CODE, device: PC1, password: "long enough 1" }), "REVOKED");
+  assert.equal(bound.createCalls.length, 0);
+});
+
+test("set_password: enforces the password policy server-side and never echoes it in errors", async () => {
+  const admin = fakeAdmin([lic({ status: "active", device_id: PC1.id })]);
+  for (const bad of ["short", "", "        ", "x".repeat(73), 12345678, null]) {
+    await assert.rejects(call(admin, { action: "set_password", code: CODE, device: PC1, password: bad }), (e) => {
+      assert.equal(e.code, "WEAK_PASSWORD");
+      if (typeof bad === "string" && bad.trim()) assert.ok(!e.message.includes(bad));
+      return true;
+    });
+  }
+  assert.equal(admin.createCalls.length, 0);
+});
+
+test("non-public actions still require a session", async () => {
+  await rejects(call(fakeAdmin([lic()]), { action: "activate", code: CODE, device: PC1 }), "UNAUTHENTICATED");
+  await rejects(call(fakeAdmin([lic()]), { action: "list" }), "UNAUTHENTICATED");
+  await rejects(call(fakeAdmin([lic()]), null), "UNAUTHENTICATED");
+});
+
+test("signed-in activate on a PC claimed code-first links the account instead of failing", async () => {
+  const admin = fakeAdmin([lic({ email: "buyer@example.com", status: "active", device_id: PC1.id, activated_user_id: null })]);
+  const actor = { id: "user-7", email: "buyer@example.com", emailConfirmed: true };
+  const r = await handleLicense({ admin, actor, body: { action: "activate", code: CODE, device: PC1 }, now: NOW });
+  assert.equal(r.result.status, "active");
+  assert.equal(admin.db.licenses[0].activated_user_id, "user-7");
+});
+
+test("maskEmail hides most of the local part", () => {
+  assert.equal(maskEmail("a@x.com"), "a•@x.com");
+  assert.equal(maskEmail("jo@x.com"), "j•@x.com");
+  assert.equal(maskEmail("buyer@example.com"), "bu•••@example.com");
+  assert.equal(maskEmail(""), "");
 });

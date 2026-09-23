@@ -1,29 +1,100 @@
 import { useState } from "react";
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Input, Select, SectionHeader } from "@tournament/ui";
 import { Trash2 } from "lucide-react";
+import { QUALIFICATION_TARGET, PLAYOFF_TARGET } from "@tournament/engine";
 import { FORMAT_LABEL } from "../lib.js";
+
+// Scoring is decided by the match's stage and enforced by the engine/API —
+// it is shown here for reference only and is not a per-division choice.
+function ScoringRules() {
+  return (
+    <section className="division-section" aria-label="Scoring">
+      <h4 className="division-section-title">Scoring</h4>
+      <ul className="division-rules">
+        <li><span>Qualification</span><strong>Race to {QUALIFICATION_TARGET}</strong></li>
+        <li><span>Semifinal</span><strong>Race to {PLAYOFF_TARGET}</strong></li>
+        <li><span>Final</span><strong>Race to {PLAYOFF_TARGET}</strong></li>
+      </ul>
+      <p className="division-note">Set automatically by stage. First side to reach the target wins — no deuce ({QUALIFICATION_TARGET}–{QUALIFICATION_TARGET - 1} and {PLAYOFF_TARGET}–{PLAYOFF_TARGET - 1} are final scores).</p>
+    </section>
+  );
+}
+
+function QualificationFields({ cfg, onChange }) {
+  const direct = cfg.progressionMode === "direct_semifinals";
+  return (
+    <>
+      <section className="division-section" aria-label="Qualification">
+        <h4 className="division-section-title">Qualification</h4>
+        <div className="division-grid">
+          <Select
+            label="After Qualifiers"
+            value={cfg.progressionMode}
+            onChange={(e) => onChange({ progressionMode: e.target.value })}
+            hint={direct
+              ? "The highest-ranked qualifiers advance directly to the semifinals."
+              : "Qualified competitors go through the playoff bracket before the semifinals."}
+          >
+            <option value="playoffs">Playoffs / Elimination</option>
+            <option value="direct_semifinals">Direct Semifinals</option>
+          </Select>
+          <Select label="Qualification method" value={cfg.qualifierMode} onChange={(e) => onChange({ qualifierMode: e.target.value })}>
+            <option value="top_x">Top X overall</option>
+            <option value="top_x_per_team">Top X per team</option>
+            <option value="manual">Manual qualification</option>
+          </Select>
+          <Input
+            label="Qualifier count"
+            value={direct ? "4" : cfg.qualifierCount}
+            onChange={(e) => onChange({ qualifierCount: e.target.value })}
+            inputMode="numeric"
+            disabled={direct}
+            hint={direct ? "Fixed at 4 for Direct Semifinals." : undefined}
+          />
+        </div>
+      </section>
+      <section className="division-section" aria-label="Bracket">
+        <h4 className="division-section-title">Bracket</h4>
+        <div className="division-grid">
+          <Select
+            label="Same-team matchup policy"
+            value={cfg.sameTeamPolicy}
+            onChange={(e) => onChange({ sameTeamPolicy: e.target.value })}
+            hint="Keeps pairs from the same team apart in the bracket for as long as possible, so teammates don't face each other early."
+          >
+            <option value="allow_anywhere">Allow anywhere — no restriction</option>
+            <option value="avoid_quarterfinals">Avoid until the quarterfinals</option>
+            <option value="avoid_semis">Avoid until the semifinals</option>
+            <option value="avoid_until_final">Avoid until the final</option>
+          </Select>
+        </div>
+      </section>
+    </>
+  );
+}
 
 export function DivisionsPanel({ data, busy, run }) {
   const [name, setName] = useState("");
   const [format, setFormat] = useState("single_elim");
-  const [winTo, setWinTo] = useState("11");
-  const [qualifierMode, setQualifierMode] = useState("top_x");
-  const [qualifierCount, setQualifierCount] = useState("4");
-  const [sameTeamPolicy, setSameTeamPolicy] = useState("avoid_semis");
-  const [progressionMode, setProgressionMode] = useState("playoffs");
+  const [draft, setDraft] = useState({
+    qualifierMode: "top_x",
+    qualifierCount: "4",
+    sameTeamPolicy: "avoid_semis",
+    progressionMode: "playoffs",
+  });
   const [edit, setEdit] = useState({});
   const [confirmDelete, setConfirmDelete] = useState(null);
   return (
     <div className="stack">
       <SectionHeader title="Divisions" description="Group players into competitions, then generate each division's bracket." />
-      <Card as="form" className="stack" onSubmit={(e) => {
+      <Card as="form" className="division-card" onSubmit={(e) => {
         e.preventDefault();
-        const config = { winTo: Number(winTo) || 11, bestOf: 1, winBy: "none", isDoubles: true, bronzeMatch: true };
+        const config = { bestOf: 1, winBy: "none", isDoubles: true, bronzeMatch: true };
         if (format === "team_elimination") {
-          config.qualifierMode = qualifierMode;
-          config.qualifierCount = progressionMode === "direct_semifinals" ? 4 : Number(qualifierCount) || 4;
-          config.sameTeamPolicy = sameTeamPolicy;
-          config.progressionMode = progressionMode;
+          config.qualifierMode = draft.qualifierMode;
+          config.qualifierCount = draft.progressionMode === "direct_semifinals" ? 4 : Number(draft.qualifierCount) || 4;
+          config.sameTeamPolicy = draft.sameTeamPolicy;
+          config.progressionMode = draft.progressionMode;
         }
         run("Create division", "create_division", {
           tournament_id: data.tournament.id,
@@ -33,61 +104,23 @@ export function DivisionsPanel({ data, busy, run }) {
         });
         setName("");
       }}>
-        <div className="row">
-          <Input label="Division name" value={name} onChange={(e) => setName(e.target.value)} required />
-          <Select label="Format" value={format} onChange={(e) => setFormat(e.target.value)} hint="Single players/pairs knocked out each round, or teams of pairs competing as a group.">
-            <option value="single_elim">Single elimination</option>
-            <option value="team_elimination">Team elimination</option>
-          </Select>
-          <Button type="submit" disabled={!!busy}>Add division</Button>
-        </div>
-        <div className="row">
-          <Select label="Game target" value={winTo} onChange={(e) => setWinTo(e.target.value)} hint="This match ends as soon as a team reaches this number.">
-            <option value="11">Race to 11</option>
-            <option value="15">Race to 15</option>
-          </Select>
-        </div>
-        {format === "team_elimination" && (
-          <div className="row">
-            <Select
-              label="After Qualifiers"
-              value={progressionMode}
-              onChange={(e) => setProgressionMode(e.target.value)}
-              hint={
-                progressionMode === "direct_semifinals"
-                  ? "The highest-ranked qualifiers advance directly to the semifinals."
-                  : "Qualified competitors go through the playoff bracket before the semifinals."
-              }
-            >
-              <option value="playoffs">Playoffs / Elimination</option>
-              <option value="direct_semifinals">Direct Semifinals</option>
-            </Select>
-            <Select label="Qualification" value={qualifierMode} onChange={(e) => setQualifierMode(e.target.value)}>
-              <option value="top_x">Top X overall</option>
-              <option value="top_x_per_team">Top X per team</option>
-              <option value="manual">Manual qualification</option>
-            </Select>
-            <Input
-              label="Qualifier count"
-              value={progressionMode === "direct_semifinals" ? "4" : qualifierCount}
-              onChange={(e) => setQualifierCount(e.target.value)}
-              inputMode="numeric"
-              disabled={progressionMode === "direct_semifinals"}
-              hint={progressionMode === "direct_semifinals" ? "Fixed at 4 for Direct Semifinals." : undefined}
-            />
-            <Select
-              label="Same-team matchup policy"
-              value={sameTeamPolicy}
-              onChange={(e) => setSameTeamPolicy(e.target.value)}
-              hint="Keeps pairs from the same team apart in the bracket for as long as possible, so teammates don't face each other early."
-            >
-              <option value="allow_anywhere">Allow anywhere — no restriction</option>
-              <option value="avoid_quarterfinals">Avoid until the quarterfinals</option>
-              <option value="avoid_semis">Avoid until the semifinals</option>
-              <option value="avoid_until_final">Avoid until the final</option>
+        <h3 className="division-title">New division</h3>
+        <section className="division-section" aria-label="Division">
+          <div className="division-grid">
+            <Input label="Division name" value={name} onChange={(e) => setName(e.target.value)} required />
+            <Select label="Format" value={format} onChange={(e) => setFormat(e.target.value)} hint="Single players/pairs knocked out each round, or teams of pairs competing as a group.">
+              <option value="single_elim">Single elimination</option>
+              <option value="team_elimination">Team elimination</option>
             </Select>
           </div>
+        </section>
+        <ScoringRules />
+        {format === "team_elimination" && (
+          <QualificationFields cfg={draft} onChange={(patch) => setDraft((prev) => ({ ...prev, ...patch }))} />
         )}
+        <div className="division-actions">
+          <Button type="submit" disabled={!!busy}>Add division</Button>
+        </div>
       </Card>
       {data.divisions.length === 0 && (
         <EmptyState title="No divisions yet">Add a division to register players and generate a bracket.</EmptyState>
@@ -98,19 +131,17 @@ export function DivisionsPanel({ data, busy, run }) {
           qualifierCount: String(d.config?.qualifierCount ?? 4),
           sameTeamPolicy: d.config?.sameTeamPolicy || "avoid_semis",
           progressionMode: d.config?.progressionMode || "playoffs",
-          winTo: String(d.config?.winTo ?? 11),
         };
+        const isTeam = d.format === "team_elimination";
         return (
-          <Card className="stack" key={d.id}>
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <div>
-                <div className="row" style={{ gap: 8, alignItems: "center" }}>
-                  <h3 style={{ margin: 0 }}>{d.name}</h3>
-                  <Badge tone="info">{FORMAT_LABEL[d.format] || d.format}</Badge>
-                </div>
+          <Card className="division-card" key={d.id}>
+            <div className="division-head">
+              <div className="division-head-title">
+                <h3 className="division-title">{d.name}</h3>
+                <Badge tone="info">{FORMAT_LABEL[d.format] || d.format}</Badge>
               </div>
-              <div className="row">
-                {d.format === "team_elimination" ? (
+              <div className="division-head-actions">
+                {isTeam ? (
                   <>
                     <Button disabled={!!busy} onClick={() => run("Generate qualification", "generate_team_elimination", { division_id: d.id }, true)}>
                       Generate qualification
@@ -126,29 +157,9 @@ export function DivisionsPanel({ data, busy, run }) {
                 )}
               </div>
             </div>
-            <form className="row" onSubmit={(e) => {
-              e.preventDefault();
-              run("Update division", "update_division", {
-                division_id: d.id,
-                config: {
-                  winTo: Number(cfg.winTo) || 11,
-                  winBy: "none",
-                },
-              });
-            }}>
-              <Select
-                label="Game target"
-                value={cfg.winTo}
-                onChange={(e) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, winTo: e.target.value } }))}
-                hint="This match ends as soon as a team reaches this number. Applies to newly started matches — this is the default an operator/umpire is shown when starting a match, and can still be confirmed or changed per match."
-              >
-                <option value="11">Race to 11</option>
-                <option value="15">Race to 15</option>
-              </Select>
-              <Button type="submit" variant="secondary" disabled={!!busy}>Save scoring</Button>
-            </form>
-            {d.format === "team_elimination" && (
-              <form className="row" onSubmit={(e) => {
+            <ScoringRules />
+            {isTeam && (
+              <form className="division-form" onSubmit={(e) => {
                 e.preventDefault();
                 run("Update division", "update_division", {
                   division_id: d.id,
@@ -160,51 +171,14 @@ export function DivisionsPanel({ data, busy, run }) {
                   },
                 });
               }}>
-                <Select
-                  label="After Qualifiers"
-                  value={cfg.progressionMode}
-                  onChange={(e) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, progressionMode: e.target.value } }))}
-                  hint={
-                    cfg.progressionMode === "direct_semifinals"
-                      ? "The highest-ranked qualifiers advance directly to the semifinals."
-                      : "Qualified competitors go through the playoff bracket before the semifinals."
-                  }
-                >
-                  <option value="playoffs">Playoffs / Elimination</option>
-                  <option value="direct_semifinals">Direct Semifinals</option>
-                </Select>
-                <Select
-                  label="Qualification"
-                  value={cfg.qualifierMode}
-                  onChange={(e) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, qualifierMode: e.target.value } }))}
-                >
-                  <option value="top_x">Top X overall</option>
-                  <option value="top_x_per_team">Top X per team</option>
-                  <option value="manual">Manual qualification</option>
-                </Select>
-                <Input
-                  label="Qualifier count"
-                  value={cfg.progressionMode === "direct_semifinals" ? "4" : cfg.qualifierCount}
-                  onChange={(e) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, qualifierCount: e.target.value } }))}
-                  inputMode="numeric"
-                  disabled={cfg.progressionMode === "direct_semifinals"}
-                  hint={cfg.progressionMode === "direct_semifinals" ? "Fixed at 4 for Direct Semifinals." : undefined}
-                />
-                <Select
-                  label="Same-team matchup policy"
-                  value={cfg.sameTeamPolicy}
-                  onChange={(e) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, sameTeamPolicy: e.target.value } }))}
-                  hint="Keeps pairs from the same team apart in the bracket for as long as possible."
-                >
-                  <option value="allow_anywhere">Allow anywhere — no restriction</option>
-                  <option value="avoid_quarterfinals">Avoid until the quarterfinals</option>
-                  <option value="avoid_semis">Avoid until the semifinals</option>
-                  <option value="avoid_until_final">Avoid until the final</option>
-                </Select>
-                <Button type="submit" variant="secondary" disabled={!!busy}>Save options</Button>
+                <QualificationFields cfg={cfg} onChange={(patch) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, ...patch } }))} />
+                <div className="division-actions">
+                  <Button type="submit" variant="secondary" disabled={!!busy}>Save options</Button>
+                </div>
               </form>
             )}
-            <div className="row" style={{ justifyContent: "flex-end", borderTop: "1px solid var(--border)", paddingTop: "var(--space-3)" }}>
+            <div className="division-danger">
+              <span className="division-note">Permanently removes this division and its matches.</span>
               <Button
                 type="button"
                 variant="danger"

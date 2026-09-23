@@ -36,6 +36,8 @@ import { buildDeskHash, parseDeskHash } from "./deskHash.js";
 import { firstQueryError, isToday } from "./lib.js";
 import { version as APP_VERSION } from "../package.json";
 import { LicenseGate, useLicense } from "./LicenseGate.jsx";
+import { ActivationSetup } from "./ActivationSetup.jsx";
+import { hasAccountHere, rememberHasAccount } from "./license.js";
 
 function useConfig() {
   return useMemo(() => envConfig(), []);
@@ -145,6 +147,7 @@ export default function App() {
 
   // Licensing: the server decides whether this account's license is activated on this PC.
   const license = useLicense({ commandUrl: cfg.commandUrl, publishableKey: cfg.publishableKey, session });
+  useEffect(() => { if (session?.user) rememberHasAccount(); }, [session]);
 
   if (session === undefined) {
     return (
@@ -187,7 +190,7 @@ export default function App() {
     return (
       <>
         <UpdateBanner />
-        <AuthScreen supabase={supabase} error={error} setError={setError} />
+        <AuthScreen supabase={supabase} cfg={cfg} error={error} setError={setError} />
       </>
     );
   }
@@ -225,8 +228,10 @@ export default function App() {
   );
 }
 
-function AuthScreen({ supabase, error, setError }) {
-  const [mode, setMode] = useState("login");
+function AuthScreen({ supabase, cfg, error, setError }) {
+  // A new buyer starts with their access code; an install that has signed in
+  // before starts at sign-in (the code is not needed again).
+  const [mode, setMode] = useState(() => (hasAccountHere() ? "login" : "activate"));
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
@@ -242,6 +247,7 @@ function AuthScreen({ supabase, error, setError }) {
       if (mode === "login") {
         const { error: err } = await supabase.auth.signInWithPassword({ email, password });
         if (err) throw err;
+        rememberHasAccount();
       } else if (mode === "signup") {
         if (!name.trim()) throw new Error("Display name is required");
         const { error: err } = await supabase.auth.signUp({
@@ -270,25 +276,37 @@ function AuthScreen({ supabase, error, setError }) {
 
   return (
     <AuthLayout title="Operator" subtitle="Run registration, courts, and live matches from one desk.">
-      <form className="stack" onSubmit={submit} style={{ marginTop: "var(--space-5)" }}>
-        <div className="auth-modes">
-          <Button variant={mode === "login" ? "primary" : "secondary"} onClick={() => setMode("login")}>Sign in</Button>
-          <Button variant={mode === "signup" ? "primary" : "secondary"} onClick={() => setMode("signup")}>Create account</Button>
-          <Button variant={mode === "reset" ? "primary" : "secondary"} onClick={() => setMode("reset")}>Reset password</Button>
+      <div className="auth-modes" style={{ marginTop: "var(--space-5)" }}>
+        <Button variant={mode === "activate" ? "primary" : "secondary"} onClick={() => { setMode("activate"); setError(""); setInfo(""); }}>Activate license</Button>
+        <Button variant={mode === "login" ? "primary" : "secondary"} onClick={() => { setMode("login"); setError(""); setInfo(""); }}>Sign in</Button>
+        <Button variant={mode === "signup" ? "primary" : "secondary"} onClick={() => { setMode("signup"); setError(""); setInfo(""); }}>Create account</Button>
+        <Button variant={mode === "reset" ? "primary" : "secondary"} onClick={() => { setMode("reset"); setError(""); setInfo(""); }}>Reset password</Button>
+      </div>
+      {mode === "activate" ? (
+        <div style={{ marginTop: "var(--space-4)" }}>
+          <ActivationSetup
+            supabase={supabase}
+            commandUrl={cfg.commandUrl}
+            publishableKey={cfg.publishableKey}
+            onSignIn={(prefill) => { setMode("login"); if (prefill) setEmail(prefill); }}
+          />
         </div>
-        {mode === "signup" && (
-          <Input label="Display name" value={name} onChange={(e) => setName(e.target.value)} required autoComplete="name" />
-        )}
-        <Input label="Email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="username" />
-        {mode !== "reset" && (
-          <Input label="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} autoComplete={mode === "login" ? "current-password" : "new-password"} />
-        )}
-        {error && <Alert>{error}</Alert>}
-        {info && <Alert tone="ok">{info}</Alert>}
-        <Button type="submit" disabled={busy}>
-          {busy ? "Working…" : mode === "login" ? "Sign in" : mode === "signup" ? "Create organizer account" : "Send reset"}
-        </Button>
-      </form>
+      ) : (
+        <form className="stack" onSubmit={submit} style={{ marginTop: "var(--space-4)" }}>
+          {mode === "signup" && (
+            <Input label="Display name" value={name} onChange={(e) => setName(e.target.value)} required autoComplete="name" />
+          )}
+          <Input label="Email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="username" />
+          {mode !== "reset" && (
+            <Input label="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} autoComplete={mode === "login" ? "current-password" : "new-password"} />
+          )}
+          {error && <Alert>{error}</Alert>}
+          {info && <Alert tone="ok">{info}</Alert>}
+          <Button type="submit" disabled={busy}>
+            {busy ? "Working…" : mode === "login" ? "Sign in" : mode === "signup" ? "Create organizer account" : "Send reset"}
+          </Button>
+        </form>
+      )}
     </AuthLayout>
   );
 }

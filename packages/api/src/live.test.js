@@ -186,7 +186,7 @@ describe.skipIf(!live)("live tournament path", () => {
       tournament_id: tournamentId,
       name: "Open Doubles",
       format: "single_elim",
-      config: { winTo: 2, winBy: "none", bestOf: 1, isDoubles: true },
+      config: { winBy: "none", bestOf: 1, isDoubles: true },
     });
     expect(r.body.ok).toBe(true);
     divisionId = r.body.result.division.id;
@@ -275,6 +275,9 @@ describe.skipIf(!live)("live tournament path", () => {
     r = await send(umpire.token, "start_match", { match_id: matchId });
     expect(r.body.ok).toBe(true);
     expect(r.body.result.match.score_state.server).toBe(2);
+    // 4-player single elimination: round 1 is the semifinal — race to 15, no deuce.
+    expect(r.body.result.match.score_state.winTo).toBe(15);
+    expect(r.body.result.match.score_state.winBy).toBe("none");
 
     const tossId = crypto.randomUUID();
     r = await send(umpire.token, "coin_toss", {
@@ -321,16 +324,11 @@ describe.skipIf(!live)("live tournament path", () => {
     expect(dup.body.ok).toBe(true);
     expect(dup.body.result.duplicate || dup.body.idempotent).toBeTruthy();
 
-    const second = crypto.randomUUID();
-    r = await send(umpire.token, "score_event", {
-      match_id: matchId,
-      event_id: second,
-      seq: 3,
-      type: "point",
-      payload: { team: "A" },
-    });
-    expect(r.body.ok).toBe(true);
+    // Serving side A rally-scores to the target: the match ends exactly at 15–0.
+    r = await playPointsToWin(send, umpire.token, matchId, "A", 3);
     expect(r.body.result.match.status).toBe("completed");
+    expect(r.body.result.match.score_state.scoreA).toBe(15);
+    expect(r.body.result.match.score_state.scoreB).toBe(0);
 
     const { data: resultRow } = await organizer.client.from("match_results").select("*").eq("match_id", matchId).maybeSingle();
     expect(resultRow).toBeTruthy();
@@ -360,6 +358,8 @@ async function expectOk(token, type, payload, command_id) {
   return r;
 }
 
+// Starts a match and scores a single point — the match stays in progress
+// (use assignAndWin to complete one under the stage rules).
 async function assignAndPlay(token, matchId, courtId, umpireId, winner = "A") {
   await expectOk(token, "assign_court", { match_id: matchId, court_id: courtId });
   await expectOk(token, "assign_umpire", { match_id: matchId, user_id: umpireId });
@@ -380,6 +380,44 @@ async function assignAndPlay(token, matchId, courtId, umpireId, winner = "A") {
   });
 }
 
+// Stage-based scoring: the server decides the target from the match's stage
+// (qualification 11; semifinal/final/bronze 15), first to the target wins,
+// no deuce. These helpers read the target the server chose (score_state.winTo)
+// rather than assuming one, and finish matches through the real rules.
+
+// Completes a match with a manual score of T–(T-1) (or (T-1)–T for B) — also
+// proves 11–10 / 15–14 end the match immediately.
+async function finishByCorrection(token, matchId, seq, winner, winTo) {
+  const payload = winner === "A" ? { scoreA: winTo, scoreB: winTo - 1 } : { scoreA: winTo - 1, scoreB: winTo };
+  const r = await expectOk(token, "score_event", { match_id: matchId, event_id: crypto.randomUUID(), seq, type: "correction", payload });
+  expect(r.body.result.match.status).toBe("completed");
+  return r;
+}
+
+async function assignAndWin(token, matchId, courtId, umpireId, winner, expectedTarget) {
+  await expectOk(token, "assign_court", { match_id: matchId, court_id: courtId });
+  await expectOk(token, "assign_umpire", { match_id: matchId, user_id: umpireId });
+  const started = await expectOk(token, "start_match", { match_id: matchId });
+  const winTo = started.body.result.match.score_state.winTo;
+  expect(winTo).toBe(expectedTarget);
+  expect(started.body.result.match.score_state.winBy).toBe("none");
+  await expectOk(token, "coin_toss", { match_id: matchId, event_id: crypto.randomUUID(), seq: 1, result: winner, serving_team: winner });
+  return finishByCorrection(token, matchId, 2, winner, winTo);
+}
+
+// Rally-scores points for the serving team until the match completes (for
+// actors that may not send corrections, e.g. a paired court station, or where
+// real point-by-point scoring is what's under test). Returns the final response.
+async function playPointsToWin(sendFn, token, matchId, team, fromSeq) {
+  let seq = fromSeq;
+  for (let i = 0; i < 40; i++) {
+    const r = await sendFn(token, "score_event", { match_id: matchId, event_id: crypto.randomUUID(), seq: seq++, type: "point", payload: { team } });
+    expect(r.body.ok, JSON.stringify(r.body)).toBe(true);
+    if (r.body.result.match.status === "completed") return r;
+  }
+  throw new Error("match did not complete within 40 points");
+}
+
 async function setupTeamEliminationQualifiers(organizer, umpire, divisionConfig) {
   const createId = crypto.randomUUID();
   let r = await expectOk(organizer.token, "create_tournament", { name: `TE ${Date.now()}` }, createId);
@@ -390,7 +428,7 @@ async function setupTeamEliminationQualifiers(organizer, umpire, divisionConfig)
     tournament_id: tournamentId,
     name: "Team Elim",
     format: "team_elimination",
-    config: { winTo: 1, winBy: "none", bestOf: 1, isDoubles: true, ...divisionConfig },
+    config: { winBy: "none", bestOf: 1, isDoubles: true, ...divisionConfig },
   });
   const divisionId = r.body.result.division.id;
 
@@ -448,7 +486,7 @@ async function setupTeamEliminationQualifiers(organizer, umpire, divisionConfig)
     .eq("bracket_side", "pair")
     .eq("status", "scheduled");
   for (const m of rrPairs) {
-    await assignAndPlay(organizer.token, m.id, courtId, umpire.user.id, "A");
+    await assignAndWin(organizer.token, m.id, courtId, umpire.user.id, "A", 11); // qualification: race to 11
   }
 
   return { tournamentId, divisionId, courtId };
@@ -485,7 +523,7 @@ describe.skipIf(!live)("live team elimination path", () => {
       tournament_id: tournamentId,
       name: "Team Elim",
       format: "team_elimination",
-      config: { winTo: 1, winBy: "none", bestOf: 1, isDoubles: true, qualifierMode: "top_x", qualifierCount: 4 },
+      config: { winBy: "none", bestOf: 1, isDoubles: true, qualifierMode: "top_x", qualifierCount: 4 },
     });
     divisionId = r.body.result.division.id;
 
@@ -613,7 +651,7 @@ describe.skipIf(!live)("live team elimination path", () => {
     expect(rrPairs.length).toBeGreaterThanOrEqual(12);
 
     for (const m of rrPairs) {
-      await assignAndPlay(organizer.token, m.id, courtId, umpire.user.id, "A");
+      await assignAndWin(organizer.token, m.id, courtId, umpire.user.id, "A", 11); // qualification: race to 11
     }
 
     const { data: rrParents } = await organizer.client
@@ -649,8 +687,12 @@ describe.skipIf(!live)("live team elimination path", () => {
     await expectOk(organizer.token, "assign_umpire", { match_id: semiPairs[0].id, user_id: umpire.user.id });
     await expectOk(organizer.token, "assign_court", { match_id: semiPairs[1].id, court_id: courtId });
     await expectOk(organizer.token, "assign_umpire", { match_id: semiPairs[1].id, user_id: umpire.user.id });
-    await expectOk(umpire.token, "start_match", { match_id: semiPairs[0].id });
-    await expectOk(umpire.token, "start_match", { match_id: semiPairs[1].id });
+    const semiStart0 = await expectOk(umpire.token, "start_match", { match_id: semiPairs[0].id });
+    const semiStart1 = await expectOk(umpire.token, "start_match", { match_id: semiPairs[1].id });
+    // Semifinals: race to 15, no deuce.
+    expect(semiStart0.body.result.match.score_state.winTo).toBe(15);
+    expect(semiStart1.body.result.match.score_state.winTo).toBe(15);
+    expect(semiStart0.body.result.match.score_state.winBy).toBe("none");
     await expectOk(umpire.token, "coin_toss", {
       match_id: semiPairs[0].id,
       event_id: crypto.randomUUID(),
@@ -666,24 +708,34 @@ describe.skipIf(!live)("live team elimination path", () => {
       serving_team: "A",
     });
 
+    // Bring both semis to 14–0, then land both winning points concurrently so
+    // the two completions (and their playoff reconciliation) race each other.
+    for (const pm of semiPairs) {
+      const nearly = await expectOk(umpire.token, "score_event", {
+        match_id: pm.id, event_id: crypto.randomUUID(), seq: 2, type: "correction", payload: { scoreA: 14, scoreB: 0 },
+      });
+      expect(nearly.body.result.match.status).toBe("in_progress");
+    }
     const [s1, s2] = await Promise.all([
       send(umpire.token, "score_event", {
         match_id: semiPairs[0].id,
         event_id: crypto.randomUUID(),
-        seq: 2,
+        seq: 3,
         type: "point",
         payload: { team: "A" },
       }),
       send(umpire.token, "score_event", {
         match_id: semiPairs[1].id,
         event_id: crypto.randomUUID(),
-        seq: 2,
+        seq: 3,
         type: "point",
         payload: { team: "A" },
       }),
     ]);
     expect(s1.body.ok, JSON.stringify(s1.body)).toBe(true);
     expect(s2.body.ok, JSON.stringify(s2.body)).toBe(true);
+    expect(s1.body.result.match.status).toBe("completed");
+    expect(s2.body.result.match.status).toBe("completed");
 
     const completeAgain1 = await send(umpire.token, "complete_match", { match_id: semiPairs[0].id });
     expect(completeAgain1.body.ok || completeAgain1.body.result?.already_complete || completeAgain1.body.idempotent).toBeTruthy();
@@ -725,8 +777,8 @@ describe.skipIf(!live)("live team elimination path", () => {
     expect(outsiderFinal.body.ok).toBe(false);
     expect(outsiderFinal.status).toBe(403);
 
-    await assignAndPlay(organizer.token, bronze1.kids[0].id, courtId, umpire.user.id, "A");
-    await assignAndPlay(organizer.token, final1.kids[0].id, courtId, umpire.user.id, "A");
+    await assignAndWin(organizer.token, bronze1.kids[0].id, courtId, umpire.user.id, "A", 15); // bronze: race to 15
+    await assignAndWin(organizer.token, final1.kids[0].id, courtId, umpire.user.id, "A", 15); // final: race to 15
 
     const { data: bronzeResult } = await organizer.client.from("match_results").select("*").eq("match_id", bronze1.kids[0].id).maybeSingle();
     const { data: finalResult } = await organizer.client.from("match_results").select("*").eq("match_id", final1.kids[0].id).maybeSingle();
@@ -978,7 +1030,7 @@ describe.skipIf(!live)("court station pairing", () => {
       tournament_id: tournamentId,
       name: "Open",
       format: "single_elim",
-      config: { winTo: 2, winBy: "none", bestOf: 1, isDoubles: true },
+      config: { winBy: "none", bestOf: 1, isDoubles: true },
     });
     const divisionId = r.body.result.division.id;
     const names = ["Ada / Al", "Bea / Bo", "Cia / Cy", "Dee / Di"];
@@ -1022,6 +1074,7 @@ describe.skipIf(!live)("court station pairing", () => {
 
     r = await cmd(deviceToken, "start_match", { match_id: matchId });
     expect(r.body.ok, JSON.stringify(r.body)).toBe(true);
+    expect(r.body.result.match.score_state.winTo).toBe(15); // semifinal
     r = await cmd(deviceToken, "coin_toss", {
       match_id: matchId,
       event_id: crypto.randomUUID(),
@@ -1030,23 +1083,10 @@ describe.skipIf(!live)("court station pairing", () => {
       serving_team: "A",
     });
     expect(r.body.ok).toBe(true);
-    r = await cmd(deviceToken, "score_event", {
-      match_id: matchId,
-      event_id: crypto.randomUUID(),
-      seq: 2,
-      type: "point",
-      payload: { team: "A" },
-    });
-    expect(r.body.ok).toBe(true);
-    r = await cmd(deviceToken, "score_event", {
-      match_id: matchId,
-      event_id: crypto.randomUUID(),
-      seq: 3,
-      type: "point",
-      payload: { team: "A" },
-    });
-    expect(r.body.ok).toBe(true);
+    // A station may only send points (never corrections): rally to 15–0.
+    r = await playPointsToWin(cmd, deviceToken, matchId, "A", 2);
     expect(r.body.result.match.status).toBe("completed");
+    expect(r.body.result.match.score_state.scoreA).toBe(15);
 
     r = await cmd(organizer.token, "revoke_court_device", { court_id: courtId });
     expect(r.body.ok).toBe(true);
@@ -1086,9 +1126,13 @@ async function setupCorrectionMatch(organizer, umpire, config) {
   const matchId = matches[0].id;
   await expectOk(organizer.token, "assign_court", { match_id: matchId, court_id: courtId });
   await expectOk(organizer.token, "assign_umpire", { match_id: matchId, user_id: umpire.user.id });
-  await expectOk(umpire.token, "start_match", { match_id: matchId });
+  const started = await expectOk(umpire.token, "start_match", { match_id: matchId });
   await expectOk(umpire.token, "coin_toss", { match_id: matchId, event_id: crypto.randomUUID(), seq: 1, result: "A", serving_team: "A" });
-  return { tournamentId, divisionId, matchId };
+  // The server-chosen stage target (every match of a 4-player bracket is a
+  // semifinal or the final → 15).
+  const winTo = started.body.result.match.score_state.winTo;
+  expect(winTo).toBe(15);
+  return { tournamentId, divisionId, matchId, winTo };
 }
 
 let correctionSeq;
@@ -1134,7 +1178,7 @@ describe.skipIf(!live)("live score correction path", () => {
   }, 60_000);
 
   test("invalid correction values are rejected without changing the score", async () => {
-    const { matchId } = await setupCorrectionMatch(organizer, umpire, { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true });
+    const { matchId, winTo } = await setupCorrectionMatch(organizer, umpire, { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true });
     correctionSeq = 1;
     for (const bad of [{ scoreA: -1, scoreB: 6 }, { scoreA: 1.5, scoreB: 6 }, { scoreA: "abc", scoreB: 6 }, { scoreA: null, scoreB: 6 }, {}]) {
       const r = await send(umpire.token, "score_event", {
@@ -1142,6 +1186,17 @@ describe.skipIf(!live)("live score correction path", () => {
       });
       expect(r.body.ok, JSON.stringify(r.body)).toBe(false);
     }
+    // No deuce / no extension: past the target, or both sides at it, can never be a score.
+    for (const bad of [{ scoreA: winTo + 1, scoreB: 3 }, { scoreA: winTo, scoreB: winTo }]) {
+      const r = await send(umpire.token, "score_event", {
+        match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(), type: "correction", payload: bad,
+      });
+      expect(r.body.ok, JSON.stringify(r.body)).toBe(false);
+      expect(r.body.error.code).toBe("INVALID_SCORE");
+    }
+    const { data: unchanged } = await organizer.client.from("matches").select("*").eq("id", matchId).maybeSingle();
+    expect(unchanged.status).toBe("in_progress");
+    expect(unchanged.score_state.scoreA).toBe(0);
   }, 60_000);
 
   test("unauthorized user and paired station cannot issue a correction", async () => {
@@ -1155,11 +1210,11 @@ describe.skipIf(!live)("live score correction path", () => {
   }, 60_000);
 
   test("completed match: same-winner correction allowed with confirmation+reason; missing either is rejected; winner-changing correction is rejected", async () => {
-    const { matchId } = await setupCorrectionMatch(organizer, umpire, { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true });
+    const { matchId, winTo } = await setupCorrectionMatch(organizer, umpire, { winTo: 11, winBy: "two", bestOf: 1, isDoubles: true });
     correctionSeq = 1;
     let r = await send(umpire.token, "score_event", {
       match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
-      type: "correction", payload: { scoreA: 11, scoreB: 9 },
+      type: "correction", payload: { scoreA: winTo, scoreB: 9 },
     });
     expect(r.body.ok).toBe(true);
     expect(r.body.result.match.status).toBe("completed");
@@ -1169,21 +1224,21 @@ describe.skipIf(!live)("live score correction path", () => {
 
     const missingConfirm = await send(umpire.token, "score_event", {
       match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
-      type: "correction", payload: { scoreA: 11, scoreB: 7, reason: "Recount" },
+      type: "correction", payload: { scoreA: winTo, scoreB: 7, reason: "Recount" },
     });
     expect(missingConfirm.body.ok).toBe(false);
     expect(missingConfirm.body.error.code).toBe("CONFIRMATION_REQUIRED");
 
     const missingReason = await send(umpire.token, "score_event", {
       match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
-      type: "correction", payload: { scoreA: 11, scoreB: 7, confirm_completed: true },
+      type: "correction", payload: { scoreA: winTo, scoreB: 7, confirm_completed: true },
     });
     expect(missingReason.body.ok).toBe(false);
     expect(missingReason.body.error.code).toBe("REASON_REQUIRED");
 
     const winnerFlip = await send(umpire.token, "score_event", {
       match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
-      type: "correction", payload: { scoreA: 7, scoreB: 11, confirm_completed: true, reason: "Recount" },
+      type: "correction", payload: { scoreA: 7, scoreB: winTo, confirm_completed: true, reason: "Recount" },
     });
     expect(winnerFlip.body.ok).toBe(false);
     expect(winnerFlip.body.error.code).toBe("WOULD_CHANGE_WINNER");
@@ -1191,7 +1246,7 @@ describe.skipIf(!live)("live score correction path", () => {
     const allowedCommandId = crypto.randomUUID();
     const allowed = await send(umpire.token, "score_event", {
       match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
-      type: "correction", payload: { scoreA: 11, scoreB: 7, confirm_completed: true, reason: "Recount confirmed same winner" },
+      type: "correction", payload: { scoreA: winTo, scoreB: 7, confirm_completed: true, reason: "Recount confirmed same winner" },
     }, allowedCommandId);
     expect(allowed.body.ok, JSON.stringify(allowed.body)).toBe(true);
     expect(allowed.body.result.match.status).toBe("completed");
@@ -1204,7 +1259,7 @@ describe.skipIf(!live)("live score correction path", () => {
 
     const { data: audit } = await organizer.client.from("audit_logs").select("*").eq("command_id", allowedCommandId).maybeSingle();
     expect(audit).toBeTruthy();
-    expect(audit.detail?.correction?.next).toEqual({ scoreA: 11, scoreB: 7 });
+    expect(audit.detail?.correction?.next).toEqual({ scoreA: winTo, scoreB: 7 });
     expect(audit.detail?.correction?.reason).toBe("Recount confirmed same winner");
 
     const { data: events } = await organizer.client.from("score_events").select("*").eq("match_id", matchId).order("seq");
@@ -1213,16 +1268,17 @@ describe.skipIf(!live)("live score correction path", () => {
   }, 60_000);
 
   test("completed multi-game (bestOf > 1) match rejects correction", async () => {
-    const { matchId } = await setupCorrectionMatch(organizer, umpire, { winTo: 2, winBy: "none", bestOf: 3, isDoubles: true });
+    const { matchId, winTo } = await setupCorrectionMatch(organizer, umpire, { winBy: "none", bestOf: 3, isDoubles: true });
     correctionSeq = 1;
     let last;
-    for (let i = 0; i < 4; i++) {
+    // Two straight games at the stage target (T–0, T–0) settle the best-of-3.
+    for (let i = 0; i < 2; i++) {
       last = await send(umpire.token, "score_event", {
-        match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(), type: "point", payload: { team: "A" },
+        match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(), type: "correction", payload: { scoreA: winTo, scoreB: 0 },
       });
       expect(last.body.ok, JSON.stringify(last.body)).toBe(true);
     }
-    expect(last.body.result.match.status).toBe("completed"); // two straight games, 2-0/2-0
+    expect(last.body.result.match.status).toBe("completed");
 
     const r = await send(umpire.token, "score_event", {
       match_id: matchId, event_id: crypto.randomUUID(), seq: nextCorrectionSeq(),
@@ -1253,7 +1309,7 @@ describe.skipIf(!live)("update_match_participant (edit players / change partner)
       tournament_id: tournamentId,
       name: "Doubles MP",
       format: "single_elim",
-      config: { winTo: 2, winBy: "none", bestOf: 1, isDoubles: true },
+      config: { winBy: "none", bestOf: 1, isDoubles: true },
     });
     const divisionId = r.body.result.division.id;
 
@@ -1379,7 +1435,7 @@ describe.skipIf(!live)("update_match_participant (edit players / change partner)
     expect(noopTry.body.error.code).toBe("INVALID_COMMAND");
 
     // Test 6 — once the match is live, editing is locked.
-    await expectOk(umpire.token, "start_match", { match_id: matchId });
+    const editStart = await expectOk(umpire.token, "start_match", { match_id: matchId });
     const liveEditTry = await send(organizer.token, "update_match_participant", {
       match_id: matchId, slot: "B", person_ids: [personIdsByPair[1][0], markId],
     });
@@ -1390,7 +1446,7 @@ describe.skipIf(!live)("update_match_participant (edit players / change partner)
     // scoring on a match that has been through a participant swap works exactly as elsewhere).
     await expectOk(umpire.token, "coin_toss", { match_id: matchId, event_id: crypto.randomUUID(), seq: 1, result: "A", serving_team: "A" });
     await expectOk(umpire.token, "score_event", { match_id: matchId, event_id: crypto.randomUUID(), seq: 2, type: "point", payload: { team: "A" } });
-    const finishR = await expectOk(umpire.token, "score_event", { match_id: matchId, event_id: crypto.randomUUID(), seq: 3, type: "point", payload: { team: "A" } });
+    const finishR = await finishByCorrection(umpire.token, matchId, 3, "A", editStart.body.result.match.score_state.winTo);
     expect(finishR.body.result.match.status).toBe("completed");
 
     // Test 7 — completed matches are locked too, and the historical result is untouched.
@@ -1533,7 +1589,7 @@ describe.skipIf(!live)("Operator Override Start (start_match by organizer, not t
   }, 90_000);
 });
 
-describe.skipIf(!live)("start_match scoring_override (per-match target confirmation)", () => {
+describe.skipIf(!live)("stage-based scoring target (semifinal race to 15)", () => {
   let organizer;
   let umpire;
 
@@ -1573,30 +1629,36 @@ describe.skipIf(!live)("start_match scoring_override (per-match target confirmat
     return { matchId };
   }
 
-  test("a scoring_override at start overrides the division's default target, and is always immediate-win (winBy: none)", async () => {
+  // 4-player single-elim: round 1 = semifinals, so the stage target is 15 no
+  // matter what the division config or a (legacy) client override says.
+  test("a semifinal always starts at race to 15 (no deuce); a legacy scoring_override is ignored", async () => {
     const { matchId } = await setupScoringOverrideMatch(11);
-    const r = await expectOk(umpire.token, "start_match", { match_id: matchId, scoring_override: { winTo: 15 } });
+    const r = await expectOk(umpire.token, "start_match", { match_id: matchId, scoring_override: { winTo: 11 } });
     expect(r.body.result.match.score_state.winTo).toBe(15);
     expect(r.body.result.match.score_state.winBy).toBe("none");
   }, 60_000);
 
-  test("an invalid scoring_override.winTo is rejected and the match is not started", async () => {
+  test("an invalid legacy scoring_override no longer blocks start; the stage target applies", async () => {
     const { matchId } = await setupScoringOverrideMatch(11);
-    const badR = await send(umpire.token, "start_match", { match_id: matchId, scoring_override: { winTo: 13 } });
-    expect(badR.body.ok).toBe(false);
-    expect(badR.body.error.code).toBe("INVALID_COMMAND");
-    const { data: after } = await organizer.client.from("matches").select("*").eq("id", matchId).maybeSingle();
-    expect(after.status).not.toBe("in_progress");
+    const r = await expectOk(umpire.token, "start_match", { match_id: matchId, scoring_override: { winTo: 13 } });
+    expect(r.body.result.match.score_state.winTo).toBe(15);
   }, 60_000);
 
-  test("omitting scoring_override falls back to the division's configured target, still immediate-win (winBy: none)", async () => {
+  test("coin toss before start keeps the semifinal at 15, and a manual 14–15 completes it", async () => {
     const { matchId } = await setupScoringOverrideMatch(11);
-    const r = await expectOk(umpire.token, "start_match", { match_id: matchId });
-    expect(r.body.result.match.score_state.winTo).toBe(11);
-    // The division was created with winBy: "two" (legacy-looking config), but
-    // this product no longer honors deuce — scoringSettings() always returns
-    // winBy: "none" regardless of what a division's config says.
-    expect(r.body.result.match.score_state.winBy).toBe("none");
+    await expectOk(umpire.token, "coin_toss", { match_id: matchId, event_id: crypto.randomUUID(), seq: 1, result: "A", serving_team: "A" });
+    let r = await expectOk(umpire.token, "start_match", { match_id: matchId });
+    expect(r.body.result.match.score_state.winTo).toBe(15);
+    r = await send(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: 2, type: "correction", payload: { scoreA: 15, scoreB: 15 },
+    });
+    expect(r.body.ok).toBe(false);
+    expect(r.body.error.code).toBe("INVALID_SCORE");
+    r = await expectOk(umpire.token, "score_event", {
+      match_id: matchId, event_id: crypto.randomUUID(), seq: 2, type: "correction", payload: { scoreA: 14, scoreB: 15 },
+    });
+    expect(r.body.result.match.status).toBe("completed");
+    expect(r.body.result.match.winner).toBe("B");
   }, 60_000);
 });
 
@@ -1648,7 +1710,7 @@ describe.skipIf(!live)("Match integrity: self-match and cross-team protection (u
     await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
     r = await expectOk(organizer.token, "create_division", {
       tournament_id: tournamentId, name: "TeamBoundary", format: "team_elimination",
-      config: { winTo: 1, winBy: "none", bestOf: 1, isDoubles: true, qualifierMode: "top_x", qualifierCount: 4 },
+      config: { winBy: "none", bestOf: 1, isDoubles: true, qualifierMode: "top_x", qualifierCount: 4 },
     });
     const divisionId = r.body.result.division.id;
     r = await expectOk(organizer.token, "create_team", { tournament_id: tournamentId, division_id: divisionId, name: "TB Falcons" });

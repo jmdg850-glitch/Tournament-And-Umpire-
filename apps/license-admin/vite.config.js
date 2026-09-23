@@ -22,7 +22,9 @@ const productionCsp = {
 };
 
 export default defineConfig({
+  base: (process.env.VITE_ELECTRON === "1" || process.env.CAPACITOR === "1") ? "./" : "/",
   plugins: [react(), productionCsp],
   server: { port: 5176, strictPort: true },
   preview: { port: 4176, strictPort: true },
+  test: { environment: "jsdom", setupFiles: ["./src/test-setup.js"] },
 });

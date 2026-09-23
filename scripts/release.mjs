@@ -53,6 +53,8 @@ try {
 const operatorDir = resolve(root, "apps/operator");
 const umpireDir = resolve(root, "apps/umpire");
 const androidDir = resolve(umpireDir, "android");
+const licenseAdminDir = resolve(root, "apps/license-admin");
+const licenseAdminAndroidDir = resolve(licenseAdminDir, "android");
 // Kept inside node_modules (gitignored, always present once `npm install` has
 // run) rather than at the repo root, so the lock file itself never shows up
 // as an untracked path in `git status` while a release is running.
@@ -92,6 +94,8 @@ const VERSION_FILES = [
   "apps/operator/package.json",
   "apps/umpire/package.json",
   "apps/umpire/android/app/build.gradle",
+  "apps/license-admin/package.json",
+  "apps/license-admin/android/app/build.gradle",
 ];
 // Release-tooling files that may be dirty when a release starts and are then
 // committed with it: the release script itself and the files it imports/invokes.
@@ -156,6 +160,10 @@ const GENERATED_OUTPUT_PATHS = [
   "apps/umpire/android/.gradle/", "apps/umpire/android/build/", "apps/umpire/android/app/build/",
   "apps/umpire/android/capacitor-cordova-android-plugins/",
   "apps/umpire/android/app/src/main/assets/public/",
+  "apps/license-admin/dist/", "apps/license-admin/release/",
+  "apps/license-admin/android/.gradle/", "apps/license-admin/android/build/", "apps/license-admin/android/app/build/",
+  "apps/license-admin/android/capacitor-cordova-android-plugins/",
+  "apps/license-admin/android/app/src/main/assets/public/",
   ".gradle/", ".turbo/", ".cache/", "coverage/",
 ];
 const GENERATED_FILE_PATTERN = /\.(apk|aab|aar|ap_|dex|class|exe|msi|dll|blockmap|hprof|log)$/i;
@@ -365,7 +373,7 @@ function readPackageVersion(pkgPath) {
 // release (e.g. a new test script). Returns a stable string so two extracts
 // can be compared with ===.
 function protectedVersionFieldsOf(rel, raw) {
-  if (rel === "apps/umpire/android/app/build.gradle") {
+  if (rel.endsWith("android/app/build.gradle")) {
     const code = raw.match(/versionCode\s+(\d+)/);
     const name = raw.match(/versionName\s+"([^"]+)"/);
     return `versionCode=${code ? code[1] : "<missing>"} versionName=${name ? name[1] : "<missing>"}`;
@@ -558,7 +566,24 @@ check("Version files are consistent", () => {
   ctx.nextUmpire = bumpVersion(ctx.currentUmpire, bumpType);
   ctx.nextVersionCode = ctx.currentVersionCode + 1;
   state.tag = `v${ctx.nextOperator}`;
-  return `Operator ${ctx.currentOperator} -> ${ctx.nextOperator}, Umpire ${ctx.currentUmpire} -> ${ctx.nextUmpire}, versionCode ${ctx.currentVersionCode} -> ${ctx.nextVersionCode}`;
+
+  // License Admin is versioned fully independently of Operator/Umpire — its own
+  // package.json + its own Android build.gradle, bumped by the same bump-type
+  // argument but never sharing a number with the other two apps.
+  const licenseAdminPkgPath = resolve(licenseAdminDir, "package.json");
+  const licenseAdminGradlePath = resolve(licenseAdminAndroidDir, "app/build.gradle");
+  ctx.currentLicenseAdmin = readPackageVersion(licenseAdminPkgPath);
+  const laGradleRaw = readFileSync(licenseAdminGradlePath, "utf8");
+  const laCode = laGradleRaw.match(/versionCode\s+(\d+)/);
+  const laName = laGradleRaw.match(/versionName\s+"([^"]+)"/);
+  if (!laCode) throw new Error(`Could not find versionCode in ${licenseAdminGradlePath}`);
+  if (!laName) throw new Error(`Could not find versionName in ${licenseAdminGradlePath}`);
+  if (laName[1] !== ctx.currentLicenseAdmin) throw new Error(`License Admin Android versionName (${laName[1]}) != License Admin package.json (${ctx.currentLicenseAdmin}) — fix before releasing.`);
+  ctx.currentLicenseAdminVersionCode = Number.parseInt(laCode[1], 10);
+  ctx.nextLicenseAdmin = bumpVersion(ctx.currentLicenseAdmin, bumpType);
+  ctx.nextLicenseAdminVersionCode = ctx.currentLicenseAdminVersionCode + 1;
+
+  return `Operator ${ctx.currentOperator} -> ${ctx.nextOperator}, Umpire ${ctx.currentUmpire} -> ${ctx.nextUmpire}, versionCode ${ctx.currentVersionCode} -> ${ctx.nextVersionCode}, License Admin ${ctx.currentLicenseAdmin} -> ${ctx.nextLicenseAdmin}, versionCode ${ctx.currentLicenseAdminVersionCode} -> ${ctx.nextLicenseAdminVersionCode}`;
 });
 
 check("Dependency health", () => {
@@ -584,6 +609,8 @@ check("Local build tooling is installed", () => {
   if (missing.length) throw new Error(`Missing from node_modules: ${missing.join(", ")}`);
   const gradleFiles = ["gradlew.bat", "gradle/wrapper/gradle-wrapper.jar"].filter((f) => !existsSync(resolve(androidDir, f)));
   if (gradleFiles.length) throw new Error(`Gradle wrapper files missing under apps/umpire/android: ${gradleFiles.join(", ")}`);
+  const laGradleFiles = ["gradlew.bat", "gradle/wrapper/gradle-wrapper.jar"].filter((f) => !existsSync(resolve(licenseAdminAndroidDir, f)));
+  if (laGradleFiles.length) throw new Error(`Gradle wrapper files missing under apps/license-admin/android: ${laGradleFiles.join(", ")}`);
   return `${pkgs.length} packages + Gradle wrapper present`;
 });
 
@@ -614,6 +641,24 @@ check("Android release signing configuration is present", () => {
   if (!existsSync(storePath)) throw new Error(`The keystore file that keystore.properties points to does not exist (${props.storeFile}).`);
   const gradle = readFileSync(resolve(androidDir, "app/build.gradle"), "utf8");
   if (!/signingConfig\s+signingConfigs\.release/.test(gradle)) throw new Error("app/build.gradle does not apply signingConfigs.release to the release build type.");
+  return "keystore.properties has all 4 keys, keystore file exists (values not printed)";
+});
+
+// Unlike Umpire's signing check above, a missing keystore here is reported, not
+// thrown — License Admin shipping unsigned is an accepted, explicit state for
+// now (internal-test artifact), not a reason to block Operator+Umpire's release.
+// A malformed (present but incomplete) keystore.properties still fails loudly,
+// since that looks like an unfinished setup rather than a deliberate choice.
+check("License Admin Android signing configuration", () => {
+  const ksPath = resolve(licenseAdminAndroidDir, "keystore.properties");
+  if (!existsSync(ksPath)) {
+    return "not configured — release APK will be UNSIGNED (Umpire's signing above is unaffected; this is optional for License Admin for now)";
+  }
+  const props = parseProperties(readFileSync(ksPath, "utf8"));
+  const missing = ["storeFile", "storePassword", "keyAlias", "keyPassword"].filter((k) => !props[k]);
+  if (missing.length) throw new Error(`apps/license-admin/android/keystore.properties is missing or has empty value(s) for: ${missing.join(", ")} (values are never printed).`);
+  const storePath = resolve(licenseAdminAndroidDir, props.storeFile.replace(/\\\\/g, "\\"));
+  if (!existsSync(storePath)) throw new Error(`The keystore file that License Admin's keystore.properties points to does not exist (${props.storeFile}).`);
   return "keystore.properties has all 4 keys, keystore file exists (values not printed)";
 });
 
@@ -668,6 +713,7 @@ console.log("  PASS  Operator test suite");
 console.log(`
 Preflight PASSED. Plan:
   Operator ${ctx.currentOperator} -> ${ctx.nextOperator}   Umpire ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.currentVersionCode} -> ${ctx.nextVersionCode})
+  License Admin ${ctx.currentLicenseAdmin} -> ${ctx.nextLicenseAdmin} (versionCode ${ctx.currentLicenseAdminVersionCode} -> ${ctx.nextLicenseAdminVersionCode}) — independent of Operator/Umpire's versions
   Tag / release: ${state.tag} on ${ctx.releaseSlug}
   Will stage exactly: ${[...VERSION_FILES, ...initialEntries.map((e) => e.path)].join(", ")}`);
 
@@ -692,6 +738,12 @@ const bumpPlan = [
     path: gradlePath,
     edit: (raw) => raw.replace(/versionCode\s+\d+/, `versionCode ${ctx.nextVersionCode}`).replace(/versionName\s+"[^"]+"/, `versionName "${ctx.nextUmpire}"`),
   },
+  { rel: "apps/license-admin/package.json", path: resolve(licenseAdminDir, "package.json"), edit: (raw) => raw.replace(/"version":\s*"[^"]+"/, `"version": "${ctx.nextLicenseAdmin}"`) },
+  {
+    rel: "apps/license-admin/android/app/build.gradle",
+    path: resolve(licenseAdminAndroidDir, "app/build.gradle"),
+    edit: (raw) => raw.replace(/versionCode\s+\d+/, `versionCode ${ctx.nextLicenseAdminVersionCode}`).replace(/versionName\s+"[^"]+"/, `versionName "${ctx.nextLicenseAdmin}"`),
+  },
 ];
 for (const f of bumpPlan) {
   const original = readFileSync(f.path, "utf8");
@@ -701,6 +753,7 @@ for (const f of bumpPlan) {
 for (const f of bumpedFiles) writeFileSync(f.path, f.written);
 console.log(`Operator: ${ctx.currentOperator} -> ${ctx.nextOperator}`);
 console.log(`Umpire:   ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.currentVersionCode} -> ${ctx.nextVersionCode})`);
+console.log(`License Admin: ${ctx.currentLicenseAdmin} -> ${ctx.nextLicenseAdmin} (versionCode ${ctx.currentLicenseAdminVersionCode} -> ${ctx.nextLicenseAdminVersionCode})`);
 
 // ---------------------------------------------------------------------------
 // 3. Builds — strictly sequential: Windows Operator, then Android Umpire.
@@ -713,6 +766,11 @@ logStep("Build Windows (electron-builder, includes clean:desktop)");
 state.releaseDirCleanupStarted = true; // build:desktop deletes apps/operator/release/ first
 if (run("npm", ["run", "build:desktop", "-w", "@tournament/operator"], { cwd: root }) !== 0) {
   fail("Windows build", "`npm run build:desktop -w @tournament/operator` failed — see output above.");
+}
+
+logStep("Build Windows — License Admin (electron-builder, includes clean:desktop)");
+if (run("npm", ["run", "build:desktop", "-w", "@tournament/license-admin"], { cwd: root }) !== 0) {
+  fail("Windows build (License Admin)", "`npm run build:desktop -w @tournament/license-admin` failed — see output above.");
 }
 
 stage = "android-build";
@@ -729,6 +787,18 @@ const gradleStatus = run(resolve(androidDir, "gradlew.bat"), ["assembleRelease",
   env: { ...process.env, JAVA_HOME: ctx.javaHome, ANDROID_HOME: ctx.androidSdk, ANDROID_SDK_ROOT: ctx.androidSdk },
 });
 if (gradleStatus !== 0) fail("Android build (Gradle)", "`gradlew.bat assembleRelease` failed — see output above. The signing config was not touched.");
+
+logStep("Build Android — License Admin (vite + cap sync)");
+if (run("npm", ["run", "build:android", "-w", "@tournament/license-admin"], { cwd: root }) !== 0) {
+  fail("Android build (License Admin, web bundle)", "`npm run build:android -w @tournament/license-admin` failed — see output above.");
+}
+
+logStep("Build Android — License Admin (gradlew assembleRelease)");
+const laGradleStatus = run(resolve(licenseAdminAndroidDir, "gradlew.bat"), ["assembleRelease", "--no-daemon"], {
+  cwd: licenseAdminAndroidDir,
+  env: { ...process.env, JAVA_HOME: ctx.javaHome, ANDROID_HOME: ctx.androidSdk, ANDROID_SDK_ROOT: ctx.androidSdk },
+});
+if (laGradleStatus !== 0) fail("Android build (License Admin, Gradle)", "`gradlew.bat assembleRelease` failed — see output above. The signing config was not touched.");
 
 // ---------------------------------------------------------------------------
 // 4. Verify both artifacts directly (an exit code alone is not enough)
@@ -757,6 +827,39 @@ if (!apkResult.ok) fail("Verify Android build", apkResult.error);
 console.log(`APK:     ${apkResult.path} (${apkResult.size} bytes, ${apkResult.mtime.toISOString()})`);
 console.log(`Package: ${apkResult.appId} versionName ${apkResult.versionName} versionCode ${apkResult.versionCode} (release variant, not debuggable)`);
 console.log(`Signer:  ${apkResult.signerDn} SHA-256 ${apkResult.signerSha256 ?? "(n/a)"}`);
+
+logStep("Verify Windows build — License Admin");
+const laWinResult = verifyWindowsInstaller({
+  root, operatorDir: licenseAdminDir, version: ctx.nextLicenseAdmin, notOlderThanMs: buildStartMs,
+  artifactNamePattern: "Tournament-License-Admin-Setup", skipUpdateCheck: true,
+});
+if (!laWinResult.ok) fail("Verify Windows build (License Admin)", laWinResult.error);
+console.log(`Installer:            ${laWinResult.path} (${laWinResult.size} bytes, ${laWinResult.mtime.toISOString()})`);
+console.log(`NSIS installer:       yes (MZ header + Nullsoft/NSIS stub)`);
+console.log(`ProductVersion:       ${laWinResult.productVersion ?? "(not readable)"}`);
+console.log(`Windows Authenticode: ${laWinResult.authenticode.label}`);
+if (laWinResult.authenticode.signed !== true) console.log("  (not blocking: no Windows signing certificate is configured for this project)");
+
+logStep("Verify Android build — License Admin");
+const laApkResult = verifyAndroidApk({
+  androidDir: licenseAdminAndroidDir,
+  androidSdk: ctx.androidSdk,
+  javaHome: ctx.javaHome,
+  expectedAppId: "app.tournament.licenseadmin",
+  expectedVersionCode: ctx.nextLicenseAdminVersionCode,
+  expectedVersionName: ctx.nextLicenseAdmin,
+  notOlderThanMs: buildStartMs,
+  // License Admin Android signing is optional (see the preflight check): an
+  // unsigned release APK is the expected artifact until keystore.properties is
+  // configured. Umpire's verification above stays signed-only.
+  allowUnsigned: true,
+});
+if (!laApkResult.ok) fail("Verify Android build (License Admin)", laApkResult.error);
+console.log(`APK:     ${laApkResult.path} (${laApkResult.size} bytes, ${laApkResult.mtime.toISOString()})`);
+console.log(`Package: ${laApkResult.appId} versionName ${laApkResult.versionName} versionCode ${laApkResult.versionCode} (release variant, not debuggable)`);
+console.log(laApkResult.signed
+  ? `Signer:  ${laApkResult.signerDn} SHA-256 ${laApkResult.signerSha256 ?? "(n/a)"}`
+  : "Signer:  UNSIGNED (License Admin signing is optional — configure apps/license-admin/android/keystore.properties to sign)");
 console.log("Android APK stays LOCAL — it is not uploaded anywhere by this script.");
 
 // ---------------------------------------------------------------------------
@@ -790,7 +893,7 @@ if (stagedNow.length !== expectedStaged.length || stagedNow.some((p, i) => p !==
   try { git(["restore", "--staged", "--", ...pathsToStage]); } catch { /* best effort */ }
   fail("Commit", `Staged set does not match the allowlist exactly.\n  expected: ${expectedStaged.join(", ")}\n  staged:   ${stagedNow.join(", ")}\nThe paths this script staged were unstaged again; nothing was committed.`);
 }
-const commitMsg = `Release v${ctx.nextOperator} (Umpire ${ctx.nextUmpire})\n\n- Windows Operator: ${ctx.currentOperator} -> ${ctx.nextOperator}\n- Android Umpire: ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.nextVersionCode})\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n`;
+const commitMsg = `Release v${ctx.nextOperator} (Umpire ${ctx.nextUmpire}, License Admin ${ctx.nextLicenseAdmin})\n\n- Windows Operator: ${ctx.currentOperator} -> ${ctx.nextOperator}\n- Android Umpire: ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.nextVersionCode})\n- Windows + Android License Admin: ${ctx.currentLicenseAdmin} -> ${ctx.nextLicenseAdmin} (versionCode ${ctx.nextLicenseAdminVersionCode})\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n`;
 writeFileSync(commitMsgPath, commitMsg);
 try {
   git(["commit", "-F", commitMsgPath], { stdio: "inherit" });
@@ -884,6 +987,7 @@ RELEASE COMPLETE
 
 Operator version: ${ctx.nextOperator}
 Umpire version:   ${ctx.nextUmpire} (versionCode ${ctx.nextVersionCode})
+License Admin version: ${ctx.nextLicenseAdmin} (versionCode ${ctx.nextLicenseAdminVersionCode})
 Duration: ${durationSec}s
 
 Windows:
@@ -897,6 +1001,18 @@ PASS (LOCAL ONLY — not uploaded or published)
 ${apkResult.path}
 ${apkResult.size} bytes - ${apkResult.appId} ${apkResult.versionName} (${apkResult.versionCode}), release, signed
 Signer SHA-256: ${apkResult.signerSha256 ?? "n/a"}
+
+Windows — License Admin:
+PASS (LOCAL ONLY — no auto-update channel)
+${laWinResult.path}
+${laWinResult.size} bytes, NSIS installer, ProductVersion ${laWinResult.productVersion ?? "n/a"}
+Windows Authenticode: ${laWinResult.authenticode.label}
+
+Android — License Admin:
+PASS (LOCAL ONLY — not uploaded or published)
+${laApkResult.path}
+${laApkResult.size} bytes - ${laApkResult.appId} ${laApkResult.versionName} (${laApkResult.versionCode}), release variant, ${laApkResult.signed ? "signed" : "UNSIGNED"}
+Signer SHA-256: ${laApkResult.signerSha256 ?? "n/a (unsigned unless apps/license-admin/android/keystore.properties is configured)"}
 
 Tests (preflight):
 Root suite (engine, contracts, api, client, ui): PASS
