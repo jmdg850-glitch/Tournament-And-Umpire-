@@ -21,7 +21,8 @@
 // Any failing step stops the pipeline and reports which stage failed and what
 // state the repo is in — see fail() below. The GitHub release carries both
 // Windows desktop updates (Operator latest.yml, License Admin license-admin.yml).
-// The Android APKs are built and verified locally only; nothing here uploads them.
+// The verified, signed Umpire APK is attached to the same release (License
+// Admin's APK stays local — it is unsigned/internal).
 //
 // Nothing here bypasses the existing build, test, or publish tooling; it
 // orchestrates the same npm scripts a human would run by hand (see
@@ -29,8 +30,8 @@
 // scripts/publish-desktop-update.mjs). It never force-pushes and never
 // overwrites an existing tag or release.
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { copyFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import {
   run,
   runCapture,
@@ -832,6 +833,13 @@ if (!apkResult.ok) fail("Verify Android build", apkResult.error);
 console.log(`APK:     ${apkResult.path} (${apkResult.size} bytes, ${apkResult.mtime.toISOString()})`);
 console.log(`Package: ${apkResult.appId} versionName ${apkResult.versionName} versionCode ${apkResult.versionCode} (release variant, not debuggable)`);
 console.log(`Signer:  ${apkResult.signerDn} SHA-256 ${apkResult.signerSha256 ?? "(n/a)"}`);
+// The verified, signed Umpire APK is attached to the GitHub release under a
+// versioned name. The copy lives beside Gradle's output (gitignored build dir)
+// and is byte-identical to the APK verified just above.
+const umpireApkAsset = resolve(dirname(apkResult.path), `Tournament-Umpire-${ctx.nextUmpire}.apk`);
+copyFileSync(apkResult.path, umpireApkAsset);
+if (sha256OfFile(umpireApkAsset) !== sha256OfFile(apkResult.path)) fail("Verify Android build", `Copy ${umpireApkAsset} does not match the verified APK.`);
+console.log(`Release asset: ${umpireApkAsset} (byte-identical copy of the verified APK)`);
 
 logStep("Verify Windows build — License Admin");
 // skipUpdateCheck: its license-admin.yml/.blockmap were already verified by the
@@ -869,7 +877,7 @@ console.log(`Package: ${laApkResult.appId} versionName ${laApkResult.versionName
 console.log(laApkResult.signed
   ? `Signer:  ${laApkResult.signerDn} SHA-256 ${laApkResult.signerSha256 ?? "(n/a)"}`
   : "Signer:  UNSIGNED (License Admin signing is optional — configure apps/license-admin/android/keystore.properties to sign)");
-console.log("Android APK stays LOCAL — it is not uploaded anywhere by this script.");
+console.log("License Admin APK stays LOCAL — it is not uploaded. The Umpire APK is attached to the GitHub release.");
 
 // ---------------------------------------------------------------------------
 // 5. Commit — explicit allowlist only, never "everything git status shows"
@@ -902,7 +910,7 @@ if (stagedNow.length !== expectedStaged.length || stagedNow.some((p, i) => p !==
   try { git(["restore", "--staged", "--", ...pathsToStage]); } catch { /* best effort */ }
   fail("Commit", `Staged set does not match the allowlist exactly.\n  expected: ${expectedStaged.join(", ")}\n  staged:   ${stagedNow.join(", ")}\nThe paths this script staged were unstaged again; nothing was committed.`);
 }
-const commitMsg = `Release v${ctx.nextOperator} (Umpire ${ctx.nextUmpire}, License Admin ${ctx.nextLicenseAdmin})\n\n- Windows Operator: ${ctx.currentOperator} -> ${ctx.nextOperator}\n- Android Umpire: ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.nextVersionCode})\n- Windows + Android License Admin: ${ctx.currentLicenseAdmin} -> ${ctx.nextLicenseAdmin} (versionCode ${ctx.nextLicenseAdminVersionCode})\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n`;
+const commitMsg = `Release v${ctx.nextOperator} (Umpire ${ctx.nextUmpire}, License Admin ${ctx.nextLicenseAdmin})\n\n- Windows Operator: ${ctx.currentOperator} -> ${ctx.nextOperator}\n- Android Umpire: ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.nextVersionCode})\n- Windows + Android License Admin: ${ctx.currentLicenseAdmin} -> ${ctx.nextLicenseAdmin} (versionCode ${ctx.nextLicenseAdminVersionCode})\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n`;
 writeFileSync(commitMsgPath, commitMsg);
 try {
   git(["commit", "-F", commitMsgPath], { stdio: "inherit" });
@@ -952,7 +960,7 @@ try {
   fail("Publish GitHub Release", `${err.message}\nSource push succeeded (commit ${state.commitHash}); no release was created.`);
 }
 state.ghReleaseStarted = true;
-if (run("node", [resolve(root, "scripts/publish-desktop-update.mjs")], { cwd: root }) !== 0) {
+if (run("node", [resolve(root, "scripts/publish-desktop-update.mjs"), `--extra-asset=${umpireApkAsset}`], { cwd: root }) !== 0) {
   fail("Publish GitHub Release", `scripts/publish-desktop-update.mjs failed. Source push already succeeded (commit ${state.commitHash}).`);
 }
 
@@ -964,6 +972,7 @@ const releaseFiles = [
   resolve(licenseAdminDir, `release/Tournament-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe`),
   resolve(licenseAdminDir, `release/Tournament-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe.blockmap`),
   resolve(licenseAdminDir, "release/license-admin.yml"),
+  umpireApkAsset,
 ];
 const view = tryCapture("gh", ["release", "view", state.tag, "--repo", ctx.releaseSlug, "--json", "tagName,isDraft,url,assets"]);
 if (!view.ok) fail("Verify published release", `gh could not read release ${state.tag}: ${errText(view)}`);
@@ -1009,7 +1018,7 @@ ${winResult.size} bytes, NSIS installer, ProductVersion ${winResult.productVersi
 Windows Authenticode: ${winResult.authenticode.label}
 
 Android:
-PASS (LOCAL ONLY — not uploaded or published)
+PASS (attached to GitHub release ${state.tag} as ${basename(umpireApkAsset)})
 ${apkResult.path}
 ${apkResult.size} bytes - ${apkResult.appId} ${apkResult.versionName} (${apkResult.versionCode}), release, signed
 Signer SHA-256: ${apkResult.signerSha256 ?? "n/a"}

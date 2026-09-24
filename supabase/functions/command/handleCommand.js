@@ -600,11 +600,12 @@ function finalizeCrossTeamMatchup(matchup, allPairMatches) {
     const sA = m.score?.scoreA ?? 0, sB = m.score?.scoreB ?? 0;
     diffA += sA - sB;
   }
-  let winnerTeamId;
-  if (teamAWins !== teamBWins) winnerTeamId = teamAWins > teamBWins ? matchup.teamAId : matchup.teamBId;
-  else if (diffA !== 0) winnerTeamId = diffA > 0 ? matchup.teamAId : matchup.teamBId;
-  else winnerTeamId = stableTiebreak(matchup.teamAId, matchup.teamBId) < 0 ? matchup.teamAId : matchup.teamBId;
-  return { teamAWins, teamBWins, winnerTeamId };
+  let winnerSlot;
+  if (teamAWins !== teamBWins) winnerSlot = teamAWins > teamBWins ? "A" : "B";
+  else if (diffA !== 0) winnerSlot = diffA > 0 ? "A" : "B";
+  else winnerSlot = stableTiebreak(matchup.teamAId, matchup.teamBId) < 0 ? "A" : "B";
+  const winnerTeamId = winnerSlot === "A" ? matchup.teamAId : matchup.teamBId;
+  return { teamAWins, teamBWins, winnerTeamId, winnerSlot };
 }
 
 // packages/engine/src/teamRoundRobin.js
@@ -1454,6 +1455,28 @@ async function resolveActor(admin, jwt) {
 }
 
 // packages/api/src/handleCommand.js
+var TEAM_QUALIFIER_MODE = "top_x_per_team";
+var DEFAULT_QUALIFIERS_PER_TEAM = 2;
+var KNOCKOUT_STAGE_UNIQUE_INDEX = "stages_one_team_knockout_per_division_uidx";
+function isValidQualifierCount(value) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1;
+}
+function assertTeamQualificationConfig(config) {
+  if (Object.hasOwn(config, "qualifierMode") && config.qualifierMode !== TEAM_QUALIFIER_MODE) {
+    throw httpError(
+      400,
+      "INVALID_QUALIFIER_MODE",
+      `Qualification mode "${config.qualifierMode}" is retired. Team elimination only supports "${TEAM_QUALIFIER_MODE}" (qualifiers per team).`
+    );
+  }
+  if (Object.hasOwn(config, "qualifierCount") && !isValidQualifierCount(config.qualifierCount)) {
+    throw httpError(
+      400,
+      "INVALID_QUALIFIER_COUNT",
+      `Qualifiers per team must be a whole number of 1 or more (got ${JSON.stringify(config.qualifierCount) ?? "undefined"}).`
+    );
+  }
+}
 function scoringSettings(config = {}) {
   return {
     winTo: QUALIFICATION_TARGET,
@@ -1517,6 +1540,43 @@ async function matchCourt(admin, matchId) {
   const { data, error } = await admin.from("court_assignments").select("*").eq("match_id", matchId).maybeSingle();
   if (error) throw error;
   return data;
+}
+function matchNotReady(message) {
+  return httpError(409, "MATCH_NOT_READY", message);
+}
+async function assertMatchPlayable(admin, match, division) {
+  if (division.format === "team_elimination" && !match.parent_match_id) {
+    throw matchNotReady("This is a team matchup; its pair match is played instead.");
+  }
+  const sides = await matchSides(admin, match.id);
+  const a = sides.find((s) => s.slot === "A");
+  const b = sides.find((s) => s.slot === "B");
+  if (!a?.participant_id || !b?.participant_id) {
+    throw matchNotReady("Both sides of this match must be filled before it can be started or scored.");
+  }
+  if (a.participant_id === b.participant_id) {
+    throw matchNotReady("A pair cannot play against itself.");
+  }
+  const { data: participants, error } = await admin.from("participants").select("id, division_id").in("id", [a.participant_id, b.participant_id]);
+  if (error) throw error;
+  const valid = (participants || []).filter((p) => p.division_id === match.division_id);
+  if (valid.length !== 2) {
+    throw matchNotReady("This match references a participant that is not registered in its division.");
+  }
+  if (match.parent_match_id) {
+    const parent = await getMatch(admin, match.parent_match_id);
+    if (parent.division_id !== match.division_id || parent.stage_id !== match.stage_id) {
+      throw matchNotReady("This pair match does not belong to its matchup's stage.");
+    }
+    if (parent.stage_label && parent.stage_label !== "round_robin") {
+      const parentSides = await matchSides(admin, parent.id);
+      const pa = parentSides.find((s) => s.slot === "A")?.participant_id;
+      const pb = parentSides.find((s) => s.slot === "B")?.participant_id;
+      if (pa !== a.participant_id || pb !== b.participant_id) {
+        throw matchNotReady("This playoff match's pairs do not match its bracket slot yet.");
+      }
+    }
+  }
 }
 async function authorizeMatchOperation(admin, actor, match) {
   const courtAsg = await matchCourt(admin, match.id);
@@ -1906,7 +1966,7 @@ async function finishMatchIfWon(admin, batch, match, scoreState, actorId) {
       persistMatch(batch, {
         ...parent,
         status: "completed",
-        winner: finalized.winnerTeamId === parentSides.find((s) => s.slot === "A")?.team_id ? "A" : "B",
+        winner: finalized.winnerSlot,
         team_a_wins: finalized.teamAWins,
         team_b_wins: finalized.teamBWins,
         completed_at: nowIso()
@@ -2028,9 +2088,10 @@ async function handleCreateDivision(admin, actor, payload, envelope) {
   const format = payload.format || "single_elim";
   const config = { ...payload.config || { bestOf: 1, winBy: "none", isDoubles: true } };
   if (format === "team_elimination") {
+    assertTeamQualificationConfig(config);
     if (config.sameTeamPolicy == null) config.sameTeamPolicy = "avoid_semis";
-    if (config.qualifierMode == null) config.qualifierMode = "top_x";
-    if (config.qualifierCount == null) config.qualifierCount = 4;
+    if (!Object.hasOwn(config, "qualifierMode")) config.qualifierMode = TEAM_QUALIFIER_MODE;
+    if (!Object.hasOwn(config, "qualifierCount")) config.qualifierCount = DEFAULT_QUALIFIERS_PER_TEAM;
     if (config.progressionMode == null) config.progressionMode = "playoffs";
   }
   const ts = nowIso();
@@ -2063,6 +2124,9 @@ async function handleUpdateDivision(admin, actor, payload, envelope) {
     config: payload.config != null ? { ...division.config, ...payload.config } : division.config,
     updated_at: nowIso()
   };
+  if (next.format === "team_elimination" && payload.config != null) {
+    assertTeamQualificationConfig(payload.config);
+  }
   const batch = createBatch();
   batch.upsert("divisions", next);
   return commit(admin, batch, {
@@ -2666,13 +2730,36 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
     };
   });
   const ranked = rankIndividualPairsForSemifinals(grouped.teams, rrMatchups, pairRows);
-  const mode = division.config?.qualifierMode || "top_x";
-  const count = Number(division.config?.qualifierCount || 4);
+  const mode = TEAM_QUALIFIER_MODE;
+  const storedMode = division.config?.qualifierMode;
+  if (storedMode !== TEAM_QUALIFIER_MODE) {
+    throw httpError(
+      409,
+      "QUALIFICATION_NOT_CONFIGURED",
+      `This division uses a retired qualification setting (${storedMode ?? "none"}). Open Divisions, set Qualifiers per team, and save before generating playoffs.`
+    );
+  }
+  const count = division.config?.qualifierCount;
+  if (!isValidQualifierCount(count)) {
+    throw httpError(
+      409,
+      "INVALID_QUALIFIER_COUNT",
+      `Qualifiers per team must be a whole number of 1 or more (stored: ${JSON.stringify(count) ?? "none"}). Open Divisions and save a valid value.`
+    );
+  }
+  const pairsPerTeam = Math.min(...grouped.teams.map((t) => t.pairs.length));
+  if (count > pairsPerTeam) {
+    throw httpError(
+      400,
+      "INVALID_QUALIFIER_COUNT",
+      `Qualifiers per team (${count}) cannot exceed the number of pairs per team (${pairsPerTeam}).`
+    );
+  }
   const progressionMode = division.config?.progressionMode || "playoffs";
   const expected = expectedQualifierCount(mode, count, grouped.teams.length);
-  if (progressionMode === "direct_semifinals" && expected != null && expected !== 4) {
-    const math = mode === "top_x_per_team" ? `Top ${count} per team \xD7 ${grouped.teams.length} teams = ${expected}` : `Top ${count} overall = ${expected}`;
-    const fix = mode === "top_x_per_team" && 4 % grouped.teams.length === 0 ? ` Set qualifiers per team to ${4 / grouped.teams.length}.` : " Adjust the qualifier count or qualification mode.";
+  if (progressionMode === "direct_semifinals" && expected !== 4) {
+    const math = `Top ${count} per team \xD7 ${grouped.teams.length} teams = ${expected}`;
+    const fix = 4 % grouped.teams.length === 0 ? ` Set qualifiers per team to ${4 / grouped.teams.length}.` : " Use Playoffs / Elimination for this number of teams.";
     throw httpError(
       400,
       "DIRECT_SEMIS_INVALID_COUNT",
@@ -2709,18 +2796,25 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
   const batch = createBatch();
   batch.upsert("stages", stage);
   persistTeamBracket(batch, division, stage, teamMatchups, pairMatches, grouped, nowIso());
-  return commit(admin, batch, {
-    ...envelope,
-    actorId: actor.id,
-    tournamentId: division.tournament_id,
-    result: {
-      stage,
-      team_matchups: teamMatchups.length,
-      pair_matches: pairMatches.length,
-      qualifiers: qualifiers.map((q) => q.registrationId),
-      unresolved_ties: unresolvedTies
+  try {
+    return await commit(admin, batch, {
+      ...envelope,
+      actorId: actor.id,
+      tournamentId: division.tournament_id,
+      result: {
+        stage,
+        team_matchups: teamMatchups.length,
+        pair_matches: pairMatches.length,
+        qualifiers: qualifiers.map((q) => q.registrationId),
+        unresolved_ties: unresolvedTies
+      }
+    });
+  } catch (err) {
+    if (String(err?.message || "").includes(KNOCKOUT_STAGE_UNIQUE_INDEX)) {
+      throw httpError(409, "PLAYOFFS_EXIST", "Knockout stage already generated");
     }
-  });
+    throw err;
+  }
 }
 async function handleAssignCourt(admin, actor, payload, envelope) {
   requireUserActor(actor);
@@ -2838,6 +2932,7 @@ async function handleStartMatch(admin, actor, payload, envelope) {
     throw httpError(409, err.code || "ILLEGAL_TRANSITION", err.message);
   }
   const division = await getDivision(admin, match.division_id);
+  await assertMatchPlayable(admin, match, division);
   const settings = await matchScoringSettings(admin, division, match);
   const score_state = scoreStateForMatchStart(match, settings);
   const next = { ...match, status: "in_progress", started_at: nowIso(), score_state };
@@ -2868,6 +2963,7 @@ async function handleCoinToss(admin, actor, payload, envelope) {
   if (!["assigned", "in_progress", "ready"].includes(match.status)) {
     throw httpError(409, "ILLEGAL_TRANSITION", `Cannot coin toss from ${match.status}`);
   }
+  await assertMatchPlayable(admin, match, await getDivision(admin, match.division_id));
   if (!isUuid2(payload.event_id)) throw httpError(400, "INVALID_COMMAND", "event_id must be a UUID");
   const { data: existing } = await admin.from("score_events").select("*").eq("id", payload.event_id).maybeSingle();
   if (existing) {
@@ -2955,6 +3051,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
   const isCorrection = payload.type === "correction";
   const wasCompleted = match.status === "completed";
   const division = await getDivision(admin, match.division_id);
+  await assertMatchPlayable(admin, match, division);
   const settings = await matchScoringSettings(admin, division, match);
   const eventPayload = payload.event_payload || payload.payload || {};
   if (wasCompleted) {
@@ -3069,6 +3166,7 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
     await reconcilePlayoffChildren(admin, match.division_id, division.format);
     return { match, already_complete: true };
   }
+  await assertMatchPlayable(admin, match, division);
   const { data: events } = await admin.from("score_events").select("*").eq("match_id", match.id).order("seq");
   const state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
   if (state.status !== "completed") {

@@ -175,7 +175,6 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
     if (!data || busy) return;
     for (const d of data.divisions) {
       if (d.format !== "team_elimination") continue;
-      if (d.config?.qualifierMode === "manual") continue;
       if (attemptedPlayoffs.current.has(d.id)) continue;
       const knockout = (data.stages || []).some((s) => s.division_id === d.id && s.kind === "team_knockout");
       if (knockout) continue;

@@ -104,10 +104,13 @@ export function finalizeCrossTeamMatchup(matchup, allPairMatches){
     diffA += (sA - sB);
   }
 
-  let winnerTeamId;
-  if (teamAWins !== teamBWins) winnerTeamId = teamAWins > teamBWins ? matchup.teamAId : matchup.teamBId;
-  else if (diffA !== 0) winnerTeamId = diffA > 0 ? matchup.teamAId : matchup.teamBId;
-  else winnerTeamId = stableTiebreak(matchup.teamAId, matchup.teamBId) < 0 ? matchup.teamAId : matchup.teamBId;
+  // Decided per SLOT, so a same-team matchup (both sides on one team, e.g. an
+  // all-NEXTG final) still records which side actually won.
+  let winnerSlot;
+  if (teamAWins !== teamBWins) winnerSlot = teamAWins > teamBWins ? "A" : "B";
+  else if (diffA !== 0) winnerSlot = diffA > 0 ? "A" : "B";
+  else winnerSlot = stableTiebreak(matchup.teamAId, matchup.teamBId) < 0 ? "A" : "B";
+  const winnerTeamId = winnerSlot === "A" ? matchup.teamAId : matchup.teamBId;
 
-  return { teamAWins, teamBWins, winnerTeamId };
+  return { teamAWins, teamBWins, winnerTeamId, winnerSlot };
 }

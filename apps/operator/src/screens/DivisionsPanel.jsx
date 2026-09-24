@@ -20,18 +20,24 @@ function ScoringRules() {
   );
 }
 
-// Direct Semifinals always seeds exactly 4 pairs. With "Top X per team" the
-// count is per team (teams × per-team must equal 4, checked by the server);
-// with "Top X overall" it is fixed at 4.
+// Team elimination always qualifies per team: qualifierCount = pairs taken
+// from EACH team (the server enforces this too). Direct Semifinals needs
+// teams × per-team = 4, which the server checks with the real team count.
+const DEFAULT_QUALIFIERS_PER_TEAM = 2;
+
+// Strict: only a positive whole number (typed as digits) is valid — never
+// coerced, so "1.5", "0", "-1", "", "abc" stay invalid instead of turning into
+// another number. The server applies the same rule.
 function qualifierCountForSave(cfg) {
-  const lockedToFour = cfg.progressionMode === "direct_semifinals" && cfg.qualifierMode !== "top_x_per_team";
-  return lockedToFour ? 4 : Number(cfg.qualifierCount) || 4;
+  const text = String(cfg.qualifierCount ?? "").trim();
+  return /^[1-9]\d*$/.test(text) ? Number(text) : null;
 }
+
+const QUALIFIER_COUNT_ERROR = "Enter a whole number of 1 or more.";
 
 function QualificationFields({ cfg, onChange }) {
   const direct = cfg.progressionMode === "direct_semifinals";
-  const perTeam = cfg.qualifierMode === "top_x_per_team";
-  const locked = direct && !perTeam;
+  const perTeam = qualifierCountForSave(cfg);
   return (
     <>
       <section className="division-section" aria-label="Qualification">
@@ -48,24 +54,26 @@ function QualificationFields({ cfg, onChange }) {
             <option value="playoffs">Playoffs / Elimination</option>
             <option value="direct_semifinals">Direct Semifinals</option>
           </Select>
-          <Select label="Qualification method" value={cfg.qualifierMode} onChange={(e) => onChange({ qualifierMode: e.target.value })}>
-            <option value="top_x">Top X overall</option>
-            <option value="top_x_per_team">Top X per team</option>
-            <option value="manual">Manual qualification</option>
-          </Select>
           <Input
-            label={perTeam ? "Qualifiers per team" : "Qualifier count"}
-            value={locked ? "4" : cfg.qualifierCount}
+            label="Qualifiers per team"
+            type="number"
+            min={1}
+            step={1}
+            value={cfg.qualifierCount}
             onChange={(e) => onChange({ qualifierCount: e.target.value })}
             inputMode="numeric"
-            disabled={locked}
-            hint={locked
-              ? "Fixed at 4 for Direct Semifinals."
-              : direct
-                ? "Teams × qualifiers per team must equal 4 for Direct Semifinals (2 teams → 2 each)."
-                : undefined}
+            required
+            error={perTeam == null ? QUALIFIER_COUNT_ERROR : undefined}
+            hint={direct
+              ? "Teams × qualifiers per team must equal 4 for Direct Semifinals (2 teams → 2 each)."
+              : "Pairs taken from EACH team, ranked by wins, then +/-, then points for."}
           />
         </div>
+        {perTeam != null && (
+          <p className="division-note">
+            Qualification: Top {perTeam} {perTeam === 1 ? "pair" : "pairs"} per team — picked automatically when the round robin is complete.
+          </p>
+        )}
       </section>
       <section className="division-section" aria-label="Bracket">
         <h4 className="division-section-title">Bracket</h4>
@@ -91,8 +99,8 @@ export function DivisionsPanel({ data, busy, run }) {
   const [name, setName] = useState("");
   const [format, setFormat] = useState("single_elim");
   const [draft, setDraft] = useState({
-    qualifierMode: "top_x",
-    qualifierCount: "4",
+    qualifierMode: "top_x_per_team",
+    qualifierCount: String(DEFAULT_QUALIFIERS_PER_TEAM),
     sameTeamPolicy: "avoid_semis",
     progressionMode: "playoffs",
   });
@@ -103,9 +111,10 @@ export function DivisionsPanel({ data, busy, run }) {
       <SectionHeader title="Divisions" description="Group players into competitions, then generate each division's bracket." />
       <Card as="form" className="division-card" onSubmit={(e) => {
         e.preventDefault();
+        if (format === "team_elimination" && qualifierCountForSave(draft) == null) return;
         const config = { bestOf: 1, winBy: "none", isDoubles: true, bronzeMatch: true };
         if (format === "team_elimination") {
-          config.qualifierMode = draft.qualifierMode;
+          config.qualifierMode = "top_x_per_team";
           config.qualifierCount = qualifierCountForSave(draft);
           config.sameTeamPolicy = draft.sameTeamPolicy;
           config.progressionMode = draft.progressionMode;
@@ -133,7 +142,7 @@ export function DivisionsPanel({ data, busy, run }) {
           <QualificationFields cfg={draft} onChange={(patch) => setDraft((prev) => ({ ...prev, ...patch }))} />
         )}
         <div className="division-actions">
-          <Button type="submit" disabled={!!busy}>Add division</Button>
+          <Button type="submit" disabled={!!busy || (format === "team_elimination" && qualifierCountForSave(draft) == null)}>Add division</Button>
         </div>
       </Card>
       {data.divisions.length === 0 && (
@@ -141,8 +150,8 @@ export function DivisionsPanel({ data, busy, run }) {
       )}
       {data.divisions.map((d) => {
         const cfg = edit[d.id] || {
-          qualifierMode: d.config?.qualifierMode || "top_x",
-          qualifierCount: String(d.config?.qualifierCount ?? 4),
+          qualifierMode: "top_x_per_team",
+          qualifierCount: String(d.config?.qualifierCount ?? DEFAULT_QUALIFIERS_PER_TEAM),
           sameTeamPolicy: d.config?.sameTeamPolicy || "avoid_semis",
           progressionMode: d.config?.progressionMode || "playoffs",
         };
@@ -175,19 +184,25 @@ export function DivisionsPanel({ data, busy, run }) {
             {isTeam && (
               <form className="division-form" onSubmit={(e) => {
                 e.preventDefault();
+                if (qualifierCountForSave(cfg) == null) return;
                 run("Update division", "update_division", {
                   division_id: d.id,
                   config: {
-                    qualifierMode: cfg.qualifierMode,
+                    qualifierMode: "top_x_per_team",
                     qualifierCount: qualifierCountForSave(cfg),
                     sameTeamPolicy: cfg.sameTeamPolicy,
                     progressionMode: cfg.progressionMode,
                   },
                 });
               }}>
+                {d.config?.qualifierMode !== "top_x_per_team" && (
+                  <p className="division-note" role="status">
+                    This division was saved with a retired qualification setting. Check Qualifiers per team and press Save options before playoffs can be generated.
+                  </p>
+                )}
                 <QualificationFields cfg={cfg} onChange={(patch) => setEdit((prev) => ({ ...prev, [d.id]: { ...cfg, ...patch } }))} />
                 <div className="division-actions">
-                  <Button type="submit" variant="secondary" disabled={!!busy}>Save options</Button>
+                  <Button type="submit" variant="secondary" disabled={!!busy || qualifierCountForSave(cfg) == null}>Save options</Button>
                 </div>
               </form>
             )}

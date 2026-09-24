@@ -523,7 +523,7 @@ describe.skipIf(!live)("live team elimination path", () => {
       tournament_id: tournamentId,
       name: "Team Elim",
       format: "team_elimination",
-      config: { winBy: "none", bestOf: 1, isDoubles: true, qualifierMode: "top_x", qualifierCount: 4 },
+      config: { winBy: "none", bestOf: 1, isDoubles: true, qualifierMode: "top_x_per_team", qualifierCount: 1 },
     });
     divisionId = r.body.result.division.id;
 
@@ -801,8 +801,8 @@ describe.skipIf(!live)("live team elimination path", () => {
   test("Direct Semifinals: exactly 4 qualifiers skip straight to semifinal/bronze/final with no intermediate playoff round", async () => {
     const { divisionId } = await setupTeamEliminationQualifiers(organizer, umpire, {
       progressionMode: "direct_semifinals",
-      qualifierMode: "top_x",
-      qualifierCount: 4,
+      qualifierMode: "top_x_per_team",
+      qualifierCount: 1, // 4 teams x 1 per team = 4
     });
 
     const r = await expectOk(organizer.token, "generate_team_playoffs", { division_id: divisionId });
@@ -825,8 +825,8 @@ describe.skipIf(!live)("live team elimination path", () => {
   test("Direct Semifinals: a qualifier count that does not resolve to exactly 4 is rejected with a clear error and generates no bracket", async () => {
     const { divisionId } = await setupTeamEliminationQualifiers(organizer, umpire, {
       progressionMode: "direct_semifinals",
-      qualifierMode: "top_x",
-      qualifierCount: 8,
+      qualifierMode: "top_x_per_team",
+      qualifierCount: 2, // 4 teams x 2 per team = 8
     });
 
     const r = await send(organizer.token, "generate_team_playoffs", { division_id: divisionId });
@@ -1710,7 +1710,7 @@ describe.skipIf(!live)("Match integrity: self-match and cross-team protection (u
     await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
     r = await expectOk(organizer.token, "create_division", {
       tournament_id: tournamentId, name: "TeamBoundary", format: "team_elimination",
-      config: { winBy: "none", bestOf: 1, isDoubles: true, qualifierMode: "top_x", qualifierCount: 4 },
+      config: { winBy: "none", bestOf: 1, isDoubles: true, qualifierMode: "top_x_per_team", qualifierCount: 1 },
     });
     const divisionId = r.body.result.division.id;
     r = await expectOk(organizer.token, "create_team", { tournament_id: tournamentId, division_id: divisionId, name: "TB Falcons" });

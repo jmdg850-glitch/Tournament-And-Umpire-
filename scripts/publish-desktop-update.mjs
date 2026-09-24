@@ -28,6 +28,19 @@ import { execFileSync } from "node:child_process";
 const root = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 const operatorDir = resolve(root, "apps/operator");
 const checkOnly = process.argv.includes("--check");
+// Optional additional distributables for the same release (used by
+// scripts/release.mjs for the verified, signed Tournament Umpire APK). They are
+// uploaded while the release is still a draft, so the release is only ever
+// published with every asset present, and are verified like the others.
+const extraAssets = process.argv
+  .filter((a) => a.startsWith("--extra-asset="))
+  .map((a) => resolve(a.slice("--extra-asset=".length)));
+for (const file of extraAssets) {
+  if (!existsSync(file) || !statSync(file).isFile()) {
+    console.error(`--extra-asset: ${file} does not exist or is not a file.`);
+    process.exit(1);
+  }
+}
 
 function run(cmd, args, opts = {}) {
   return execFileSync(cmd, args, { encoding: "utf8", ...opts });
@@ -221,9 +234,11 @@ const licenseAdminFiles = verifyDesktopArtifacts(licenseAdminApp);
 const files = [
   ...operatorFiles.slice(0, 2),
   ...licenseAdminFiles.slice(0, 2),
+  ...extraAssets,
   licenseAdminFiles[2],
   operatorFiles[2],
 ];
+for (const file of extraAssets) console.log(`Extra asset: ${basename(file)} (${statSync(file).size} bytes)`);
 if (new Set(files.map((f) => basename(f))).size !== files.length) {
   console.error("Duplicate asset names across Operator and License Admin — refusing to publish.");
   process.exit(1);
@@ -289,7 +304,8 @@ const create = tryRun("gh", [
   "--repo", ghRepo,
   "--draft",
   "--title", tag,
-  "--notes", `Tournament Operator ${version} and Tournament License Admin ${licenseAdminApp.version} — Windows desktop updates.`,
+  "--notes", `Tournament Operator ${version} and Tournament License Admin ${licenseAdminApp.version} — Windows desktop updates.` +
+    (extraAssets.length ? `\n\nAlso attached: ${extraAssets.map((f) => basename(f)).join(", ")}.` : ""),
 ]);
 if (!create.ok) {
   console.error(`Failed to create draft release ${tag}: ${create.error.message}`);

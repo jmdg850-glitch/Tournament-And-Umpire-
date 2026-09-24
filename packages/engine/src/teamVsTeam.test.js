@@ -260,7 +260,7 @@ describe("finalizeCrossTeamMatchup — decides only once every pair match is com
       { teamMatchupId:"ttm1", status:"completed", winner:"B", score:{scoreA:6,scoreB:11} },
     ];
     const result = finalizeCrossTeamMatchup(matchup, pairMatches);
-    expect(result).toEqual({ teamAWins:2, teamBWins:1, winnerTeamId:"A" });
+    expect(result).toEqual({ teamAWins:2, teamBWins:1, winnerTeamId:"A", winnerSlot:"A" });
   });
 
   test("tie-break: equal win counts decided by aggregate point differential", () => {
@@ -290,6 +290,14 @@ describe("finalizeCrossTeamMatchup — decides only once every pair match is com
       { teamMatchupId:"other", status:"in_progress", winner:null },
     ];
     const result = finalizeCrossTeamMatchup(matchup, pairMatches);
-    expect(result).toEqual({ teamAWins:1, teamBWins:0, winnerTeamId:"A" });
+    expect(result).toEqual({ teamAWins:1, teamBWins:0, winnerTeamId:"A", winnerSlot:"A" });
+  });
+
+  test("same-team knockout matchup (e.g. an all-NEXTG final): winnerSlot follows the side that actually won", () => {
+    const sameTeam = { id:"fin", teamAId:"NEXTG", teamBId:"NEXTG" };
+    const bWins = finalizeCrossTeamMatchup(sameTeam, [{ teamMatchupId:"fin", status:"completed", winner:"B", score:{scoreA:9,scoreB:15} }]);
+    expect(bWins).toEqual({ teamAWins:0, teamBWins:1, winnerTeamId:"NEXTG", winnerSlot:"B" });
+    const aWins = finalizeCrossTeamMatchup(sameTeam, [{ teamMatchupId:"fin", status:"completed", winner:"A", score:{scoreA:15,scoreB:9} }]);
+    expect(aWins.winnerSlot).toBe("A");
   });
 });

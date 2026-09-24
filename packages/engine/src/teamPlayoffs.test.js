@@ -325,3 +325,125 @@ describe("expectedQualifierCount — derived from mode, never a fixed 4", () => 
     expect(expectedQualifierCount("manual", 4, 2)).toBeNull();
   });
 });
+
+// ---- Qualification -> Semifinals regression suite (per-team only) ----
+import { rankIndividualPairsForSemifinals } from "./teamRoundRobin.js";
+
+// Builds teams + completed round-robin pair matches from a per-pair list of
+// [wins, losses, pointsFor, pointsAgainst] records against a dummy opponent
+// pool, so ranking runs through the real engine function.
+function scenario(spec){
+  const teams = Object.entries(spec).map(([teamId, pairs]) => ({
+    teamId, teamName: teamId, pairs: pairs.map((_, i) => ({ id: `${teamId}${i+1}`, teamId })),
+  }));
+  teams.push({ teamId: "_OPP", teamName: "_OPP", pairs: [{ id: "_opp" }] });
+  const pairMatches = [];
+  let n = 0;
+  for (const [teamId, pairs] of Object.entries(spec)){
+    pairs.forEach(([w, l, pf, pa], i) => {
+      const id = `${teamId}${i+1}`;
+      const games = w + l;
+      for (let g = 0; g < games; g++){
+        const won = g < w;
+        // Spread PF/PA across games; the last game absorbs rounding.
+        const last = g === games - 1;
+        const a = last ? pf - Math.floor(pf / games) * (games - 1) : Math.floor(pf / games);
+        const b = last ? pa - Math.floor(pa / games) * (games - 1) : Math.floor(pa / games);
+        pairMatches.push({ id: "m" + (n++), teamMatchupId: "rr", status: "completed", registrationAId: id, registrationBId: "_opp", winner: won ? "A" : "B", score: { scoreA: a, scoreB: b } });
+      }
+    });
+  }
+  const ranked = rankIndividualPairsForSemifinals(teams, [{ id: "rr", stage: "round_robin" }], pairMatches).filter(r => r.teamId !== "_OPP");
+  return ranked;
+}
+const ids = qs => qs.map(q => q.registrationId);
+const perTeam = qs => qs.reduce((m, q) => ({ ...m, [q.teamId]: (m[q.teamId] || 0) + 1 }), {});
+
+describe("per-team qualification (server always uses top_x_per_team for team elimination)", () => {
+  test("1. 2 teams x 5 pairs, 2 per team: A1+A2 and B1+B2 by wins, 4 total, no 3rd-placed pair", () => {
+    const ranked = scenario({
+      A: [[4,0,44,29], [1,3,30,40], [3,1,40,35], [2,2,36,36], [0,4,20,44]],
+      B: [[3,1,41,33], [0,4,25,44], [2,2,38,38], [3,1,39,37], [1,3,30,40]],
+    });
+    const qs = selectQualifiers(ranked, "top_x_per_team", 2);
+    expect(perTeam(qs)).toEqual({ A: 2, B: 2 });
+    expect(qs).toHaveLength(4);
+    expect(new Set(ids(qs))).toEqual(new Set(["A1", "A3", "B1", "B4"]));
+    expect(ids(qs)).not.toContain("A4"); // A's 3rd-placed pair
+    expect(ids(qs)).not.toContain("B3"); // B's 3rd-placed pair
+  });
+
+  test("2. different team sizes (3 vs 7), 2 per team -> exactly 2 from each", () => {
+    const ranked = scenario({
+      A: [[1,2,30,33], [2,1,33,30], [0,3,20,33]],
+      B: [[6,0,66,30], [5,1,60,40], [4,2,55,45], [3,3,50,50], [2,4,45,55], [1,5,40,60], [0,6,30,66]],
+    });
+    const qs = selectQualifiers(ranked, "top_x_per_team", 2);
+    expect(perTeam(qs)).toEqual({ A: 2, B: 2 });
+    expect(new Set(ids(qs))).toEqual(new Set(["A2", "A1", "B1", "B2"]));
+  });
+
+  test("3. qualifierCount = 1 -> exactly 1 per team", () => {
+    const ranked = scenario({ A: [[2,1,30,25], [3,0,33,20], [1,2,25,30]], B: [[0,3,20,33], [1,2,25,30], [2,1,30,25]] });
+    const qs = selectQualifiers(ranked, "top_x_per_team", 1);
+    expect(perTeam(qs)).toEqual({ A: 1, B: 1 });
+    expect(new Set(ids(qs))).toEqual(new Set(["A2", "B3"]));
+  });
+
+  test("4. qualifierCount = 3 -> exactly 3 per team when enough pairs exist", () => {
+    const ranked = scenario({
+      A: [[4,0,44,20], [3,1,40,30], [2,2,35,35], [1,3,30,40], [0,4,20,44]],
+      B: [[0,4,20,44], [1,3,30,40], [2,2,35,35], [3,1,40,30], [4,0,44,20]],
+    });
+    const qs = selectQualifiers(ranked, "top_x_per_team", 3);
+    expect(perTeam(qs)).toEqual({ A: 3, B: 3 });
+    expect(new Set(ids(qs))).toEqual(new Set(["A1", "A2", "A3", "B5", "B4", "B3"]));
+    expect(expectedQualifierCount("top_x_per_team", 3, 2)).toBe(6);
+  });
+
+  test("5. wins tie -> +/- decides; +/- tie too -> Points For decides (existing official order)", () => {
+    const byDiff = scenario({ A: [[3,1,40,38], [3,1,42,35], [0,4,10,44]], B: [[1,3,1,1]] });
+    expect(ids(selectQualifiers(byDiff, "top_x_per_team", 1))).toContain("A2"); // +7 beats +2
+    const byPF = scenario({ A: [[3,1,40,38], [3,1,44,42], [0,4,10,44]], B: [[1,3,1,1]] });
+    const q = selectQualifiers(byPF, "top_x_per_team", 1);
+    expect(ids(q)).toContain("A2"); // both +2, PF 44 beats 40
+    expect(findCutoffTies(byPF, q, "top_x_per_team")).toEqual([]);
+  });
+});
+
+describe("qualified pairs -> semifinals (Direct Semifinals, 2 teams x 2)", () => {
+  // Every possible overall-rank order of two A and two B qualifiers.
+  const orders = ["AABB", "ABAB", "ABBA", "BAAB", "BABA", "BBAA"];
+  const build = pattern => {
+    const n = { A: 0, B: 0 };
+    return pattern.split("").map(t => q(`${t}${++n[t]}`, t));
+  };
+  const semis = shell => shell.teamMatchups.filter(m => m.stage === "semifinal");
+
+  test.each(orders)("6. avoid_semis, rank order %s: both semifinals are cross-team", pattern => {
+    const qualifiers = build(pattern);
+    const shell = generateQualifierBracketShell(qualifiers, { makeId: idGen(), sameTeamPolicy: "avoid_semis" });
+    expect(shell.conflicts).toEqual([]);
+    const sf = semis(shell);
+    expect(sf).toHaveLength(2);
+    for (const m of sf) expect(m.teamAId).not.toBe(m.teamBId);
+  });
+
+  test.each(orders)("7-8. rank order %s: semifinal participants are exactly the qualified set, once each", pattern => {
+    const qualifiers = build(pattern);
+    const shell = generateQualifierBracketShell(qualifiers, { makeId: idGen(), sameTeamPolicy: "avoid_semis" });
+    const placed = semis(shell).flatMap(m => [m.pairAId, m.pairBId]);
+    expect(placed.slice().sort()).toEqual(ids(qualifiers).sort());
+    expect(new Set(placed).size).toBe(4);
+    // Pair child matches exist only for the semifinals; the final and bronze wait for results.
+    expect(shell.pairMatches).toHaveLength(2);
+    const final = shell.teamMatchups.find(m => m.stage === "final");
+    const bronze = shell.teamMatchups.find(m => m.stage === "bronze");
+    expect([final.pairAId, final.pairBId, bronze.pairAId, bronze.pairBId]).toEqual([null, null, null, null]);
+  });
+
+  test("allow_anywhere keeps plain seeding, so a same-team semifinal is possible (policy is what prevents it)", () => {
+    const shell = generateQualifierBracketShell(build("ABBA"), { makeId: idGen(), sameTeamPolicy: "allow_anywhere" });
+    expect(semis(shell).some(m => m.teamAId === m.teamBId)).toBe(true);
+  });
+});
