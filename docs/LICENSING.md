@@ -38,7 +38,7 @@ Operator's default screen for an install that has never signed in is **Activate 
 - **Gated:** all 23 organizer/admin-only commands, `create_tournament` (the bootstrap command — a brand-new signup needs a license before creating their first tournament), and the organizer-acting branch of `transition_match` / `start_match` / `coin_toss` / `score_event` / `complete_match`.
 - **Never gated:** court station devices (no email/customer identity), `station_sync`, an umpire scoring or holding their own assigned match, password reset/login, and public/spectator "live" viewing (which never reaches `/command` at all).
 - Denials return `LICENSE_REQUIRED` (no code / never activated) or `LICENSE_INVALID` (revoked, or expired) as HTTP 403, with a generic message only — never the email, code, or any other row's data.
-- A warm-instance-local cache remembers only *positive* results for ~60 seconds; a denial is always re-checked against the database, so a revoke takes effect on that account's very next command.
+- A warm-instance-local cache remembers only *positive* results for ~60 seconds; a denial is always re-checked against the database. So a revoke takes effect on that account's next command once any cached "allowed" result for it has aged out — at most ~60 s after the revoke on a warm instance, immediately otherwise.
 - Device-seat binding (one PC per license) is intentionally **not** re-checked here — the Electron device hash isn't sent on ordinary `/command` calls, and a client that's already been modified to bypass the gate can't be trusted to send it truthfully either. That enforcement correctly stays where it already lives: the `license` function's `activate` flow.
 - Deploying a change here requires `npm run bundle:command` followed by redeploying the `command` edge function — this is a separate, independently-deployed function from `license`.
 
@@ -52,9 +52,19 @@ Electron: SHA-256 of the Windows `MachineGuid` (survives reinstall; the raw GUID
 - Caller identity comes from the verified JWT only. Admin actions require a row in `public.license_admins`, checked on every request. Unknown or extra request fields are rejected.
 - Codes are stored in plaintext so the admin can re-copy them; they are unreadable to any client. A database/service-key compromise would expose them (they still only work for the matching, confirmed email).
 
+## Revocation in a running Operator
+
+`useLicense` (`LicenseGate.jsx`) delegates to `createLicenseMonitor` in `apps/operator/src/license.js`. The server's answer is always authoritative; the client never treats a local flag as a license.
+
+- **Periodic:** an open Operator re-checks every 5 minutes (`RECHECK_MS`), on reconnect (`online`), and on window focus / becoming visible (at most once a minute). An idle open app therefore sees a revoke within ~5 minutes.
+- **Immediate:** when `/command` (or an offline-queue replay) is refused with `LICENSE_INVALID` / `LICENSE_REQUIRED`, the app blocks at once, drops the offline allowance, then re-checks for the reason to show.
+- **Ordering:** check results are applied in order, so a slow "active" answer from before a revoke can never overwrite a newer "revoked" answer.
+- **Restart:** every launch starts with a server check; a revoked license stays blocked.
+- Popped-out display windows (live/bracket/match displays) are read-only and not license-gated by design (see Known limits).
+
 ## Offline
 
-If the server is unreachable, Operator keeps working only if this account was verified active within the last 7 days. This is a convenience, not tamper-proof.
+If the server is unreachable, Operator keeps working only if this account was verified active within the last 7 days. This is a convenience, not tamper-proof. The allowance is only granted by a successful "active" check and is removed by any "not active" answer or license denial from the server — so once the client has seen a revoke, going offline or restarting offline cannot restore access. A revoke made while a PC is offline is enforced when it reconnects (writes to `/command` are refused server-side regardless).
 
 ## Operating
 
@@ -77,4 +87,5 @@ Live test (creates and leaves `+lictest-` data to delete afterwards): see the he
   - **Windows:** packaged as `Tournament-License-Admin-Setup-<version>.exe` and published in the **same GitHub Release** as Operator (`jmdg850-glitch/Tournament-And-Umpire-`, tag `v<operator version>`) with its `.blockmap` and `license-admin.yml`. The desktop app auto-updates from its own electron-updater channel, `license-admin` — it reads only `license-admin.yml`, while Operator reads only `latest.yml`, so neither app can pick up the other's installer. Updates are checked ~12 s after start and every 6 h (packaged builds only), download automatically, and install when the app quits or when the seller clicks **Restart** on the header's "Update ready" notice. `scripts/publish-desktop-update.mjs` requires both apps' artifacts, so every published release carries both update channels.
   - **First updater-enabled version:** License Admin Windows 1.0.0 and 1.0.1 contain no updater, so the first updater-enabled build must be installed manually once; later versions then arrive automatically.
   - **Android:** the release APK is built and verified locally only (not uploaded anywhere) and is **unsigned** unless `apps/license-admin/android/keystore.properties` is configured.
-- The `packages/api/src/handleCommand.js` server-side enforcement described above is implemented and unit-tested but, as of this writing, **not yet bundled/deployed** to the production `command` edge function (`npm run bundle:command` + redeploy is a separate step) — until that runs, production is still relying on `LicenseGate.jsx` alone.
+- The `packages/api/src/handleCommand.js` server-side enforcement described above **is deployed**: the production `command` edge function (v23, verified 2026-09-24) contains `requireLicense` / `requireOrganizerLicensed`. Redeploy after changing it (`npm run bundle:command` + deploy `command`).
+- Direct database **reads** (PostgREST under RLS, e.g. a signed-in account reading its own tournaments) are membership-gated, not license-gated. A revoked account's official app is blocked by the gate and its writes are refused by `/command`, but a hand-made client with that account's JWT could still read its own tournament data. Closing that requires an RLS/migration change and is not part of the current design.

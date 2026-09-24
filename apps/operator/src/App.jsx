@@ -37,7 +37,7 @@ import { firstQueryError, isToday } from "./lib.js";
 import { version as APP_VERSION } from "../package.json";
 import { LicenseGate, useLicense } from "./LicenseGate.jsx";
 import { ActivationSetup } from "./ActivationSetup.jsx";
-import { hasAccountHere, rememberHasAccount } from "./license.js";
+import { hasAccountHere, isLicenseDenial, rememberHasAccount } from "./license.js";
 
 function useConfig() {
   return useMemo(() => envConfig(), []);
@@ -79,6 +79,10 @@ export default function App() {
     return () => sub.subscription.unsubscribe();
   }, [supabase]);
 
+  // Licensing: the server decides whether this account's license is activated on this PC.
+  const license = useLicense({ commandUrl: cfg.commandUrl, publishableKey: cfg.publishableKey, session });
+  const reportLicenseDenial = license.reportDenial;
+
   const outboxRef = useRef(null);
   if (!outboxRef.current) outboxRef.current = defaultStore("tournament-operator-outbox");
   const [pendingSync, setPendingSync] = useState(0);
@@ -98,10 +102,11 @@ export default function App() {
       publishableKey: cfg.publishableKey,
       onEach: (entry, result, err) => {
         if (err) console.error(`[offline-queue] queued ${entry.type} could not be synced:`, err.message);
+        if (isLicenseDenial(err)) reportLicenseDenial();
       },
     });
     await refreshPendingSync();
-  }, [session, cfg, refreshPendingSync]);
+  }, [session, cfg, refreshPendingSync, reportLicenseDenial]);
 
   useEffect(() => {
     refreshPendingSync();
@@ -115,7 +120,18 @@ export default function App() {
     };
   }, [drain, refreshPendingSync]);
 
+  // A license refusal from the server is authoritative: block the app now
+  // instead of waiting for the next periodic license check.
   async function command(type, payload, opts) {
+    try {
+      return await sendOperatorCommand(type, payload, opts);
+    } catch (err) {
+      if (isLicenseDenial(err)) reportLicenseDenial();
+      throw err;
+    }
+  }
+
+  async function sendOperatorCommand(type, payload, opts) {
     if (!session?.access_token) throw new Error("Not signed in");
     // Durable queueing is opt-in per call site: a handful of TournamentDesk
     // flows chain a command's result straight into a second command (e.g.
@@ -145,8 +161,6 @@ export default function App() {
     return body;
   }
 
-  // Licensing: the server decides whether this account's license is activated on this PC.
-  const license = useLicense({ commandUrl: cfg.commandUrl, publishableKey: cfg.publishableKey, session });
   useEffect(() => { if (session?.user) rememberHasAccount(); }, [session]);
 
   if (session === undefined) {

@@ -1,7 +1,7 @@
 {
   "name": "@tournament/operator",
   "private": true,
-  "version": "1.2.23",
+  "version": "1.2.24",
   "type": "module",
   "description": "Tournament operator desktop application",
   "author": "Tournament",
@@ -17,7 +17,7 @@
     "publish:desktop": "node ../../scripts/publish-desktop-update.mjs",
     "publish:desktop:check": "node ../../scripts/publish-desktop-update.mjs --check",
     "release:win": "npm run build:desktop && npm run publish:desktop",
-    "test": "node --test electron/updatePolicy.test.cjs electron/licenseDevice.test.cjs electron/licenseDeviceIpc.test.cjs src/license.test.js src/excelImportExport.test.js src/importIntegrity.test.js src/lib.test.js src/deskHash.test.js src/attention.test.js src/publicLive/route.test.js src/publicLive/data.test.js"
+    "test": "node --test electron/updatePolicy.test.cjs electron/licenseDevice.test.cjs electron/licenseDeviceIpc.test.cjs src/license.test.js src/licenseRevocation.test.js src/excelImportExport.test.js src/importIntegrity.test.js src/lib.test.js src/deskHash.test.js src/attention.test.js src/publicLive/route.test.js src/publicLive/data.test.js"
   },
   "dependencies": {
     "@tournament/client": "*",

@@ -2,7 +2,12 @@
 // decides everything. The only local rule is a short offline allowance so a
 // venue with no internet can still run a tournament.
 
-export const RECHECK_MS = 6 * 60 * 60 * 1000;
+// How often an already-open app re-asks the server. A revoke reaches an idle
+// open app within this interval; any licensed command the server refuses
+// blocks the app immediately (see reportDenial below).
+export const RECHECK_MS = 5 * 60 * 1000;
+// Window focus / tab visible also re-checks, at most this often.
+export const FOCUS_RECHECK_MIN_MS = 60 * 1000;
 export const OFFLINE_ALLOWANCE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Same convention as pair-station: the function sits next to `command`.
@@ -70,8 +75,24 @@ export function rememberActive(userId, now = Date.now(), storage = globalThis.lo
   try { storage?.setItem(cacheKey(userId), String(now)); } catch { /* storage unavailable */ }
 }
 
-export function forgetActive(userId, storage = globalThis.localStorage) {
+// Also records WHEN the server last said "not active", so a check that was
+// sent before that moment (a stale answer, from any window of this app) can
+// never re-save the offline allowance afterwards.
+const blockedKey = (userId) => `tournament.license.blockedAt.${userId}`;
+
+export function forgetActive(userId, storage = globalThis.localStorage, now = Date.now()) {
   try { storage?.removeItem(cacheKey(userId)); } catch { /* ignore */ }
+  try { storage?.setItem(blockedKey(userId), String(now)); } catch { /* storage unavailable */ }
+}
+
+// rememberActive for a `check` answer: only if that check was sent after the
+// latest "not active" answer. Returns whether it was saved.
+export function rememberActiveIfCurrent(userId, requestedAt, now = Date.now(), storage = globalThis.localStorage) {
+  let blockedAt = NaN;
+  try { blockedAt = Number(storage?.getItem(blockedKey(userId))); } catch { /* ignore */ }
+  if (Number.isFinite(blockedAt) && blockedAt > 0 && requestedAt <= blockedAt) return false;
+  rememberActive(userId, now, storage);
+  return true;
 }
 
 // Offline (server unreachable): allowed only if this account was verified
@@ -80,4 +101,96 @@ export function offlineAllowed(userId, now = Date.now(), storage = globalThis.lo
   let last = NaN;
   try { last = Number(storage?.getItem(cacheKey(userId))); } catch { /* ignore */ }
   return Number.isFinite(last) && last > 0 && now >= last - 5 * 60 * 1000 && now - last <= OFFLINE_ALLOWANCE_MS;
+}
+
+// The command layer's license refusal (packages/api/src/authz.js requireLicense):
+// the server's own, current answer that this account is not licensed.
+export function isLicenseDenial(err) {
+  return Boolean(err) && err.status === 403 && (err.code === "LICENSE_INVALID" || err.code === "LICENSE_REQUIRED");
+}
+
+// One `check` result -> gate state. A server answer always wins and updates
+// the offline allowance; only an unreachable server may fall back to it.
+// `requestedAt` = when that check was sent (defaults to now).
+export function gateStateFromCheck({ userId, view, error, now = Date.now(), requestedAt = now, storage = globalThis.localStorage }) {
+  if (view) {
+    if (view.status === "active") rememberActiveIfCurrent(userId, requestedAt, now, storage); else forgetActive(userId, storage, now);
+    return { phase: view.status === "active" ? "active" : "blocked", view, error: "" };
+  }
+  if (error?.code === "NETWORK" && offlineAllowed(userId, now, storage)) return { phase: "active", view: null, error: "" };
+  return { phase: "blocked", view: null, error: error?.message || "Unable to verify license." };
+}
+
+export const DENIED_MESSAGE = "Your license is no longer active for this account.";
+
+// Keeps one account's gate in step with the server: a check on start, every
+// RECHECK_MS, on reconnect/focus, and immediately after the server refuses a
+// licensed command. Results are applied in order — an older, slower check can
+// never overwrite a newer answer (e.g. a pre-revoke "active" arriving late).
+export function createLicenseMonitor({
+  userId, check, onState,
+  storage = globalThis.localStorage,
+  now = () => Date.now(),
+  recheckMs = RECHECK_MS,
+  focusMinMs = FOCUS_RECHECK_MIN_MS,
+  timers = globalThis,
+}) {
+  let seq = 0;
+  let timer = null;
+  let stopped = false;
+  let lastCheckAt = 0;
+
+  function apply(mine, next) {
+    if (!stopped && mine === seq) onState(next);
+    return next;
+  }
+
+  async function refresh() {
+    const mine = ++seq;
+    const requestedAt = now();
+    lastCheckAt = requestedAt;
+    let outcome;
+    try {
+      outcome = { view: await check() };
+    } catch (error) {
+      outcome = { error };
+    }
+    // Superseded (a newer check, denial or activation) or stopped: this answer
+    // is discarded BEFORE it can touch storage or the gate.
+    if (stopped || mine !== seq) return null;
+    const next = gateStateFromCheck({ userId, ...outcome, now: now(), requestedAt, storage });
+    onState(next);
+    return next;
+  }
+
+  function refreshIfStale() {
+    return now() - lastCheckAt >= focusMinMs ? refresh() : null;
+  }
+
+  // Authoritative server refusal: drop the offline allowance (so going offline
+  // cannot resurrect access), block now, then fetch the reason for the screen.
+  function reportDenial() {
+    forgetActive(userId, storage, now());
+    apply(++seq, { phase: "blocked", view: null, error: DENIED_MESSAGE });
+    return refresh();
+  }
+
+  // A result obtained outside refresh() (a successful activation).
+  function set(next) {
+    return apply(++seq, next);
+  }
+
+  function start() {
+    stopped = false;
+    timer = timers.setInterval(() => { refresh(); }, recheckMs);
+    return refresh();
+  }
+
+  function stop() {
+    stopped = true;
+    if (timer) timers.clearInterval(timer);
+    timer = null;
+  }
+
+  return { start, stop, refresh, refreshIfStale, reportDenial, set };
 }
