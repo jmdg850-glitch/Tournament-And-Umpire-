@@ -86,12 +86,15 @@ export {
   isTeamRoundRobinComplete,
   rankIndividualPairsForSemifinals,
   assertNoRepeatPairOpponents,
+  pairsOfficiallyTied,
 } from "./teamRoundRobin.js";
 
 export {
   podSizeForPolicy,
   placeQualifiersWithPolicy,
   selectQualifiers,
+  expectedQualifierCount,
+  findCutoffTies,
   generateQualifierBracketShell,
   hasKnockoutStageStarted,
 } from "./teamPlayoffs.js";

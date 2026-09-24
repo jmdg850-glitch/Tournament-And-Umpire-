@@ -58,92 +58,117 @@ describe("generateTeamRoundRobinMatchups", () => {
   });
 });
 
-describe("buildTeamStandingsFromRoundRobin", () => {
-  test("ranks by wins, then head-to-head, then aggregate pair-match win margin", () => {
-    const teams = buildTeams(4, 2);
-    const [A,B,C,D] = teams.map(t => t.teamId);
-    const teamMatchups = [
-      { id:"m1", stage:"round_robin", status:"completed", teamAId:A, teamBId:B, teamAWins:2, teamBWins:0, winnerTeamId:A },
-      { id:"m2", stage:"round_robin", status:"completed", teamAId:A, teamBId:C, teamAWins:1, teamBWins:1, winnerTeamId:null },
-      { id:"m3", stage:"round_robin", status:"completed", teamAId:A, teamBId:D, teamAWins:0, teamBWins:2, winnerTeamId:D },
-      { id:"m4", stage:"round_robin", status:"completed", teamAId:B, teamBId:C, teamAWins:2, teamBWins:0, winnerTeamId:B },
-      { id:"m5", stage:"round_robin", status:"completed", teamAId:B, teamBId:D, teamAWins:0, teamBWins:2, winnerTeamId:D },
-      { id:"m6", stage:"round_robin", status:"completed", teamAId:C, teamBId:D, teamAWins:1, teamBWins:1, winnerTeamId:null },
-    ];
-    const standings = buildTeamStandingsFromRoundRobin(teams, teamMatchups);
-    expect(standings.map(s => s.teamId)).toEqual([D, A, B, C]);
-    const d = standings.find(s => s.teamId===D);
-    expect(d.wins).toBe(2);
-    expect(d.matchesPlayed).toBe(3);
+// Pair-match fixture for team standings: `id`, pairs "teamN-rM", RR matchup id.
+const pm = (id, teamMatchupId, a, b, scoreA, scoreB, status = "completed") => ({
+  id, teamMatchupId, status, registrationAId: a, registrationBId: b,
+  winner: status === "completed" ? (scoreA > scoreB ? "A" : "B") : null,
+  score: { scoreA, scoreB },
+});
+
+describe("buildTeamStandingsFromRoundRobin — every completed round-robin pair match counts", () => {
+  const teams = buildTeams(2, 3);
+  const [A, B] = teams.map(t => t.teamId);
+  // One team-vs-team matchup still in progress — the table must not wait for it.
+  const rr = { id: "rr1", stage: "round_robin", status: "in_progress", teamAId: A, teamBId: B, teamAWins: 0, teamBWins: 0, winnerTeamId: null };
+
+  test("one completed match: correct W/L/MP/PF/PA/+-", () => {
+    const rows = buildTeamStandingsFromRoundRobin(teams, [rr], [pm("p1", "rr1", "team0-r0", "team1-r0", 11, 5)]);
+    expect(rows.find(r => r.teamId === A)).toEqual(expect.objectContaining({ wins: 1, losses: 0, matchesPlayed: 1, pointsFor: 11, pointsAgainst: 5, pointDiff: 6 }));
+    expect(rows.find(r => r.teamId === B)).toEqual(expect.objectContaining({ wins: 0, losses: 1, matchesPlayed: 1, pointsFor: 5, pointsAgainst: 11, pointDiff: -6 }));
   });
 
-  test("ignores non-round_robin matchups (e.g. a semifinal that happens to be completed)", () => {
-    const teams = buildTeams(2, 2);
-    const [A,B] = teams.map(t => t.teamId);
-    const teamMatchups = [
-      { id:"sf1", stage:"semifinal", status:"completed", teamAId:A, teamBId:B, teamAWins:2, teamBWins:0, winnerTeamId:A },
+  test("multiple completed matches accumulate (11-5, 11-9, 7-11 -> W2 L1 MP3 PF29 PA25 +4)", () => {
+    const rows = buildTeamStandingsFromRoundRobin(teams, [rr], [
+      pm("p1", "rr1", "team0-r0", "team1-r0", 11, 5),
+      pm("p2", "rr1", "team0-r1", "team1-r1", 11, 9),
+      pm("p3", "rr1", "team0-r2", "team1-r2", 7, 11),
+    ]);
+    const a = rows.find(r => r.teamId === A);
+    expect(a).toEqual(expect.objectContaining({ wins: 2, losses: 1, matchesPlayed: 3, pointsFor: 29, pointsAgainst: 25, pointDiff: 4 }));
+    expect(a.matchesPlayed).toBe(a.wins + a.losses);
+    expect(rows.find(r => r.teamId === B)).toEqual(expect.objectContaining({ wins: 1, losses: 2, matchesPlayed: 3, pointsFor: 25, pointsAgainst: 29, pointDiff: -4 }));
+  });
+
+  test("unfinished (scheduled / in_progress) matches do not affect standings; a duplicated row is counted once", () => {
+    const rows = buildTeamStandingsFromRoundRobin(teams, [rr], [
+      pm("p1", "rr1", "team0-r0", "team1-r0", 11, 5),
+      pm("p1", "rr1", "team0-r0", "team1-r0", 11, 5),
+      pm("p2", "rr1", "team0-r1", "team1-r1", 9, 9, "in_progress"),
+      pm("p3", "rr1", "team0-r2", "team1-r2", 0, 0, "scheduled"),
+    ]);
+    expect(rows.find(r => r.teamId === A)).toEqual(expect.objectContaining({ wins: 1, losses: 0, matchesPlayed: 1, pointsFor: 11, pointsAgainst: 5 }));
+  });
+
+  test("all qualification rounds (several round-robin matchups, 3 teams) are included", () => {
+    const t3 = buildTeams(3, 2);
+    const [X, Y, Z] = t3.map(t => t.teamId);
+    const mus = [
+      { id: "m1", stage: "round_robin", status: "completed", teamAId: X, teamBId: Y, winnerTeamId: X },
+      { id: "m2", stage: "round_robin", status: "completed", teamAId: X, teamBId: Z, winnerTeamId: Z },
+      { id: "m3", stage: "round_robin", status: "scheduled", teamAId: Y, teamBId: Z, winnerTeamId: null },
     ];
-    const standings = buildTeamStandingsFromRoundRobin(teams, teamMatchups);
-    expect(standings).toHaveLength(2);
-    for (const row of standings) expect(row).toEqual(expect.objectContaining({ wins:0, losses:0, matchesPlayed:0 }));
-    expect(new Set(standings.map(r => r.teamId))).toEqual(new Set([A,B]));
+    const rows = buildTeamStandingsFromRoundRobin(t3, mus, [
+      pm("a", "m1", "team0-r0", "team1-r0", 11, 6), pm("b", "m1", "team0-r1", "team1-r1", 11, 8),
+      pm("c", "m2", "team0-r0", "team2-r0", 9, 11), pm("d", "m2", "team0-r1", "team2-r1", 5, 11),
+      pm("e", "m3", "team1-r0", "team2-r0", 11, 3),
+    ]);
+    expect(rows.find(r => r.teamId === X)).toEqual(expect.objectContaining({ wins: 2, losses: 2, matchesPlayed: 4, pointsFor: 36, pointsAgainst: 36, teamMatchupWins: 1, teamMatchupLosses: 1 }));
+    expect(rows.find(r => r.teamId === Y)).toEqual(expect.objectContaining({ wins: 1, losses: 2, matchesPlayed: 3, pointsFor: 25, pointsAgainst: 25 }));
+    expect(rows.find(r => r.teamId === Z)).toEqual(expect.objectContaining({ wins: 2, losses: 1, matchesPlayed: 3, pointsFor: 25, pointsAgainst: 25 }));
+  });
+
+  test("semifinal, bronze and final pair matches are excluded", () => {
+    const mus = [
+      rr,
+      { id: "sf1", stage: "semifinal", status: "completed", teamAId: A, teamBId: B, winnerTeamId: A },
+      { id: "br", stage: "bronze", status: "completed", teamAId: A, teamBId: B, winnerTeamId: B },
+      { id: "fi", stage: "final", status: "completed", teamAId: A, teamBId: B, winnerTeamId: A },
+    ];
+    const rows = buildTeamStandingsFromRoundRobin(teams, mus, [
+      pm("p1", "rr1", "team0-r0", "team1-r0", 11, 5),
+      pm("s", "sf1", "team0-r0", "team1-r0", 15, 2),
+      pm("b", "br", "team0-r1", "team1-r1", 3, 15),
+      pm("f", "fi", "team0-r2", "team1-r2", 15, 13),
+    ]);
+    expect(rows.find(r => r.teamId === A)).toEqual(expect.objectContaining({ wins: 1, losses: 0, matchesPlayed: 1, pointsFor: 11, pointsAgainst: 5 }));
+    expect(rows.find(r => r.teamId === B)).toEqual(expect.objectContaining({ wins: 0, losses: 1, matchesPlayed: 1, pointsFor: 5, pointsAgainst: 11 }));
+  });
+
+  test("ranking: more W ranks higher; equal W -> higher +/- ranks higher", () => {
+    const t3 = buildTeams(3, 2);
+    const [X, Y, Z] = t3.map(t => t.teamId);
+    const mus = ["m1", "m2", "m3"].map(id => ({ id, stage: "round_robin", status: "in_progress" }));
+    // Y 3W, X 2W, Z 0W.
+    const rows = buildTeamStandingsFromRoundRobin(t3, mus, [
+      pm("a", "m1", "team0-r0", "team1-r0", 11, 9), pm("b", "m1", "team0-r1", "team1-r1", 9, 11),
+      pm("c", "m2", "team0-r0", "team2-r0", 11, 9),
+      pm("d", "m3", "team1-r0", "team2-r0", 11, 3), pm("e", "m3", "team1-r1", "team2-r1", 11, 3),
+    ]);
+    expect(rows.map(r => [r.teamId, r.wins])).toEqual([[Y, 3], [X, 2], [Z, 0]]);
+
+    // Both 1W 1L; B has +6, A has -6 -> B first.
+    const byDiff = buildTeamStandingsFromRoundRobin(teams, [rr], [
+      pm("p1", "rr1", "team0-r0", "team1-r0", 11, 9),
+      pm("p2", "rr1", "team0-r1", "team1-r1", 3, 11),
+    ]);
+    expect(byDiff.map(r => [r.teamId, r.wins, r.pointDiff, r.rank])).toEqual([[B, 1, 6, 1], [A, 1, -6, 2]]);
+  });
+
+  test("equal W and +/- -> head-to-head; fully tied teams share a rank (no hidden arbitrary order)", () => {
+    const tied = [pm("p1", "rr1", "team0-r0", "team1-r0", 11, 9), pm("p2", "rr1", "team0-r1", "team1-r1", 9, 11)];
+    expect(buildTeamStandingsFromRoundRobin(teams, [rr], tied).map(r => r.rank)).toEqual([1, 1]);
+
+    const h2hDecided = buildTeamStandingsFromRoundRobin(teams, [{ ...rr, status: "completed", winnerTeamId: B }], tied);
+    expect(h2hDecided.map(r => [r.teamId, r.rank])).toEqual([[B, 1], [A, 2]]);
+  });
+
+  test("with no pair matches every team is 0-0", () => {
+    const rows = buildTeamStandingsFromRoundRobin(teams, [{ ...rr, status: "completed", winnerTeamId: A }]);
+    for (const row of rows) expect(row).toEqual(expect.objectContaining({ wins: 0, losses: 0, matchesPlayed: 0, pointsFor: 0, pointsAgainst: 0, pointDiff: 0 }));
   });
 });
 
 describe("buildTeamStandingsFromRoundRobin — Points For/Against/Diff", () => {
-  test("aggregates raw pair-match points up to each pair's team; existing wins/losses/margin fields and rank order are unaffected", () => {
-    const teams = buildTeams(3, 2);
-    const [A, B, C] = teams.map((t) => t.teamId);
-    const teamMatchups = [
-      { id: "m1", stage: "round_robin", status: "completed", teamAId: A, teamBId: B, teamAWins: 2, teamBWins: 0, winnerTeamId: A },
-      { id: "m2", stage: "round_robin", status: "completed", teamAId: A, teamBId: C, teamAWins: 1, teamBWins: 1, winnerTeamId: null },
-      { id: "m3", stage: "round_robin", status: "completed", teamAId: B, teamBId: C, teamAWins: 0, teamBWins: 2, winnerTeamId: C },
-    ];
-    const pairMatches = [
-      { teamMatchupId: "m1", status: "completed", registrationAId: "team0-r0", registrationBId: "team1-r0", score: { scoreA: 11, scoreB: 6 } },
-      { teamMatchupId: "m1", status: "completed", registrationAId: "team0-r1", registrationBId: "team1-r1", score: { scoreA: 11, scoreB: 8 } },
-      { teamMatchupId: "m2", status: "completed", registrationAId: "team0-r0", registrationBId: "team2-r0", score: { scoreA: 11, scoreB: 9 } },
-      { teamMatchupId: "m2", status: "completed", registrationAId: "team0-r1", registrationBId: "team2-r1", score: { scoreA: 7, scoreB: 11 } },
-      { teamMatchupId: "m3", status: "completed", registrationAId: "team1-r0", registrationBId: "team2-r0", score: { scoreA: 4, scoreB: 11 } },
-      { teamMatchupId: "m3", status: "completed", registrationAId: "team1-r1", registrationBId: "team2-r1", score: { scoreA: 9, scoreB: 11 } },
-    ];
-    const withPoints = buildTeamStandingsFromRoundRobin(teams, teamMatchups, pairMatches);
-    const withoutPoints = buildTeamStandingsFromRoundRobin(teams, teamMatchups);
-    const a = withPoints.find((s) => s.teamId === A);
-    const b = withPoints.find((s) => s.teamId === B);
-    const c = withPoints.find((s) => s.teamId === C);
-
-    expect(a.pointsFor).toBe(40); // 11+11+11+7
-    expect(a.pointsAgainst).toBe(34); // 6+8+9+11
-    expect(a.pointDiff).toBe(6);
-
-    expect(b.pointsFor).toBe(27); // 6+8+4+9
-    expect(b.pointsAgainst).toBe(44); // 11+11+11+11
-    expect(b.pointDiff).toBe(-17);
-
-    expect(c.pointsFor).toBe(42); // 9+11+11+11
-    expect(c.pointsAgainst).toBe(31); // 11+7+4+9
-    expect(c.pointDiff).toBe(11);
-
-    // Adding points is purely additive — rank order, wins/losses/margin identical either way.
-    expect(withPoints.map((s) => [s.teamId, s.wins, s.losses, s.pairWinMargin, s.rank])).toEqual(
-      withoutPoints.map((s) => [s.teamId, s.wins, s.losses, s.pairWinMargin, s.rank])
-    );
-  });
-
-  test("omitting pairMatches leaves Points For/Against/Diff at zero", () => {
-    const teams = buildTeams(2, 2);
-    const [A, B] = teams.map((t) => t.teamId);
-    const teamMatchups = [
-      { id: "m1", stage: "round_robin", status: "completed", teamAId: A, teamBId: B, teamAWins: 2, teamBWins: 0, winnerTeamId: A },
-    ];
-    const standings = buildTeamStandingsFromRoundRobin(teams, teamMatchups);
-    for (const row of standings) {
-      expect(row.pointsFor).toBe(0);
-      expect(row.pointsAgainst).toBe(0);
-      expect(row.pointDiff).toBe(0);
-    }
-  });
 
   test("excludes non-round-robin-stage and non-completed pair matches from Points For/Against", () => {
     const teams = buildTeams(2, 1);
@@ -261,6 +286,17 @@ describe("rankIndividualPairsForSemifinals — combines every pair from every te
     const first = rankIndividualPairsForSemifinals(teams, [rrMatchup], pairMatches).map(r => r.registrationId);
     const second = rankIndividualPairsForSemifinals(teams, [rrMatchup], pairMatches).map(r => r.registrationId);
     expect(first).toEqual(second);
+  });
+
+  test("rows separated only by the stable fallback are flagged tieUnresolved; others are not", () => {
+    const teams = teamsOf([["P1","tA"],["P2","tB"],["Q","tA"],["R","tB"]]);
+    const pairMatches = [match("P1","P2","A",11,9), match("P2","P1","A",11,9), match("Q","R","A",11,0)];
+    const ranked = rankIndividualPairsForSemifinals(teams, [rrMatchup], pairMatches);
+    const flag = id => ranked.find(r => r.registrationId === id).tieUnresolved;
+    expect(flag("P1")).toBe(true);
+    expect(flag("P2")).toBe(true);
+    expect(flag("Q")).toBe(false);
+    expect(flag("R")).toBe(false);
   });
 
   test("only counts completed matches belonging to round_robin-stage matchups (excludes semifinal/bronze/final pair matches)", () => {

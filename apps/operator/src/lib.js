@@ -352,6 +352,23 @@ export function teamEliminationStandings(division, data) {
   }
 }
 
+// Groups of pair names the engine could only order by its stable fallback
+// (equal W, L, +/- and PF) — shown as a note so the tie is never silent.
+export function unresolvedTieGroups(standings, data) {
+  const groups = [];
+  let current = [];
+  standings.forEach((row, i) => {
+    const prev = standings[i - 1];
+    const continues = prev && prev.tieUnresolved && row.tieUnresolved
+      && prev.wins === row.wins && prev.losses === row.losses
+      && prev.pointDiff === row.pointDiff && prev.pointsFor === row.pointsFor;
+    if (!continues && current.length) { groups.push(current); current = []; }
+    if (row.tieUnresolved) current.push(data.participants.find((p) => p.id === row.registrationId)?.display_name || row.registrationId);
+  });
+  if (current.length) groups.push(current);
+  return groups.filter((g) => g.length > 1);
+}
+
 // Team-level round-robin standings (Wins/Losses/Matches Played/Points For/
 // Against/Diff) for a team_elimination division — round-robin stage only,
 // same scope as teamEliminationStandings above (semifinal/bronze/final

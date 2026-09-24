@@ -6,7 +6,7 @@
 // of resolvePersonByName/normalizePersonName, fully exercised below.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizePersonName, resolvePersonByName, liveShareUrl, resolveShareOrigin, PUBLIC_LIVE_PRODUCTION_ORIGIN, scoringTargetFor, nextSeqAfterOutOfOrder, teamStandings } from "./lib.js";
+import { normalizePersonName, resolvePersonByName, liveShareUrl, resolveShareOrigin, PUBLIC_LIVE_PRODUCTION_ORIGIN, scoringTargetFor, nextSeqAfterOutOfOrder, teamStandings, unresolvedTieGroups } from "./lib.js";
 
 const persons = [
   { id: "p1", display_name: "Rem" },
@@ -187,9 +187,9 @@ test("teamStandings: aggregates Wins/Losses/Matches Played/Points For/Against/Di
   const a = rows.find((r) => r.teamId === "teamA");
   const b = rows.find((r) => r.teamId === "teamB");
 
-  assert.equal(a.wins, 1);
+  assert.equal(a.wins, 2); // both completed round-robin pair matches
   assert.equal(a.losses, 0);
-  assert.equal(a.matchesPlayed, 1); // one round-robin team matchup — the semifinal is a separate stage
+  assert.equal(a.matchesPlayed, 2); // completed round-robin pair matches only — the live one and the semifinal are excluded
   // Points use the corrected result (11-9), not the stale score_state (11-8),
   // and exclude both the live pair match (99-99) and the semifinal (15-2).
   assert.equal(a.pointsFor, 22); // 11 + 11
@@ -197,8 +197,8 @@ test("teamStandings: aggregates Wins/Losses/Matches Played/Points For/Against/Di
   assert.equal(a.pointDiff, 7);
 
   assert.equal(b.wins, 0);
-  assert.equal(b.losses, 1);
-  assert.equal(b.matchesPlayed, 1);
+  assert.equal(b.losses, 2);
+  assert.equal(b.matchesPlayed, 2);
   assert.equal(b.pointsFor, 15);
   assert.equal(b.pointsAgainst, 22);
   assert.equal(b.pointDiff, -7);
@@ -208,4 +208,11 @@ test("teamStandings: a division with no matches yet returns an empty list, not a
   const division = { id: "d-empty", format: "team_elimination" };
   const rows = teamStandings(division, { teams: [], participants: [], matches: [], matchParticipants: [], results: [] });
   assert.deepEqual(rows, []);
+});
+
+test("unresolvedTieGroups: names only the pairs the engine flagged as tied on every official criterion", () => {
+  const data = { participants: [{ id: "j", display_name: "JEFFREY / REM" }, { id: "g", display_name: "GRACE / REIN" }, { id: "k", display_name: "KENNETH / JENNY" }] };
+  const row = (registrationId, wins, pointDiff, pointsFor, tieUnresolved) => ({ registrationId, wins, losses: 4 - wins, pointDiff, pointsFor, tieUnresolved });
+  assert.deepEqual(unresolvedTieGroups([row("k", 4, 15, 44, false), row("j", 3, 2, 40, true), row("g", 3, 2, 40, true)], data), [["JEFFREY / REM", "GRACE / REIN"]]);
+  assert.deepEqual(unresolvedTieGroups([row("k", 4, 15, 44, false), row("j", 3, 2, 40, false), row("g", 3, 2, 38, false)], data), []);
 });

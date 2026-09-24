@@ -20,6 +20,8 @@ import {
   isTeamRoundRobinComplete,
   rankIndividualPairsForSemifinals,
   selectQualifiers,
+  expectedQualifierCount,
+  findCutoffTies,
   generateQualifierBracketShell,
   assignedPersonIds,
   validatePersonIdsForAssignment,
@@ -1416,16 +1418,35 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
   const ranked = rankIndividualPairsForSemifinals(grouped.teams, rrMatchups, pairRows);
   const mode = division.config?.qualifierMode || "top_x";
   const count = Number(division.config?.qualifierCount || 4);
-  const qualifiers = selectQualifiers(ranked, mode, count);
   const progressionMode = division.config?.progressionMode || "playoffs";
+  // qualifierCount is per team for top_x_per_team, overall for top_x.
+  const expected = expectedQualifierCount(mode, count, grouped.teams.length);
+  if (progressionMode === "direct_semifinals" && expected != null && expected !== 4) {
+    const math = mode === "top_x_per_team"
+      ? `Top ${count} per team × ${grouped.teams.length} teams = ${expected}`
+      : `Top ${count} overall = ${expected}`;
+    const fix = mode === "top_x_per_team" && 4 % grouped.teams.length === 0
+      ? ` Set qualifiers per team to ${4 / grouped.teams.length}.`
+      : " Adjust the qualifier count or qualification mode.";
+    throw httpError(
+      400,
+      "DIRECT_SEMIS_INVALID_COUNT",
+      `Direct Semifinals requires exactly 4 qualifying pairs; ${math}.${fix}`,
+    );
+  }
+  const qualifiers = selectQualifiers(ranked, mode, count);
+  if (new Set(qualifiers.map((q) => q.registrationId)).size !== qualifiers.length) {
+    throw httpError(500, "QUALIFIER_DUPLICATE", "Qualifier list contains a duplicate pair");
+  }
   if (progressionMode === "direct_semifinals" && qualifiers.length !== 4) {
     throw httpError(
       400,
       "DIRECT_SEMIS_INVALID_COUNT",
-      `Direct Semifinals requires exactly 4 qualifying pairs (got ${qualifiers.length}). Adjust the qualifier count or qualification mode.`,
+      `Direct Semifinals requires exactly 4 qualifying pairs (got ${qualifiers.length}). A team may have fewer pairs than the qualifier count.`,
     );
   }
   if (qualifiers.length < 2) throw httpError(400, "TE_INVALID", "Not enough qualifiers for playoffs");
+  const unresolvedTies = findCutoffTies(ranked, qualifiers, mode);
 
   const startRound = Math.max(0, ...parents.map((m) => m.round || 0)) + 1;
   const { teamMatchups, pairMatches } = generateQualifierBracketShell(qualifiers, {
@@ -1453,6 +1474,7 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
       team_matchups: teamMatchups.length,
       pair_matches: pairMatches.length,
       qualifiers: qualifiers.map((q) => q.registrationId),
+      unresolved_ties: unresolvedTies,
     },
   });
 }

@@ -51,40 +51,47 @@ export function assertNoRepeatPairOpponents(pairMatches) {
   }
 }
 
-// `pairMatches` is optional (third param) — when provided (the same
-// per-pair round-robin match rows rankIndividualPairsForSemifinals reads),
-// raw rally points are aggregated up to each pair's team, purely additive:
-// Points For/Against/Diff. Team rank/tiebreak order (wins -> head-to-head ->
-// pairWinMargin -> stable) is completely unchanged either way.
+// Team standings for the round-robin qualification stage only. Every
+// completed round-robin PAIR match counts toward its two teams as it finishes
+// (W/L/MP/PF/PA), so the table accumulates live — it does not wait for a whole
+// team-vs-team matchup to complete. Semifinal/bronze/final matchups (and their
+// pair matches) are out of scope. Team-matchup-level results are still kept
+// as teamMatchupWins/teamMatchupLosses and feed the head-to-head tiebreak.
+// Rank: W desc -> +/- desc -> head-to-head -> shared rank (never a hidden
+// arbitrary tiebreak; fully tied teams get the same rank number).
 export function buildTeamStandingsFromRoundRobin(teams, teamMatchups, pairMatches){
-  const rows = new Map(teams.map(t => [t.teamId, { teamId:t.teamId, teamName:t.teamName, wins:0, losses:0, matchesPlayed:0, pairMatchWins:0, pairMatchLosses:0, pairWinMargin:0, pointsFor:0, pointsAgainst:0, pointDiff:0 }]));
-  const completed = (teamMatchups||[]).filter(m => m.stage === "round_robin" && m.status === "completed" && m.teamAId && m.teamBId);
+  const rows = new Map(teams.map(t => [t.teamId, { teamId:t.teamId, teamName:t.teamName, wins:0, losses:0, matchesPlayed:0, pairMatchWins:0, pairMatchLosses:0, pairWinMargin:0, teamMatchupWins:0, teamMatchupLosses:0, pointsFor:0, pointsAgainst:0, pointDiff:0 }]));
+  const roundRobinMatchups = (teamMatchups||[]).filter(m => m.stage === "round_robin");
+  const completed = roundRobinMatchups.filter(m => m.status === "completed" && m.teamAId && m.teamBId);
 
   for (const m of completed){
     const a = rows.get(m.teamAId), b = rows.get(m.teamBId);
     if (!a || !b) continue;
-    a.matchesPlayed++; b.matchesPlayed++;
-    a.pairMatchWins += m.teamAWins; a.pairMatchLosses += m.teamBWins;
-    b.pairMatchWins += m.teamBWins; b.pairMatchLosses += m.teamAWins;
-    a.pairWinMargin += (m.teamAWins - m.teamBWins); b.pairWinMargin += (m.teamBWins - m.teamAWins);
-    if (m.winnerTeamId === m.teamAId){ a.wins++; b.losses++; }
-    else if (m.winnerTeamId === m.teamBId){ b.wins++; a.losses++; }
+    if (m.winnerTeamId === m.teamAId){ a.teamMatchupWins++; b.teamMatchupLosses++; }
+    else if (m.winnerTeamId === m.teamBId){ b.teamMatchupWins++; a.teamMatchupLosses++; }
   }
 
-  if (pairMatches && pairMatches.length) {
-    const registrationToTeam = new Map();
-    for (const team of teams) for (const pair of team.pairs) registrationToTeam.set(pair.id, team.teamId);
-    const roundRobinMatchupIds = new Set(completed.map(m => m.id));
-    for (const pm of pairMatches){
-      if (pm.status !== "completed" || !roundRobinMatchupIds.has(pm.teamMatchupId)) continue;
-      const a = rows.get(registrationToTeam.get(pm.registrationAId));
-      const b = rows.get(registrationToTeam.get(pm.registrationBId));
-      if (!a || !b) continue;
-      const ptsA = pm.score?.scoreA ?? 0, ptsB = pm.score?.scoreB ?? 0;
-      a.pointsFor += ptsA; a.pointsAgainst += ptsB;
-      b.pointsFor += ptsB; b.pointsAgainst += ptsA;
-    }
-    for (const r of rows.values()) r.pointDiff = r.pointsFor - r.pointsAgainst;
+  const registrationToTeam = new Map();
+  for (const team of teams) for (const pair of team.pairs) registrationToTeam.set(pair.id, team.teamId);
+  const roundRobinMatchupIds = new Set(roundRobinMatchups.map(m => m.id));
+  const counted = new Set();
+  for (const pm of pairMatches || []){
+    if (pm.status !== "completed" || !roundRobinMatchupIds.has(pm.teamMatchupId)) continue;
+    if (pm.id != null){ if (counted.has(pm.id)) continue; counted.add(pm.id); }
+    const a = rows.get(registrationToTeam.get(pm.registrationAId));
+    const b = rows.get(registrationToTeam.get(pm.registrationBId));
+    if (!a || !b || a === b) continue;
+    const ptsA = pm.score?.scoreA ?? 0, ptsB = pm.score?.scoreB ?? 0;
+    a.matchesPlayed++; b.matchesPlayed++;
+    a.pointsFor += ptsA; a.pointsAgainst += ptsB;
+    b.pointsFor += ptsB; b.pointsAgainst += ptsA;
+    if (pm.winner === "A"){ a.wins++; b.losses++; }
+    else if (pm.winner === "B"){ b.wins++; a.losses++; }
+  }
+  for (const r of rows.values()){
+    r.pointDiff = r.pointsFor - r.pointsAgainst;
+    r.pairMatchWins = r.wins; r.pairMatchLosses = r.losses;
+    r.pairWinMargin = r.wins - r.losses;
   }
 
   const headToHeadWinner = (idA, idB) => {
@@ -92,16 +99,19 @@ export function buildTeamStandingsFromRoundRobin(teams, teamMatchups, pairMatche
     if (!m || !m.winnerTeamId) return 0;
     return m.winnerTeamId === idA ? -1 : 1;
   };
-
-  const sorted = [...rows.values()].sort((x,y) => {
+  const officialCompare = (x, y) => {
     if (y.wins !== x.wins) return y.wins - x.wins;
-    const h2h = headToHeadWinner(x.teamId, y.teamId);
-    if (h2h) return h2h;
-    if (y.pairWinMargin !== x.pairWinMargin) return y.pairWinMargin - x.pairWinMargin;
-    return stableTiebreak(x.teamId, y.teamId);
-  });
+    if (y.pointDiff !== x.pointDiff) return y.pointDiff - x.pointDiff;
+    return headToHeadWinner(x.teamId, y.teamId);
+  };
 
-  return sorted.map((r,i) => ({ ...r, rank:i+1 }));
+  // Display order for fully tied rows is deterministic, but they share a rank.
+  const sorted = [...rows.values()].sort((x,y) => officialCompare(x, y) || stableTiebreak(x.teamId, y.teamId));
+  let rank = 0;
+  return sorted.map((r,i) => {
+    if (i === 0 || officialCompare(sorted[i-1], r) !== 0) rank = i + 1;
+    return { ...r, rank };
+  });
 }
 
 export function isTeamRoundRobinComplete(teamMatchups){
@@ -148,5 +158,15 @@ export function rankIndividualPairsForSemifinals(teams, teamMatchups, pairMatche
     return stablePairTiebreak(x.registrationId, y.registrationId);
   });
 
-  return sorted.map((r,i) => ({ ...r, rank: i+1 }));
+  // Rows equal on every official criterion were only separated by the stable
+  // fallback above — flag them so the tie is visible instead of silent.
+  return sorted.map((r,i) => ({
+    ...r,
+    rank: i+1,
+    tieUnresolved: [sorted[i-1], sorted[i+1]].some(o => o && pairsOfficiallyTied(o, r)),
+  }));
+}
+
+export function pairsOfficiallyTied(x, y){
+  return x.wins === y.wins && x.losses === y.losses && x.pointDiff === y.pointDiff && x.pointsFor === y.pointsFor;
 }

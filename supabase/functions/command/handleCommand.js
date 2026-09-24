@@ -712,7 +712,14 @@ function rankIndividualPairsForSemifinals(teams, teamMatchups, pairMatches) {
     if (y.pointsFor !== x.pointsFor) return y.pointsFor - x.pointsFor;
     return stablePairTiebreak(x.registrationId, y.registrationId);
   });
-  return sorted.map((r, i) => ({ ...r, rank: i + 1 }));
+  return sorted.map((r, i) => ({
+    ...r,
+    rank: i + 1,
+    tieUnresolved: [sorted[i - 1], sorted[i + 1]].some((o) => o && pairsOfficiallyTied(o, r))
+  }));
+}
+function pairsOfficiallyTied(x, y) {
+  return x.wins === y.wins && x.losses === y.losses && x.pointDiff === y.pointDiff && x.pointsFor === y.pointsFor;
 }
 
 // packages/engine/src/teamPlayoffs.js
@@ -814,6 +821,30 @@ function selectQualifiers(rankedPairs, mode, count) {
     return rankedPairs.filter((p) => keepIds.has(p.registrationId));
   }
   return [];
+}
+function expectedQualifierCount(mode, count, teamCount) {
+  const n = Math.max(0, Number(count) || 0);
+  if (mode === "top_x") return n;
+  if (mode === "top_x_per_team") return n * Math.max(0, Number(teamCount) || 0);
+  return null;
+}
+function findCutoffTies(rankedPairs, qualifiers, mode) {
+  const qualifiedIds = new Set((qualifiers || []).map((p) => p.registrationId));
+  const groups = /* @__PURE__ */ new Map();
+  for (const p of rankedPairs || []) {
+    const key = mode === "top_x_per_team" ? p.teamId : "__all__";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(p);
+  }
+  const ties = [];
+  for (const [key, list] of groups) {
+    const lastIn = [...list].reverse().find((p) => qualifiedIds.has(p.registrationId));
+    const firstOut = list.find((p) => !qualifiedIds.has(p.registrationId));
+    if (lastIn && firstOut && pairsOfficiallyTied(lastIn, firstOut)) {
+      ties.push({ teamId: key === "__all__" ? null : key, qualified: lastIn.registrationId, excluded: firstOut.registrationId });
+    }
+  }
+  return ties;
 }
 function knockoutStageLabel(fromFinal) {
   if (fromFinal === 1) return "Semifinal";
@@ -2637,16 +2668,30 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
   const ranked = rankIndividualPairsForSemifinals(grouped.teams, rrMatchups, pairRows);
   const mode = division.config?.qualifierMode || "top_x";
   const count = Number(division.config?.qualifierCount || 4);
-  const qualifiers = selectQualifiers(ranked, mode, count);
   const progressionMode = division.config?.progressionMode || "playoffs";
+  const expected = expectedQualifierCount(mode, count, grouped.teams.length);
+  if (progressionMode === "direct_semifinals" && expected != null && expected !== 4) {
+    const math = mode === "top_x_per_team" ? `Top ${count} per team \xD7 ${grouped.teams.length} teams = ${expected}` : `Top ${count} overall = ${expected}`;
+    const fix = mode === "top_x_per_team" && 4 % grouped.teams.length === 0 ? ` Set qualifiers per team to ${4 / grouped.teams.length}.` : " Adjust the qualifier count or qualification mode.";
+    throw httpError(
+      400,
+      "DIRECT_SEMIS_INVALID_COUNT",
+      `Direct Semifinals requires exactly 4 qualifying pairs; ${math}.${fix}`
+    );
+  }
+  const qualifiers = selectQualifiers(ranked, mode, count);
+  if (new Set(qualifiers.map((q) => q.registrationId)).size !== qualifiers.length) {
+    throw httpError(500, "QUALIFIER_DUPLICATE", "Qualifier list contains a duplicate pair");
+  }
   if (progressionMode === "direct_semifinals" && qualifiers.length !== 4) {
     throw httpError(
       400,
       "DIRECT_SEMIS_INVALID_COUNT",
-      `Direct Semifinals requires exactly 4 qualifying pairs (got ${qualifiers.length}). Adjust the qualifier count or qualification mode.`
+      `Direct Semifinals requires exactly 4 qualifying pairs (got ${qualifiers.length}). A team may have fewer pairs than the qualifier count.`
     );
   }
   if (qualifiers.length < 2) throw httpError(400, "TE_INVALID", "Not enough qualifiers for playoffs");
+  const unresolvedTies = findCutoffTies(ranked, qualifiers, mode);
   const startRound = Math.max(0, ...parents.map((m) => m.round || 0)) + 1;
   const { teamMatchups, pairMatches } = generateQualifierBracketShell(qualifiers, {
     makeId: uuid,
@@ -2672,7 +2717,8 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
       stage,
       team_matchups: teamMatchups.length,
       pair_matches: pairMatches.length,
-      qualifiers: qualifiers.map((q) => q.registrationId)
+      qualifiers: qualifiers.map((q) => q.registrationId),
+      unresolved_ties: unresolvedTies
     }
   });
 }

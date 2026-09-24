@@ -1,6 +1,7 @@
 // Team Elimination qualification + same-team-aware knockout bracket — pure, no DB.
 
 import { seedOrder } from "./bracket.js";
+import { pairsOfficiallyTied } from "./teamRoundRobin.js";
 
 const defaultId = () => `${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
 
@@ -95,6 +96,37 @@ export function selectQualifiers(rankedPairs, mode, count){
     return rankedPairs.filter(p => keepIds.has(p.registrationId));
   }
   return [];
+}
+
+// How many qualifiers a mode/count produces for `teamCount` teams:
+// top_x -> count overall; top_x_per_team -> count from EACH team.
+export function expectedQualifierCount(mode, count, teamCount){
+  const n = Math.max(0, Number(count) || 0);
+  if (mode === "top_x") return n;
+  if (mode === "top_x_per_team") return n * Math.max(0, Number(teamCount) || 0);
+  return null;
+}
+
+// Qualification cutoffs decided only by the stable fallback: the last pair in
+// and the first pair out (per team for top_x_per_team, overall for top_x) are
+// equal on every official criterion (see pairsOfficiallyTied).
+export function findCutoffTies(rankedPairs, qualifiers, mode){
+  const qualifiedIds = new Set((qualifiers || []).map(p => p.registrationId));
+  const groups = new Map();
+  for (const p of rankedPairs || []){
+    const key = mode === "top_x_per_team" ? p.teamId : "__all__";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(p);
+  }
+  const ties = [];
+  for (const [key, list] of groups){
+    const lastIn = [...list].reverse().find(p => qualifiedIds.has(p.registrationId));
+    const firstOut = list.find(p => !qualifiedIds.has(p.registrationId));
+    if (lastIn && firstOut && pairsOfficiallyTied(lastIn, firstOut)){
+      ties.push({ teamId: key === "__all__" ? null : key, qualified: lastIn.registrationId, excluded: firstOut.registrationId });
+    }
+  }
+  return ties;
 }
 
 function knockoutStageLabel(fromFinal){

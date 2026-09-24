@@ -1,5 +1,5 @@
 import { describe, test, expect } from "vitest";
-import { podSizeForPolicy, placeQualifiersWithPolicy, selectQualifiers, generateQualifierBracketShell, hasKnockoutStageStarted } from "./teamPlayoffs.js";
+import { podSizeForPolicy, placeQualifiersWithPolicy, selectQualifiers, generateQualifierBracketShell, hasKnockoutStageStarted, expectedQualifierCount, findCutoffTies } from "./teamPlayoffs.js";
 import { advanceIndividualMatchup, advanceBronzeIndividualMatchup } from "./teamVsTeam.js";
 
 const idGen = () => { let i = 0; return () => "id" + (i++); };
@@ -255,5 +255,73 @@ describe("hasKnockoutStageStarted", () => {
     const teamMatchups = [{ id:"sf1", stage:"semifinal", status:"scheduled" }];
     expect(hasKnockoutStageStarted(teamMatchups, [{ teamMatchupId:"sf1", status:"in_progress" }])).toBe(true);
     expect(hasKnockoutStageStarted(teamMatchups, [{ teamMatchupId:"sf1", status:"completed" }])).toBe(true);
+  });
+});
+
+// Screenshot regression: 2 teams (NEXTG, ONSE) x 5 pairs, round robin complete.
+// Rows are in rankIndividualPairsForSemifinals order (W -> L -> +/- -> PF).
+describe("qualification: top X per team (screenshot scenario)", () => {
+  const row = (registrationId, teamId, wins, losses, pointDiff, pointsFor) => ({ registrationId, teamId, wins, losses, pointDiff, pointsFor });
+  const ranked = (jeffreyPF, gracePF) => [
+    row("KENNETH/JENNY", "NEXTG", 4, 0, 15, 44),
+    row("CARL/LOY G", "ONSE", 3, 1, 8, 41),
+    ...(jeffreyPF >= gracePF
+      ? [row("JEFFREY/REM", "NEXTG", 3, 1, 2, jeffreyPF), row("GRACE/REIN", "NEXTG", 3, 1, 2, gracePF)]
+      : [row("GRACE/REIN", "NEXTG", 3, 1, 2, gracePF), row("JEFFREY/REM", "NEXTG", 3, 1, 2, jeffreyPF)]),
+    row("AKI/MAE MAE", "ONSE", 3, 1, 0, 38),
+    row("ADO/MAMEN", "NEXTG", 2, 2, 0, 36),
+    row("KEISHA/RONA", "NEXTG", 1, 3, -6, 30),
+    row("DEVAN/KEMP", "ONSE", 1, 3, -7, 29),
+    row("JOSHUA C./SANDRA", "ONSE", 0, 4, -7, 33),
+    row("ALIE/JEROME", "ONSE", 0, 4, -7, 32),
+  ];
+  const byTeam = (qs) => qs.reduce((m, p) => ({ ...m, [p.teamId]: (m[p.teamId] || 0) + 1 }), {});
+
+  test("2 per team x 2 teams -> exactly 4: NEXTG 2, ONSE 2, top two of each team, no duplicates", () => {
+    const qs = selectQualifiers(ranked(40, 39), "top_x_per_team", 2);
+    expect(qs.map(p => p.registrationId)).toEqual(["KENNETH/JENNY", "CARL/LOY G", "JEFFREY/REM", "AKI/MAE MAE"]);
+    expect(byTeam(qs)).toEqual({ NEXTG: 2, ONSE: 2 });
+    expect(new Set(qs.map(p => p.registrationId)).size).toBe(4);
+    expect(qs.find(p => p.registrationId === "AKI/MAE MAE").teamId).toBe("ONSE");
+    expect(qs.length).toBe(expectedQualifierCount("top_x_per_team", 2, 2));
+  });
+
+  test("global top 4 is NOT what per-team uses (it would take GRACE/REIN and drop AKI/MAE MAE)", () => {
+    const globalTop4 = selectQualifiers(ranked(40, 39), "top_x", 4).map(p => p.registrationId);
+    expect(globalTop4).toContain("GRACE/REIN");
+    expect(globalTop4).not.toContain("AKI/MAE MAE");
+    expect(selectQualifiers(ranked(40, 39), "top_x_per_team", 2).map(p => p.registrationId)).not.toContain("GRACE/REIN");
+  });
+
+  test("the old stored count (4 per team) is what produced 8", () => {
+    const qs = selectQualifiers(ranked(40, 39), "top_x_per_team", 4);
+    expect(qs).toHaveLength(8);
+    expect(expectedQualifierCount("top_x_per_team", 4, 2)).toBe(8);
+  });
+
+  test("JEFFREY/REM vs GRACE/REIN (3W +2): Points For decides when it differs, and no cutoff tie is reported", () => {
+    const qs = selectQualifiers(ranked(38, 40), "top_x_per_team", 2);
+    expect(qs.map(p => p.registrationId)).toContain("GRACE/REIN");
+    expect(findCutoffTies(ranked(38, 40), qs, "top_x_per_team")).toEqual([]);
+  });
+
+  test("equal on W, L, +/- and PF -> cutoff tie is reported for that team only", () => {
+    const r = ranked(40, 40);
+    const qs = selectQualifiers(r, "top_x_per_team", 2);
+    expect(findCutoffTies(r, qs, "top_x_per_team")).toEqual([
+      { teamId: "NEXTG", qualified: "JEFFREY/REM", excluded: "GRACE/REIN" },
+    ]);
+  });
+});
+
+describe("expectedQualifierCount — derived from mode, never a fixed 4", () => {
+  test("per team: teams x per-team", () => {
+    expect(expectedQualifierCount("top_x_per_team", 2, 2)).toBe(4);
+    expect(expectedQualifierCount("top_x_per_team", 2, 3)).toBe(6);
+    expect(expectedQualifierCount("top_x_per_team", 3, 2)).toBe(6);
+  });
+  test("overall: the count itself; manual: null", () => {
+    expect(expectedQualifierCount("top_x", 4, 5)).toBe(4);
+    expect(expectedQualifierCount("manual", 4, 2)).toBeNull();
   });
 });

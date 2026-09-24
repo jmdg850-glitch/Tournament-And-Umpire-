@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { Alert, Badge, Button, Card, EmptyState, SectionHeader, StandingsTable, StatusBadge, useToast } from "@tournament/ui";
 import { ExternalLink } from "lucide-react";
-import { courtFor, isTeamMatchup, membersOfParticipant, personLabel, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor } from "./lib.js";
+import { courtFor, isTeamMatchup, membersOfParticipant, personLabel, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor, unresolvedTieGroups } from "./lib.js";
 import BracketImportModal from "./BracketImportModal.jsx";
 import { openBracketWindow } from "./useRealtimeChannel.js";
 
@@ -70,7 +70,14 @@ function TeamEliminationBoard({ division, data }) {
   const kidsOf = (list) => data.matches.filter((m) => list.some((p) => p.id === m.parent_match_id));
   const standings = teamEliminationStandings(division, data);
   const playoffsExist = semis.length + bronze.length + finals.length > 0;
-  const qualified = playoffsExist ? standings.slice(0, 4) : [];
+  // The pairs the server actually placed into the knockout stage — not a
+  // slice of the overall ranking (per-team qualification picks per team).
+  const knockoutIds = new Set(parents.filter((m) => !qualParents.includes(m)).map((m) => m.id));
+  const placedIds = new Set((data.matchParticipants || [])
+    .filter((mp) => knockoutIds.has(mp.match_id) && mp.participant_id)
+    .map((mp) => mp.participant_id));
+  const qualified = playoffsExist ? standings.filter((row) => placedIds.has(row.registrationId)) : [];
+  const tieGroups = unresolvedTieGroups(standings, data);
 
   return (
     <div className="stack">
@@ -107,6 +114,11 @@ function TeamEliminationBoard({ division, data }) {
           }))}
         />
       )}
+      {tieGroups.map((names) => (
+        <p key={names.join("|")} className="muted" style={{ margin: 0 }}>
+          Unresolved tie: {names.join(" and ")} are level on W, L, +/- and PF — their order is set by a fixed fallback, not a tie-break rule.
+        </p>
+      ))}
 
       {qualified.length > 0 && (
         <div>

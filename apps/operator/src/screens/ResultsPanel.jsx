@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Button, Card, EmptyState, SectionHeader, Select, StandingsTable, StatusBadge, Table } from "@tournament/ui";
-import { placementsForDivision, resultFor, scoreLine, sideOf, teamEliminationStandings, teamStandings } from "../lib.js";
+import { placementsForDivision, resultFor, scoreLine, sideOf, teamEliminationStandings, teamStandings, unresolvedTieGroups } from "../lib.js";
 
 function PodiumCard({ division, placements }) {
   if (!placements.champion) {
@@ -118,6 +118,11 @@ export function ResultsPanel({ data }) {
                 pointDiff: row.pointDiff,
               }))}
             />
+            {unresolvedTieGroups(standings, data).map((names) => (
+              <p key={names.join("|")} className="muted" style={{ margin: 0 }}>
+                Unresolved tie: {names.join(" and ")} are level on W, L, +/- and PF — their order is set by a fixed fallback, not a tie-break rule.
+              </p>
+            ))}
           </div>
         );
       })}

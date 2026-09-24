@@ -20,8 +20,18 @@ function ScoringRules() {
   );
 }
 
+// Direct Semifinals always seeds exactly 4 pairs. With "Top X per team" the
+// count is per team (teams × per-team must equal 4, checked by the server);
+// with "Top X overall" it is fixed at 4.
+function qualifierCountForSave(cfg) {
+  const lockedToFour = cfg.progressionMode === "direct_semifinals" && cfg.qualifierMode !== "top_x_per_team";
+  return lockedToFour ? 4 : Number(cfg.qualifierCount) || 4;
+}
+
 function QualificationFields({ cfg, onChange }) {
   const direct = cfg.progressionMode === "direct_semifinals";
+  const perTeam = cfg.qualifierMode === "top_x_per_team";
+  const locked = direct && !perTeam;
   return (
     <>
       <section className="division-section" aria-label="Qualification">
@@ -44,12 +54,16 @@ function QualificationFields({ cfg, onChange }) {
             <option value="manual">Manual qualification</option>
           </Select>
           <Input
-            label="Qualifier count"
-            value={direct ? "4" : cfg.qualifierCount}
+            label={perTeam ? "Qualifiers per team" : "Qualifier count"}
+            value={locked ? "4" : cfg.qualifierCount}
             onChange={(e) => onChange({ qualifierCount: e.target.value })}
             inputMode="numeric"
-            disabled={direct}
-            hint={direct ? "Fixed at 4 for Direct Semifinals." : undefined}
+            disabled={locked}
+            hint={locked
+              ? "Fixed at 4 for Direct Semifinals."
+              : direct
+                ? "Teams × qualifiers per team must equal 4 for Direct Semifinals (2 teams → 2 each)."
+                : undefined}
           />
         </div>
       </section>
@@ -92,7 +106,7 @@ export function DivisionsPanel({ data, busy, run }) {
         const config = { bestOf: 1, winBy: "none", isDoubles: true, bronzeMatch: true };
         if (format === "team_elimination") {
           config.qualifierMode = draft.qualifierMode;
-          config.qualifierCount = draft.progressionMode === "direct_semifinals" ? 4 : Number(draft.qualifierCount) || 4;
+          config.qualifierCount = qualifierCountForSave(draft);
           config.sameTeamPolicy = draft.sameTeamPolicy;
           config.progressionMode = draft.progressionMode;
         }
@@ -165,7 +179,7 @@ export function DivisionsPanel({ data, busy, run }) {
                   division_id: d.id,
                   config: {
                     qualifierMode: cfg.qualifierMode,
-                    qualifierCount: cfg.progressionMode === "direct_semifinals" ? 4 : Number(cfg.qualifierCount) || 4,
+                    qualifierCount: qualifierCountForSave(cfg),
                     sameTeamPolicy: cfg.sameTeamPolicy,
                     progressionMode: cfg.progressionMode,
                   },
