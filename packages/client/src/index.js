@@ -1,7 +1,48 @@
 import { createClient } from "@supabase/supabase-js";
 
-export { isNetworkError, createMemoryStore, createIndexedDBStore, defaultStore, sendCommandDurable, drainQueue, queueSize } from "./offlineQueue.js";
+export { isNetworkError, classifySendError, createMemoryStore, createIndexedDBStore, defaultStore, sendCommandDurable, drainQueue, queueSize, enqueueCommand, ownerKey } from "./offlineQueue.js";
 export { readMatchSnapshot, writeMatchSnapshot, clearMatchSnapshot } from "./matchSnapshot.js";
+export { createMatchLane, reconstructMatchView, laneOf, sortLaneEntries } from "./matchLane.js";
+export { createSyncEngine, createStorageLease, DEFAULT_BACKOFF_MS } from "./syncEngine.js";
+
+// fetch with an optional hard deadline. A timeout rejects with an error that
+// has NO `.status` (so isNetworkError() treats it as "never answered"), plus
+// `timeout: true`: the server may still have applied the request, so callers
+// must retry with the SAME command_id rather than treat it as a failure.
+async function fetchWithTimeout(url, init, timeoutMs) {
+  if (!timeoutMs || typeof AbortController === "undefined") return { res: await fetch(url, init), clear() {} };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    return { res, clear: () => clearTimeout(timer), signal: controller.signal };
+  } catch (e) {
+    clearTimeout(timer);
+    if (controller.signal.aborted) {
+      const err = new Error(`No response from the server within ${Math.round(timeoutMs / 1000)}s`);
+      err.code = "TIMEOUT";
+      err.timeout = true;
+      throw err;
+    }
+    throw e;
+  }
+}
+
+async function readJson(res, clear, timeoutMs) {
+  try {
+    return await res.json();
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      const err = new Error(`No response from the server within ${Math.round(timeoutMs / 1000)}s`);
+      err.code = "TIMEOUT";
+      err.timeout = true;
+      throw err;
+    }
+    return { ok: false, error: { code: "BAD_RESPONSE", message: res.statusText } };
+  } finally {
+    clear();
+  }
+}
 
 export function createBrowserClient(url, publishableKey) {
   const httpOrigin = typeof window !== "undefined" && /^https?:$/.test(window.location.protocol);
@@ -26,10 +67,10 @@ export function createSpectatorClient(url, publishableKey) {
   });
 }
 
-export async function sendCommand({ commandUrl, accessToken, publishableKey, type, payload, commandId }) {
+export async function sendCommand({ commandUrl, accessToken, publishableKey, type, payload, commandId, timeoutMs }) {
   const command_id = commandId || crypto.randomUUID();
   const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
-  const res = await fetch(commandUrl, {
+  const { res, clear } = await fetchWithTimeout(commandUrl, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -37,13 +78,8 @@ export async function sendCommand({ commandUrl, accessToken, publishableKey, typ
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ command_id, type, payload }),
-  });
-  let body = null;
-  try {
-    body = await res.json();
-  } catch {
-    body = { ok: false, error: { code: "BAD_RESPONSE", message: res.statusText } };
-  }
+  }, timeoutMs);
+  const body = await readJson(res, clear, timeoutMs);
   const elapsedMs = Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - t0);
   if (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.DEV) {
     console.debug("[tournament-command]", type, `${elapsedMs}ms`, body?.error?.code || "ok");
@@ -60,6 +96,34 @@ export async function sendCommand({ commandUrl, accessToken, publishableKey, typ
   return body;
 }
 
+// Auth source for the sync engine for a signed-in Supabase user. Uses the
+// existing Supabase session only (no new credential mechanism): returns
+//   { token }                   — a current access token for `userId`
+//   { offline: true }           — refresh couldn't reach the server; retry later
+//   { needsAuth: true, message} — the session is gone/expired/another user;
+//                                 queued work must wait for this user to sign in
+// A 401 from the command API is handled by calling this with { force: true }.
+export function createUserAuthProvider(supabase, userId, { minValidityMs = 60_000, expiredMessage, otherUserMessage } = {}) {
+  return async function getAuth({ force = false } = {}) {
+    if (!userId) return { needsAuth: true, message: expiredMessage || "Sign in to sync." };
+    if (!force) {
+      const { data } = await supabase.auth.getSession();
+      const s = data?.session;
+      if (s?.access_token && s.user?.id === userId && (!s.expires_at || s.expires_at * 1000 - Date.now() > minValidityMs)) {
+        return { token: s.access_token };
+      }
+    }
+    const { data, error } = await supabase.auth.refreshSession();
+    const s = data?.session;
+    if (s?.access_token) {
+      if (s.user?.id !== userId) return { needsAuth: true, message: otherUserMessage || "A different account is signed in." };
+      return { token: s.access_token };
+    }
+    if (error && (error.name === "AuthRetryableFetchError" || !error.status)) return { offline: true };
+    return { needsAuth: true, message: expiredMessage || "Your sign-in has expired. Sign in again to sync." };
+  };
+}
+
 export function envConfig() {
   const url = import.meta.env.VITE_SUPABASE_URL;
   const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -71,8 +135,8 @@ export function envConfig() {
   return { url, publishableKey, commandUrl, pairStationUrl };
 }
 
-export async function pairStation({ pairStationUrl, publishableKey, pairingToken, stationPublicId, deviceLabel, refreshToken, action }) {
-  const res = await fetch(pairStationUrl, {
+export async function pairStation({ pairStationUrl, publishableKey, pairingToken, stationPublicId, deviceLabel, refreshToken, action, timeoutMs }) {
+  const { res, clear } = await fetchWithTimeout(pairStationUrl, {
     method: "POST",
     headers: {
       apikey: publishableKey,
@@ -85,13 +149,8 @@ export async function pairStation({ pairStationUrl, publishableKey, pairingToken
       device_label: deviceLabel,
       refresh_token: refreshToken,
     }),
-  });
-  let body = null;
-  try {
-    body = await res.json();
-  } catch {
-    body = { ok: false, error: { code: "BAD_RESPONSE", message: res.statusText } };
-  }
+  }, timeoutMs);
+  const body = await readJson(res, clear, timeoutMs);
   if (!res.ok || body?.ok === false) {
     const err = new Error(body?.error?.message || `Pairing failed (${res.status})`);
     err.status = res.status;

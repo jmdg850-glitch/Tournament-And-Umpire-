@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createBrowserClient, envConfig, sendCommand, sendCommandDurable, defaultStore, drainQueue, queueSize, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
+import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, createSyncEngine, createUserAuthProvider, ownerKey, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
 import { parseBracketHash, parseLiveHash, parseMatchDisplayHash } from "@tournament/engine";
 import {
   Alert,
@@ -83,42 +83,51 @@ export default function App() {
   const license = useLicense({ commandUrl: cfg.commandUrl, publishableKey: cfg.publishableKey, session });
   const reportLicenseDenial = license.reportDenial;
 
-  const outboxRef = useRef(null);
-  if (!outboxRef.current) outboxRef.current = defaultStore("tournament-operator-outbox");
-  const [pendingSync, setPendingSync] = useState(0);
-
-  const refreshPendingSync = useCallback(async () => {
-    setPendingSync(await queueSize(outboxRef.current));
-  }, []);
-
-  const drain = useCallback(async () => {
-    if (!session?.access_token) return;
-    // A command the server actively rejects on replay (not a network retry)
-    // is left in the outbox rather than dropped — the "N unsynced" badge
-    // stays visible as the honest signal that something needs attention.
-    await drainQueue({
-      store: outboxRef.current,
-      getAccessToken: async () => session?.access_token,
-      publishableKey: cfg.publishableKey,
-      onEach: (entry, result, err) => {
-        if (err) console.error(`[offline-queue] queued ${entry.type} could not be synced:`, err.message);
-        if (isLicenseDenial(err)) reportLicenseDenial();
-      },
-    });
-    await refreshPendingSync();
-  }, [session, cfg, refreshPendingSync, reportLicenseDenial]);
+  // Operator writes are ONLINE-ONLY: setup/administration commands chain on
+  // server-generated ids and have no local model, so they are never queued.
+  // The outbox below exists only to finish entries an earlier app version
+  // queued. It is synced by ONE worker (cross-window lock), only from the main
+  // window (never from Live/Bracket/Match-display popouts), and only for the
+  // account that created the entries — entries with no recorded owner wait
+  // for explicit confirmation (see OperatorSyncBanner).
+  const isPopout = Boolean(liveRoute || bracketRoute || matchDisplayRoute);
+  const outbox = useMemo(() => defaultStore("tournament-operator-outbox"), []);
+  const operatorOwner = !isPopout && session?.user?.id ? ownerKey("user", session.user.id) : null;
+  const [syncEngine, setSyncEngine] = useState(null);
+  const [syncStatus, setSyncStatus] = useState(null);
+  const reportDenialRef = useRef(reportLicenseDenial);
+  reportDenialRef.current = reportLicenseDenial;
 
   useEffect(() => {
-    refreshPendingSync();
-    drain();
-    function onOnline() { drain(); }
+    if (!operatorOwner) {
+      setSyncEngine(null);
+      setSyncStatus(null);
+      return undefined;
+    }
+    const getAuth = createUserAuthProvider(supabase, operatorOwner.slice("user:".length));
+    const engine = createSyncEngine({
+      store: outbox,
+      lockName: "tournament-operator-outbox-sync",
+      owner: operatorOwner,
+      getAuth: async (opts) => getAuth(opts),
+      timeoutMs: 30000,
+    });
+    setSyncEngine(engine);
+    const unsubscribe = engine.subscribe((s) => {
+      setSyncStatus({ ...s });
+      if (s.lastError?.status === 403 && /LICENSE_(INVALID|REQUIRED)/.test(s.lastError.code || "")) reportDenialRef.current?.();
+    });
+    engine.kick();
+    const onOnline = () => engine.kick({ resetBackoff: true });
     window.addEventListener("online", onOnline);
-    const interval = setInterval(drain, 20000);
     return () => {
+      unsubscribe();
+      engine.stop();
       window.removeEventListener("online", onOnline);
-      clearInterval(interval);
     };
-  }, [drain, refreshPendingSync]);
+  }, [operatorOwner, outbox, supabase]);
+
+  const pendingSync = syncStatus?.pending || 0;
 
   // A license refusal from the server is authoritative: block the app now
   // instead of waiting for the next periodic license check.
@@ -131,34 +140,26 @@ export default function App() {
     }
   }
 
-  async function sendOperatorCommand(type, payload, opts) {
+  // `opts.durable` (still passed by some call sites) is intentionally ignored:
+  // nothing the operator does is presented as "saved offline".
+  async function sendOperatorCommand(type, payload) {
     if (!session?.access_token) throw new Error("Not signed in");
-    // Durable queueing is opt-in per call site: a handful of TournamentDesk
-    // flows chain a command's result straight into a second command (e.g.
-    // Edit Players creating a new person, then assigning them) and cannot
-    // safely proceed on a queued-but-not-yet-applied result — those keep the
-    // original throw-on-failure behavior unchanged. Single, self-contained
-    // mutations (score corrections, hold/override/resume, remove player) opt
-    // in with { durable: true } so they survive a real connectivity gap.
-    if (!opts?.durable) {
-      return sendCommand({
+    try {
+      return await sendCommand({
         commandUrl: cfg.commandUrl,
         accessToken: session.access_token,
         publishableKey: cfg.publishableKey,
         type,
         payload,
       });
+    } catch (err) {
+      if (isNetworkError(err)) {
+        const offline = new Error("You're offline — this change was NOT saved. Organizer changes need an internet connection; reconnect and try again.", { cause: err });
+        offline.code = "OFFLINE";
+        throw offline;
+      }
+      throw err;
     }
-    const body = await sendCommandDurable({
-      store: outboxRef.current,
-      commandUrl: cfg.commandUrl,
-      accessToken: session.access_token,
-      publishableKey: cfg.publishableKey,
-      type,
-      payload,
-    });
-    if (body.queued) await refreshPendingSync();
-    return body;
   }
 
   useEffect(() => { if (session?.user) rememberHasAccount(); }, [session]);
@@ -225,6 +226,7 @@ export default function App() {
   return (
     <ToastProvider>
       <UpdateBanner />
+      <OperatorSyncBanner status={syncStatus} engine={syncEngine} email={session.user?.email} />
       <LicenseGate
         license={license}
         email={session.user?.email}
@@ -239,6 +241,88 @@ export default function App() {
         />
       </LicenseGate>
     </ToastProvider>
+  );
+}
+
+// Visible handling for anything left in the operator outbox by an earlier app
+// version (operator commands are no longer queued). Nothing here deletes
+// work: "Don't send" archives entries on this computer.
+function OperatorSyncBanner({ status, engine, email }) {
+  const [confirm, setConfirm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  if (!status || !engine) return null;
+  const { unclaimed = 0, conflicts = 0, pending = 0, otherOwner = 0, needsAuth, lastError, byLane = {} } = status;
+  if (!unclaimed && !conflicts && !(needsAuth && pending) && !otherOwner) return null;
+  const conflictLanes = Object.entries(byLane).filter(([, v]) => v.conflicts > 0).map(([k]) => k);
+  const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+  async function run(fn) {
+    setBusy(true);
+    try {
+      await fn();
+    } finally {
+      setBusy(false);
+      setConfirm(null);
+    }
+  }
+
+  return (
+    <div className="stack" style={{ padding: "var(--space-3) var(--space-4)" }}>
+      {unclaimed > 0 && (
+        <Alert tone="warn">
+          {plural(unclaimed, "change was", "changes were")} saved offline on this computer by an earlier version of the app and never sent. They are only sent after you confirm they are yours.
+          <div className="row" style={{ marginTop: 8 }}>
+            <Button variant="secondary" onClick={() => setConfirm("claim")}>Send as {email}</Button>
+            <Button variant="ghost" onClick={() => setConfirm("archiveUnowned")}>Don't send</Button>
+          </div>
+        </Alert>
+      )}
+      {conflicts > 0 && (
+        <Alert>
+          {plural(conflicts, "saved change was", "saved changes were")} rejected by the server and not applied{lastError?.message ? `: ${lastError.message}` : "."}
+          <div className="row" style={{ marginTop: 8 }}>
+            <Button variant="secondary" disabled={busy} onClick={() => run(async () => { for (const lane of conflictLanes) await engine.retryLane(lane); })}>Retry</Button>
+            <Button variant="ghost" onClick={() => setConfirm("archiveConflicts")}>Don't send</Button>
+          </div>
+        </Alert>
+      )}
+      {needsAuth && pending > 0 && <Alert tone="warn">{needsAuth}</Alert>}
+      {otherOwner > 0 && (
+        <p className="muted" style={{ margin: 0 }}>{plural(otherOwner, "saved change belongs", "saved changes belong")} to another account on this computer and will not be sent from this account.</p>
+      )}
+      {confirm === "claim" && (
+        <ConfirmDialog
+          title="Send earlier saved changes?"
+          body={`${plural(unclaimed, "change", "changes")} will be sent now as ${email}. Only confirm if you made them on this computer.`}
+          confirmLabel="Send as me"
+          busy={busy}
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => run(() => engine.claimUnowned())}
+        />
+      )}
+      {confirm === "archiveUnowned" && (
+        <ConfirmDialog
+          title="Don't send these changes?"
+          body="They will not be sent. They stay archived on this computer (not deleted) for 30 days."
+          confirmLabel="Don't send"
+          danger
+          busy={busy}
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => run(() => engine.archiveUnowned())}
+        />
+      )}
+      {confirm === "archiveConflicts" && (
+        <ConfirmDialog
+          title="Don't send the rejected changes?"
+          body="The rejected changes (and anything saved after them for the same item) will not be sent. They stay archived on this computer (not deleted) for 30 days."
+          confirmLabel="Don't send"
+          danger
+          busy={busy}
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => run(async () => { for (const lane of conflictLanes) await engine.archiveLane(lane); })}
+        />
+      )}
+    </div>
   );
 }
 

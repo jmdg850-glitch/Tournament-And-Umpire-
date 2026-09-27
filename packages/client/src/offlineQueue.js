@@ -12,11 +12,63 @@ export function isNetworkError(err) {
   return Boolean(err) && err.status == null;
 }
 
+// How a failed send must be treated by anything replaying the queue:
+//   "network"  — never answered (offline, DNS, timeout). Outcome unknown: keep
+//                the entry and retry the SAME command_id later.
+//   "auth"     — 401. The credential expired/was rejected; refresh and retry.
+//                Never a conflict.
+//   "retry"    — 5xx / 408 / 429. The server may or may not have applied it;
+//                retrying the same command_id is idempotent server-side.
+//   "rejected" — any other 4xx: the server actively refused this command
+//                against its current state. Keep it, surface it, never drop.
+export function classifySendError(err) {
+  if (!err) return "network";
+  if (err.status == null) return "network";
+  const status = Number(err.status);
+  if (status === 401) return "auth";
+  if (status >= 500 || status === 408 || status === 429) return "retry";
+  return "rejected";
+}
+
+// Queue entries carry the identity that created them ("user:<uuid>" or
+// "station:<device id>") so a queue is never replayed under a different
+// signed-in user or a different court pairing on the same device.
+export function ownerKey(kind, id) {
+  return kind && id ? `${kind}:${id}` : null;
+}
+
+function seqOf(match) {
+  const n = Number(match?.score_state?.lastSeq);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// Confirmed (server-acknowledged) match context is only ever moved FORWARD:
+// a stale fetch or an old idempotent receipt with a lower lastSeq can refresh
+// the display context (names, court) but never roll the confirmed score back.
+export function mergeConfirmedRecord(existing, incoming) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const keepExistingMatch = incoming.match && existing.match && seqOf(incoming.match) < seqOf(existing.match);
+  return {
+    ...existing,
+    ...incoming,
+    match: keepExistingMatch ? existing.match : (incoming.match || existing.match),
+    sides: incoming.sides ?? existing.sides,
+    participants: incoming.participants ?? existing.participants,
+    court: incoming.court !== undefined ? incoming.court : existing.court,
+  };
+}
+
 export function createMemoryStore() {
   const rows = new Map();
+  const matches = new Map();
   return {
+    durable: false,
     async put(entry) {
       rows.set(entry.command_id, entry);
+    },
+    async get(command_id) {
+      return rows.get(command_id) || null;
     },
     async delete(command_id) {
       rows.delete(command_id);
@@ -24,11 +76,31 @@ export function createMemoryStore() {
     async list() {
       return [...rows.values()].sort((a, b) => a.queuedAt - b.queuedAt);
     },
+    async putMatch(record) {
+      matches.set(record.matchId, mergeConfirmedRecord(matches.get(record.matchId), record));
+    },
+    async getMatch(matchId) {
+      return matches.get(matchId) || null;
+    },
+    async listMatches() {
+      return [...matches.values()];
+    },
+    async deleteMatch(matchId) {
+      matches.delete(matchId);
+    },
+    async ack(command_id, record) {
+      rows.delete(command_id);
+      if (record) matches.set(record.matchId, mergeConfirmedRecord(matches.get(record.matchId), record));
+    },
   };
 }
 
-const DB_VERSION = 1;
+// v2 adds the "matches" store (confirmed match context for offline resume).
+// The upgrade is additive: the v1 "commands" store and every entry in it are
+// kept as-is.
+const DB_VERSION = 2;
 const STORE_NAME = "commands";
+const MATCH_STORE = "matches";
 
 export function createIndexedDBStore(dbName) {
   if (typeof indexedDB === "undefined") return null;
@@ -41,56 +113,154 @@ export function createIndexedDBStore(dbName) {
         if (!db.objectStoreNames.contains(STORE_NAME)) {
           db.createObjectStore(STORE_NAME, { keyPath: "command_id" });
         }
+        if (!db.objectStoreNames.contains(MATCH_STORE)) {
+          db.createObjectStore(MATCH_STORE, { keyPath: "matchId" });
+        }
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const db = req.result;
+        // Another window upgrading the schema must never be blocked by us.
+        db.onversionchange = () => db.close();
+        resolve(db);
+      };
       req.onerror = () => reject(req.error);
     });
   }
 
-  async function withStore(mode, fn) {
+  // Writes ask for "strict" durability (flushed to disk before oncomplete)
+  // where the browser supports it; older engines ignore/omit the option.
+  function transaction(db, names, mode) {
+    if (mode === "readwrite") {
+      try {
+        return db.transaction(names, mode, { durability: "strict" });
+      } catch {
+        // option unsupported — fall through
+      }
+    }
+    return db.transaction(names, mode);
+  }
+
+  async function withStores(names, mode, fn) {
     const db = await openDB();
     try {
       return await new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, mode);
-        const store = tx.objectStore(STORE_NAME);
-        const result = fn(store);
-        tx.oncomplete = () => resolve(result?.value);
+        const tx = transaction(db, names, mode);
+        const holder = {};
+        fn(tx, holder);
+        tx.oncomplete = () => resolve(holder.value);
         tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
       });
     } finally {
       db.close();
     }
   }
 
+  function getAllInto(store, holder, sort) {
+    const req = store.getAll();
+    req.onsuccess = () => {
+      const rows = req.result || [];
+      holder.value = sort ? rows.sort(sort) : rows;
+    };
+  }
+
+  function mergePut(store, record) {
+    const req = store.get(record.matchId);
+    req.onsuccess = () => {
+      store.put(mergeConfirmedRecord(req.result || null, record));
+    };
+  }
+
   return {
+    durable: true,
     async put(entry) {
-      await withStore("readwrite", (store) => {
-        store.put(entry);
+      await withStores(STORE_NAME, "readwrite", (tx) => {
+        tx.objectStore(STORE_NAME).put(entry);
+      });
+    },
+    async get(command_id) {
+      return withStores(STORE_NAME, "readonly", (tx, holder) => {
+        const req = tx.objectStore(STORE_NAME).get(command_id);
+        req.onsuccess = () => { holder.value = req.result || null; };
       });
     },
     async delete(command_id) {
-      await withStore("readwrite", (store) => {
-        store.delete(command_id);
+      await withStores(STORE_NAME, "readwrite", (tx) => {
+        tx.objectStore(STORE_NAME).delete(command_id);
       });
     },
     async list() {
-      const holder = {};
-      await withStore("readonly", (store) => {
-        const req = store.getAll();
-        req.onsuccess = () => {
-          holder.value = (req.result || []).sort((a, b) => a.queuedAt - b.queuedAt);
-        };
+      const rows = await withStores(STORE_NAME, "readonly", (tx, holder) => {
+        getAllInto(tx.objectStore(STORE_NAME), holder, (a, b) => a.queuedAt - b.queuedAt);
       });
-      return holder.value || [];
+      return rows || [];
+    },
+    async putMatch(record) {
+      await withStores(MATCH_STORE, "readwrite", (tx) => {
+        mergePut(tx.objectStore(MATCH_STORE), record);
+      });
+    },
+    async getMatch(matchId) {
+      return withStores(MATCH_STORE, "readonly", (tx, holder) => {
+        const req = tx.objectStore(MATCH_STORE).get(matchId);
+        req.onsuccess = () => { holder.value = req.result || null; };
+      });
+    },
+    async listMatches() {
+      const rows = await withStores(MATCH_STORE, "readonly", (tx, holder) => {
+        getAllInto(tx.objectStore(MATCH_STORE), holder);
+      });
+      return rows || [];
+    },
+    async deleteMatch(matchId) {
+      await withStores(MATCH_STORE, "readwrite", (tx) => {
+        tx.objectStore(MATCH_STORE).delete(matchId);
+      });
+    },
+    // Server acknowledgement, atomically: the command leaves the queue in the
+    // SAME transaction that records its confirmed result, so a crash can never
+    // leave "command gone but confirmed score not advanced" (which would let
+    // the seq allocator hand out an already-used seq after a restart).
+    async ack(command_id, record) {
+      await withStores([STORE_NAME, MATCH_STORE], "readwrite", (tx) => {
+        tx.objectStore(STORE_NAME).delete(command_id);
+        if (record) mergePut(tx.objectStore(MATCH_STORE), record);
+      });
     },
   };
 }
 
 // Best-effort: falls back to an in-memory store (queue does not survive a
-// reload, but the app still works exactly as it does today — no regression)
-// if IndexedDB is unavailable for any reason.
+// reload) if IndexedDB is unavailable for any reason. Such a store reports
+// `durable: false` so the UI can warn that scores are NOT being kept on disk.
 export function defaultStore(dbName) {
   return createIndexedDBStore(dbName) || createMemoryStore();
+}
+
+// Write-ahead persistence of one command: the returned promise resolves only
+// once the entry is committed to `store`. Callers must not show the change or
+// attempt the network until it resolves. `queuedAt` is strictly increasing
+// within this JS realm so same-millisecond commands keep their order.
+let lastQueuedAt = 0;
+export async function enqueueCommand(store, { command_id, type, payload, owner, commandUrl, publishableKey, local }) {
+  if (!store) throw new Error("enqueueCommand: a store is required");
+  const queuedAt = Math.max(Date.now(), lastQueuedAt + 1);
+  lastQueuedAt = queuedAt;
+  const entry = {
+    command_id,
+    type,
+    payload,
+    commandUrl,
+    publishableKey,
+    queuedAt,
+    owner: owner || null,
+    status: "pending",
+    attempts: 0,
+    lastError: null,
+    ...(local ? { local } : {}),
+  };
+  await store.put(entry);
+  return entry;
 }
 
 // Drop-in replacement for `sendCommand`: on a real network failure the
@@ -112,18 +282,19 @@ export function defaultStore(dbName) {
 // command is finally replayed and permanently rejected. Forcing every
 // command behind an already-nonempty per-resource queue to also queue keeps
 // replay strictly FIFO and gap-free.
-export async function sendCommandDurable({ store, send = sendCommand, commandUrl, accessToken, publishableKey, type, payload, commandId, forceQueue = false }) {
+export async function sendCommandDurable({ store, send = sendCommand, commandUrl, accessToken, publishableKey, type, payload, commandId, forceQueue = false, owner }) {
   const command_id = commandId || crypto.randomUUID();
+  const entry = () => ({ command_id, type, payload, commandUrl, publishableKey, queuedAt: Date.now(), ...(owner ? { owner } : {}) });
   if (forceQueue) {
     if (!store) throw new Error("sendCommandDurable: forceQueue requires a store");
-    await store.put({ command_id, type, payload, commandUrl, publishableKey, queuedAt: Date.now() });
+    await store.put(entry());
     return { ok: true, queued: true, command_id };
   }
   try {
     return await send({ commandUrl, accessToken, publishableKey, type, payload, commandId: command_id });
   } catch (err) {
     if (!isNetworkError(err) || !store) throw err;
-    await store.put({ command_id, type, payload, commandUrl, publishableKey, queuedAt: Date.now() });
+    await store.put(entry());
     return { ok: true, queued: true, command_id };
   }
 }

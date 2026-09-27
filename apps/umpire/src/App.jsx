@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createBrowserClient, envConfig, sendCommand, sendCommandDurable, defaultStore, drainQueue, queueSize, isNetworkError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, readMatchSnapshot, writeMatchSnapshot } from "@tournament/client";
-import { applyOptimisticScore, mergeMatchFromResult, reconcileAuthoritativeScore, isCoinTossCommitted, stageScoringTarget, validateFinalScore } from "@tournament/engine";
-import { clearStation, parsePairingInput, readStation, writeStation } from "./stationSession.js";
+import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, classifySendError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, createSyncEngine, createMatchLane, createUserAuthProvider, reconstructMatchView, laneOf, ownerKey } from "@tournament/client";
+import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, stageScoringTarget, validateFinalScore } from "@tournament/engine";
+import { clearStation, parsePairingInput, readStation, writeStation, stationDeviceId, stationTokenExpiresSoon } from "./stationSession.js";
 import PairingScanner from "./PairingScanner.jsx";
 import CoinTossPanel from "./CoinTossPanel.jsx";
 import {
@@ -33,14 +33,237 @@ function participantNameFor(sides, participants, matchId, slot) {
   return part?.display_name || (side?.team_id ? `Team ${slot}` : `Side ${slot}`);
 }
 
+// ---------------------------------------------------------------------------
+// Offline scoring plumbing (see packages/client matchLane.js / syncEngine.js).
+//
+// Every match action the umpire can take offline is written to the durable
+// outbox BEFORE it is shown or sent; one app-level sync engine replays the
+// outbox (one worker per device via a cross-window lock), and each match's
+// screen is rebuilt from "confirmed server state + unsynced local actions".
+// ---------------------------------------------------------------------------
+const OUTBOX_DB = "tournament-umpire-outbox";
+const SYNC_LOCK = "tournament-umpire-outbox-sync";
+const COMMAND_TIMEOUT_MS = 15000;
+const DONE_STATUSES = ["completed", "bye", "cancelled", "abandoned"];
+
+function offlineError(message = "You're offline.") {
+  return new Error(message); // no .status → isNetworkError()
+}
+
+function needsAuthError(message) {
+  const err = new Error(message || "Sign in again to continue.");
+  err.status = 401; // a real answer, not "offline"
+  err.code = "NEEDS_AUTH";
+  return err;
+}
+
+// Online-only command with auth refresh: used for loads and for the actions
+// that deliberately stay online-only (start match, hold). One command_id for
+// the logical request, reused on the post-refresh retry.
+async function liveCommand({ cfg, getAuth, type, payload }) {
+  const commandId = crypto.randomUUID();
+  let auth = await getAuth({ force: false });
+  if (auth?.offline) throw offlineError();
+  if (!auth?.token) throw needsAuthError(auth?.message);
+  const attempt = (token) => sendCommand({
+    commandUrl: cfg.commandUrl,
+    accessToken: token,
+    publishableKey: cfg.publishableKey,
+    type,
+    payload,
+    commandId,
+    timeoutMs: COMMAND_TIMEOUT_MS,
+  });
+  try {
+    return await attempt(auth.token);
+  } catch (err) {
+    if (Number(err?.status) !== 401) throw err;
+    auth = await getAuth({ force: true });
+    if (auth?.token) return attempt(auth.token);
+    if (auth?.offline) throw offlineError();
+    const out = needsAuthError(auth?.message || err.message);
+    out.cause = err;
+    throw out;
+  }
+}
+
+function scoreSummary(st) {
+  if (!st || typeof st !== "object") return null;
+  return {
+    scoreA: st.scoreA ?? 0,
+    scoreB: st.scoreB ?? 0,
+    gameNumber: st.gameNumber ?? 1,
+    gamesWonA: st.gamesWonA ?? 0,
+    gamesWonB: st.gamesWonB ?? 0,
+    status: st.status ?? null,
+    winner: st.winner ?? null,
+    bestOf: st.bestOf ?? 1,
+  };
+}
+
+// Applies one queued entry to a match for the LOCAL view. Throws if the entry
+// can't be applied (the view then marks it blocked rather than guessing).
+function applyEntryToMatch(match, entry) {
+  const p = entry.payload || {};
+  if (entry.type === "score_event") {
+    const r = applyOptimisticScore(match, { id: p.event_id, seq: p.seq, type: p.type, payload: p.payload || {} });
+    if (!r.applied && !r.duplicate) {
+      throw new Error(p.type === "correction" ? "That score is not valid for this match." : "That action can't be applied to the current score.");
+    }
+    return r.match;
+  }
+  if (entry.type === "coin_toss") {
+    let next = { ...match, coin_toss: p, serving_team: p.serving_team };
+    const st = match?.score_state;
+    if (st && typeof st.lastSeq === "number") {
+      const r = applyOptimisticScore(match, {
+        id: p.event_id,
+        seq: p.seq,
+        type: "coin_toss",
+        payload: { result: p.result, winner: p.winner, servingTeam: p.serving_team, courtSide: p.court_side },
+      });
+      next = { ...next, score_state: r.state };
+    }
+    return next;
+  }
+  return match; // complete_match: the server decides; nothing to show locally
+}
+
+// Minimum context needed to reopen a match with no network: the match row,
+// its two sides, the names on those sides, and the court name. Nothing else.
+function matchContextRecord({ owner, match, sides, participants, court }) {
+  const ids = new Set((sides || []).map((s) => s.participant_id).filter(Boolean));
+  return {
+    matchId: match.id,
+    owner,
+    match,
+    sides: (sides || []).map((s) => ({ match_id: s.match_id, slot: s.slot, participant_id: s.participant_id ?? null, team_id: s.team_id ?? null })),
+    participants: (participants || []).filter((p) => ids.has(p.id)).map((p) => ({ id: p.id, display_name: p.display_name })),
+    court: court ? { id: court.id, name: court.name } : null,
+    savedAt: Date.now(),
+    openedAt: Date.now(),
+  };
+}
+
+async function ackRecord(store, owner, entry, result) {
+  const matchId = entry.payload?.match_id;
+  if (!matchId || !result || typeof result !== "object") return null;
+  const existing = await store.getMatch(matchId);
+  if (!existing || existing.owner !== owner) return null;
+  const rowId = result.match?.id ?? result.match_id;
+  if (rowId && rowId !== matchId) return null;
+  return { matchId, owner, match: mergeMatchFromResult(existing.match, result), savedAt: Date.now() };
+}
+
+// Keeps only what offline resume needs: this owner's recent contexts, plus
+// any context (any owner) that still has unsynced work behind it.
+async function pruneMatchContexts(store, owner) {
+  const [entries, contexts] = await Promise.all([store.list(), store.listMatches()]);
+  const withWork = new Set(entries.filter((e) => e.status !== "discarded").map(laneOf));
+  const cutoff = Date.now() - 12 * 60 * 60 * 1000;
+  const mine = contexts
+    .filter((c) => c.owner === owner)
+    .sort((a, b) => (b.openedAt || b.savedAt || 0) - (a.openedAt || a.savedAt || 0));
+  for (const [i, c] of mine.entries()) {
+    if (withWork.has(c.matchId)) continue;
+    if (i >= 20 || (DONE_STATUSES.includes(c.match?.status) && (c.savedAt || 0) < cutoff)) await store.deleteMatch(c.matchId);
+  }
+  for (const c of contexts) {
+    if (c.owner !== owner && !withWork.has(c.matchId)) await store.deleteMatch(c.matchId);
+  }
+}
+
+function useUmpireSync({ cfg, supabase, store, owner, setStation }) {
+  const [engine, setEngine] = useState(null);
+  const [status, setStatus] = useState(null);
+  const setStationRef = useRef(setStation);
+  setStationRef.current = setStation;
+
+  const getAuth = useCallback(async ({ force = false } = {}) => {
+    if (!owner) return { needsAuth: true, message: "Sign in to sync saved scores." };
+    if (owner.startsWith("station:")) {
+      const st = readStation();
+      if (!st?.access_token || ownerKey("station", stationDeviceId(st)) !== owner) {
+        return { needsAuth: true, message: "This court is no longer paired on this device. Scores saved here are kept but can't be sent from a different pairing." };
+      }
+      if (!force && !stationTokenExpiresSoon(st.access_token)) return { token: st.access_token };
+      if (!st.refresh_token) return { needsAuth: true, message: "This court station must be paired again to sync. Scores saved on this device are kept." };
+      try {
+        const body = await pairStation({
+          pairStationUrl: cfg.pairStationUrl,
+          publishableKey: cfg.publishableKey,
+          refreshToken: st.refresh_token,
+          action: "refresh",
+          timeoutMs: COMMAND_TIMEOUT_MS,
+        });
+        const next = { ...readStation(), ...body.result };
+        writeStation(next);
+        setStationRef.current?.(next);
+        return { token: next.access_token };
+      } catch (err) {
+        const kind = classifySendError(err);
+        if (kind === "network" || kind === "retry") {
+          // Refresh endpoint unreachable: a token that hasn't actually expired
+          // yet is still usable; otherwise we're effectively offline.
+          return !force && !stationTokenExpiresSoon(st.access_token, 0) ? { token: st.access_token } : { offline: true };
+        }
+        return { needsAuth: true, message: "This court station was revoked. Scores saved on this device are kept — ask the organizer to re-pair this court." };
+      }
+    }
+    return createUserAuthProvider(supabase, owner.slice("user:".length), {
+      expiredMessage: "Your sign-in has expired. Sign in again (internet required) to sync the scores saved on this device — they are kept until then.",
+      otherUserMessage: "A different account is signed in. Scores saved by the previous account are kept and are not sent from this account.",
+    })({ force });
+  }, [owner, supabase, cfg]);
+
+  useEffect(() => {
+    if (!owner) {
+      setEngine(null);
+      setStatus(null);
+      return undefined;
+    }
+    const next = createSyncEngine({
+      store,
+      lockName: SYNC_LOCK,
+      owner,
+      getAuth,
+      timeoutMs: COMMAND_TIMEOUT_MS,
+      onAck: (entry, result) => ackRecord(store, owner, entry, result),
+    });
+    setEngine(next);
+    const unsubscribe = next.subscribe((s) => setStatus({ ...s }));
+    next.pruneArchived().catch(() => {});
+    pruneMatchContexts(store, owner).catch(() => {});
+    next.kick();
+    const onOnline = () => next.kick({ resetBackoff: true });
+    const onVisible = () => { if (document.visibilityState === "visible") next.kick(); };
+    window.addEventListener("online", onOnline);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      unsubscribe();
+      next.stop();
+      window.removeEventListener("online", onOnline);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [store, owner, getAuth]);
+
+  return { engine, status, getAuth, store, owner };
+}
+
+function unsyncedCount(status) {
+  return (status?.pending || 0) + (status?.conflicts || 0);
+}
+
 export default function App() {
   const cfg = useMemo(() => envConfig(), []);
   const supabase = useMemo(() => createBrowserClient(cfg.url, cfg.publishableKey), [cfg]);
+  const store = useMemo(() => defaultStore(OUTBOX_DB), []);
   const [session, setSession] = useState(undefined);
   const [station, setStation] = useState(() => (typeof window === "undefined" ? null : readStation()));
   const [error, setError] = useState("");
   const [matchId, setMatchId] = useState(null);
   const [recovering, setRecovering] = useState(() => isRecoveryAuthUrl());
+  const [leaveRequest, setLeaveRequest] = useState(null);
 
   useEffect(() => {
     applyAuthCallback(supabase);
@@ -54,31 +277,67 @@ export default function App() {
     return () => sub.subscription.unsubscribe();
   }, [supabase]);
 
+  const owner = station?.access_token
+    ? ownerKey("station", stationDeviceId(station))
+    : session?.user?.id ? ownerKey("user", session.user.id) : null;
+  const sync = useUmpireSync({ cfg, supabase, store, owner, setStation });
+
+  // Signing out / unpairing never deletes saved work: queued actions stay on
+  // this device, tied to the identity that recorded them, and are never sent
+  // by a different account or pairing.
+  function guardedLeave(kind, run) {
+    return () => {
+      if (unsyncedCount(sync.status) > 0) setLeaveRequest({ kind, run, count: unsyncedCount(sync.status) });
+      else run();
+    };
+  }
+  const unpair = () => { clearStation(); setStation(null); setMatchId(null); };
+  const signOut = () => { setMatchId(null); supabase.auth.signOut({ scope: "local" }); };
+
+  const leaveDialog = leaveRequest ? (
+    <ConfirmDialog
+      title={leaveRequest.kind === "station" ? "Unpair with unsynced scores?" : "Sign out with unsynced scores?"}
+      body={leaveRequest.kind === "station"
+        ? `${leaveRequest.count} saved action${leaveRequest.count === 1 ? " has" : "s have"} not reached the server yet. They stay saved on this device, but after unpairing they can no longer be sent as this court. Stay paired until they show SYNCED if you can.`
+        : `${leaveRequest.count} saved action${leaveRequest.count === 1 ? " has" : "s have"} not reached the server yet. They stay saved on this device and are sent only when this same account signs in here again. No other account can send them.`}
+      confirmLabel={leaveRequest.kind === "station" ? "Unpair anyway (keep saved scores)" : "Sign out (keep saved scores)"}
+      danger
+      onCancel={() => setLeaveRequest(null)}
+      onConfirm={() => { const run = leaveRequest.run; setLeaveRequest(null); run(); }}
+    />
+  ) : null;
+
   if (session === undefined) {
     return <SplashScreen tagline="Umpire" status="Restoring your session…" />;
   }
   if (station?.access_token) {
-    return matchId ? (
-      <MatchDesk
-        cfg={cfg}
-        supabase={supabase}
-        session={{ access_token: station.access_token }}
-        station={station}
-        matchId={matchId}
-        onBack={() => setMatchId(null)}
-        onSignOut={() => { clearStation(); setStation(null); setMatchId(null); }}
-      />
-    ) : (
-      <CourtQueue
-        cfg={cfg}
-        station={station}
-        setStation={setStation}
-        onOpen={setMatchId}
-        onUnpair={() => { clearStation(); setStation(null); }}
-      />
+    return (
+      <>
+        {matchId ? (
+          <MatchDesk
+            cfg={cfg}
+            supabase={supabase}
+            station={station}
+            matchId={matchId}
+            sync={sync}
+            onBack={() => setMatchId(null)}
+            onSignOut={guardedLeave("station", unpair)}
+          />
+        ) : (
+          <CourtQueue
+            cfg={cfg}
+            station={station}
+            setStation={setStation}
+            sync={sync}
+            onOpen={setMatchId}
+            onUnpair={guardedLeave("station", unpair)}
+          />
+        )}
+        {leaveDialog}
+      </>
     );
   }
-  if (!session) return <Auth cfg={cfg} supabase={supabase} error={error} setError={setError} onPaired={setStation} />;
+  if (!session) return <Auth cfg={cfg} supabase={supabase} store={store} error={error} setError={setError} onPaired={setStation} />;
   if (recovering) {
     return (
       <RecoveryScreen
@@ -89,26 +348,125 @@ export default function App() {
     );
   }
 
-  return matchId ? (
-    <MatchDesk
-      cfg={cfg}
-      supabase={supabase}
-      session={session}
-      matchId={matchId}
-      onBack={() => setMatchId(null)}
-      onSignOut={() => supabase.auth.signOut({ scope: "local" })}
-    />
-  ) : (
-    <MyMatches
-      supabase={supabase}
-      session={session}
-      onOpen={setMatchId}
-      onSignOut={() => supabase.auth.signOut({ scope: "local" })}
-    />
+  return (
+    <>
+      {matchId ? (
+        <MatchDesk
+          cfg={cfg}
+          supabase={supabase}
+          matchId={matchId}
+          sync={sync}
+          onBack={() => setMatchId(null)}
+          onSignOut={guardedLeave("user", signOut)}
+        />
+      ) : (
+        <MyMatches
+          supabase={supabase}
+          session={session}
+          sync={sync}
+          onOpen={setMatchId}
+          onSignOut={guardedLeave("user", signOut)}
+        />
+      )}
+      {leaveDialog}
+    </>
   );
 }
 
-function Auth({ cfg, supabase, error, setError, onPaired }) {
+// Status + actions for the device's outbox, shown on the match lists.
+function SyncNotices({ sync, who }) {
+  const [confirmClaim, setConfirmClaim] = useState(false);
+  const s = sync?.status;
+  if (!s) return null;
+  return (
+    <>
+      {s.durable === false && (
+        <Alert>This device can't store scores offline (browser storage is unavailable). Keep the internet connection on while scoring.</Alert>
+      )}
+      {s.needsAuth && unsyncedCount(s) > 0 && <Alert tone="warn">{s.needsAuth}</Alert>}
+      {s.pending > 0 && (
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <span className="ump-sync ump-sync-offline">
+            <span className="ump-sync-dot" aria-hidden="true" /> {s.pending} action{s.pending === 1 ? "" : "s"} saved on this device — {s.syncing ? "syncing…" : s.offline ? "offline, will sync when connected" : "not yet synced"}
+          </span>
+          <Button variant="secondary" onClick={() => sync.engine?.kick({ resetBackoff: true })}>Sync now</Button>
+        </div>
+      )}
+      {s.conflicts > 0 && (
+        <Alert>{s.conflicts} saved action{s.conflicts === 1 ? " needs" : "s need"} attention — open the match marked "Needs attention" below.</Alert>
+      )}
+      {s.unclaimed > 0 && (
+        <Alert tone="warn">
+          {s.unclaimed} action{s.unclaimed === 1 ? " was" : "s were"} saved on this device by an earlier version of this app. They are only sent after you confirm they are yours.
+          <div className="row" style={{ marginTop: 8 }}>
+            <Button variant="secondary" onClick={() => setConfirmClaim(true)}>Review and send</Button>
+          </div>
+        </Alert>
+      )}
+      {s.otherOwner > 0 && (
+        <p className="muted" style={{ color: "var(--muted-court)" }}>
+          {s.otherOwner} saved action{s.otherOwner === 1 ? " belongs" : "s belong"} to another account or court pairing on this device and will not be sent from here.
+        </p>
+      )}
+      {confirmClaim && (
+        <ConfirmDialog
+          title="Send earlier saved actions?"
+          body={`${s.unclaimed} saved action${s.unclaimed === 1 ? "" : "s"} will be sent as ${who}. Only confirm if they were recorded by you on this device.`}
+          confirmLabel="Send as me"
+          onCancel={() => setConfirmClaim(false)}
+          onConfirm={async () => { setConfirmClaim(false); await sync.engine?.claimUnowned(); }}
+        />
+      )}
+    </>
+  );
+}
+
+// Matches this device can reopen with no network (confirmed context on disk).
+function SavedMatches({ sync, onOpen, showAll }) {
+  const [rows, setRows] = useState([]);
+  const { store, owner, status } = sync || {};
+  useEffect(() => {
+    if (!store || !owner) return undefined;
+    let alive = true;
+    store.listMatches()
+      .then((all) => {
+        if (!alive) return;
+        setRows(all
+          .filter((r) => r.owner === owner)
+          .sort((a, b) => (b.openedAt || b.savedAt || 0) - (a.openedAt || a.savedAt || 0)));
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [store, owner, status]);
+  const byLane = status?.byLane || {};
+  const visible = rows.filter((r) => showAll || ((byLane[r.matchId]?.pending || 0) + (byLane[r.matchId]?.conflicts || 0)) > 0);
+  if (!visible.length) return null;
+  return (
+    <section>
+      <div className="section-label">Saved on this device</div>
+      {visible.map((r) => {
+        const lane = byLane[r.matchId] || {};
+        const st = r.match?.score_state || {};
+        const nameFor = (slot) => participantNameFor(r.sides || [], r.participants || [], r.matchId, slot);
+        return (
+          <ClickableCard key={r.matchId} className="ump-card" live={r.match?.status === "in_progress"} onClick={() => onOpen(r.matchId)}>
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <strong>{r.court?.name || "No court"}</strong>
+              {lane.conflicts > 0 ? <Badge tone="warn">Needs attention</Badge> : lane.pending > 0 ? <Badge tone="warn">{lane.pending} not synced</Badge> : <StatusBadge status={r.match?.status} />}
+            </div>
+            <div className="ump-name">{nameFor("A")} vs {nameFor("B")}</div>
+            <div className="muted" style={{ color: "var(--muted-court)" }}>
+              Server score {st.scoreA ?? 0}–{st.scoreB ?? 0}
+              {r.savedAt ? ` · saved ${new Date(r.savedAt).toLocaleTimeString()}` : ""}
+            </div>
+          </ClickableCard>
+        );
+      })}
+    </section>
+  );
+}
+
+function Auth({ cfg, supabase, store, error, setError, onPaired }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -116,6 +474,18 @@ function Auth({ cfg, supabase, error, setError, onPaired }) {
   const [info, setInfo] = useState("");
   const [pairText, setPairText] = useState("");
   const [scanning, setScanning] = useState(false);
+  const [savedCount, setSavedCount] = useState(0);
+
+  // Signing in needs the internet (there is deliberately no offline login).
+  // If scores were saved on this device before the session ended, say so —
+  // they are kept and sync once the same account/court is signed in again.
+  useEffect(() => {
+    let alive = true;
+    store?.list()
+      .then((rows) => { if (alive) setSavedCount(rows.filter((r) => r.status !== "discarded").length); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [store]);
 
   async function pairWithRaw(raw) {
     const parsed = parsePairingInput(raw);
@@ -166,6 +536,11 @@ function Auth({ cfg, supabase, error, setError, onPaired }) {
             ? "Pair this court. Scan the organizer QR or enter the pairing code. New matches on that court do not need another scan."
             : "Assigned matches only. Scores persist through refresh."}
         </p>
+        {savedCount > 0 && (
+          <Alert tone="warn">
+            {savedCount} scoring action{savedCount === 1 ? " is" : "s are"} saved on this device and not yet synced. Signing in needs an internet connection; they are sent automatically once the same umpire account signs in again. (Actions saved under an earlier court pairing can't be sent by a new pairing — they stay on this device.)
+          </Alert>
+        )}
         <form className="stack" onSubmit={submit} style={{ marginTop: 16 }}>
           {mode === "pair" ? (
             <>
@@ -278,7 +653,7 @@ function groupMatches(rows) {
   return { live, ready, upcoming, done, other };
 }
 
-function MyMatches({ supabase, session, onOpen, onSignOut }) {
+function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
   const [rows, setRows] = useState(null);
   const [meta, setMeta] = useState({ courts: [], sides: [], participants: [] });
   const [error, setError] = useState("");
@@ -360,12 +735,14 @@ function MyMatches({ supabase, session, onOpen, onSignOut }) {
         </div>
       </header>
       <div className="ump-list">
+        <SyncNotices sync={sync} who={session.user.email} />
         {error && (
           <>
-            <Alert>{error}</Alert>
+            <Alert>Couldn't load your assigned matches ({error}). If you're offline, matches saved on this device are listed below and can still be scored; they sync when you're back online.</Alert>
             <Button onClick={load}>Retry</Button>
           </>
         )}
+        <SavedMatches sync={sync} onOpen={onOpen} showAll={Boolean(error)} />
         {rows === null && !error && <LoadingState label="Loading assignments" />}
         {rows?.length === 0 && <EmptyState title="No assigned matches">When an organizer assigns you, matches appear here.</EmptyState>}
         {rows?.length > 0 && (
@@ -441,66 +818,51 @@ function MatchGroup({ title, rows, onOpen, nameFor }) {
   );
 }
 
-function CourtQueue({ cfg, station, setStation, onOpen, onUnpair }) {
+function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
   const [rows, setRows] = useState(null);
   const [meta, setMeta] = useState({ sides: [], participants: [] });
   const [error, setError] = useState("");
+  const [offline, setOffline] = useState(false);
   const [court, setCourt] = useState(station.court || null);
   const stationRef = useRef(station);
   stationRef.current = station;
+  const getAuth = sync.getAuth;
 
   const load = useCallback(async () => {
-    const st = stationRef.current;
     try {
-      const body = await sendCommand({
-        commandUrl: cfg.commandUrl,
-        accessToken: st.access_token,
-        publishableKey: cfg.publishableKey,
-        type: "station_sync",
-        payload: {},
-      });
-      const sync = body.result;
-      setCourt(sync.court);
-      setRows((sync.matches || []).map((m) => ({ ...m, courtName: sync.court?.name || null })));
-      setMeta({ sides: sync.sides || [], participants: sync.participants || [] });
+      // liveCommand refreshes the station token itself (via the shared
+      // getAuth) when it is near expiry or the server answers 401.
+      const body = await liveCommand({ cfg, getAuth, type: "station_sync", payload: {} });
+      const result = body.result;
+      setCourt(result.court);
+      setRows((result.matches || []).map((m) => ({ ...m, courtName: result.court?.name || null })));
+      setMeta({ sides: result.sides || [], participants: result.participants || [] });
       setError("");
-      if (sync.court) {
-        const next = { ...stationRef.current, court: sync.court };
+      setOffline(false);
+      if (result.court) {
+        const next = { ...readStation(), court: result.court };
         writeStation(next);
         const prev = stationRef.current.court;
-        if (prev?.id !== sync.court.id || prev?.name !== sync.court.name) {
+        if (prev?.id !== result.court.id || prev?.name !== result.court.name) {
           setStation(next);
         } else {
           stationRef.current = next;
         }
       }
     } catch (err) {
-      if (err.status === 401 && st.refresh_token) {
-        try {
-          const refreshed = await pairStation({
-            pairStationUrl: cfg.pairStationUrl,
-            publishableKey: cfg.publishableKey,
-            refreshToken: st.refresh_token,
-            action: "refresh",
-          });
-          const next = { ...stationRef.current, ...refreshed.result };
-          writeStation(next);
-          setStation(next);
-          return;
-        } catch (refreshErr) {
-          setError(isStationInactiveError(refreshErr)
-            ? "This court station was revoked. Pair again with a new QR."
-            : refreshErr.message);
-          setRows(null);
-          return;
-        }
+      if (isNetworkError(err)) {
+        // Keep whatever list is already on screen; saved matches below stay usable.
+        setOffline(true);
+        setError("");
+        return;
       }
+      setOffline(false);
       setError(isStationInactiveError(err)
         ? "This court station was revoked. Pair again with a new QR."
         : err.message);
       setRows(null);
     }
-  }, [cfg.commandUrl, cfg.publishableKey, cfg.pairStationUrl, station.access_token, station.refresh_token, setStation]);
+  }, [cfg, getAuth, setStation]);
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
@@ -532,6 +894,13 @@ function CourtQueue({ cfg, station, setStation, onOpen, onUnpair }) {
         </div>
       </header>
       <div className="ump-list">
+        <SyncNotices sync={sync} who={`this court (${court?.name || "paired device"})`} />
+        {offline && (
+          <>
+            <Alert tone="warn">You're offline — this court's match list can't be refreshed. Matches saved on this device are listed below and can still be scored; they sync when you're back online.</Alert>
+            <Button onClick={load}>Retry</Button>
+          </>
+        )}
         {error && (
           <>
             <Alert>{error}</Alert>
@@ -540,7 +909,8 @@ function CourtQueue({ cfg, station, setStation, onOpen, onUnpair }) {
               : <Button onClick={load}>Retry</Button>}
           </>
         )}
-        {rows === null && !error && <LoadingState label="Loading court" />}
+        <SavedMatches sync={sync} onOpen={onOpen} showAll={offline || Boolean(error)} />
+        {rows === null && !error && !offline && <LoadingState label="Loading court" />}
         {rows?.length === 0 && <EmptyState title="No matches on this court">When an organizer assigns a match here, it appears without a new QR scan.</EmptyState>}
         {grouped && (
           <>
@@ -558,13 +928,16 @@ function CourtQueue({ cfg, station, setStation, onOpen, onUnpair }) {
 // Edit Score / Instant Score Entry — sends a "correction" score_event through
 // the same command/engine/audit pipeline as normal point-scoring (see
 // packages/engine/src/scoring.js applyScoreEvent's "correction" case and
-// packages/api/src/handleCommand.js handleScoreEvent). Never mutates the
-// score locally beyond what the server confirms.
-function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose }) {
+// packages/api/src/handleCommand.js handleScoreEvent). Like every other match
+// action it is saved on this device first and synced by the outbox; a
+// correction the server refuses shows up as a sync conflict, never silently.
+// `initialScoreA/B` prefill the form (used to re-apply this device's score
+// after a sync conflict).
+function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose, initialScoreA, initialScoreB, title = "Edit score" }) {
   const state = match.score_state || {};
   const wasCompleted = match.status === "completed";
-  const [scoreA, setScoreA] = useState(String(state.scoreA ?? 0));
-  const [scoreB, setScoreB] = useState(String(state.scoreB ?? 0));
+  const [scoreA, setScoreA] = useState(String(initialScoreA ?? state.scoreA ?? 0));
+  const [scoreB, setScoreB] = useState(String(initialScoreB ?? state.scoreB ?? 0));
   const [reason, setReason] = useState("");
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -606,7 +979,7 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose }) {
   }
 
   return (
-    <Modal title="Edit score" onClose={() => !busy && onClose()}>
+    <Modal title={title} onClose={() => !busy && onClose()}>
       <div className="stack">
         {wasCompleted && (
           <Alert>
@@ -663,23 +1036,18 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose }) {
   );
 }
 
-function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut }) {
-  // Read once, synchronously, before first paint: if this device already has
-  // a locally-durable snapshot of this exact match, the scoreboard can render
-  // it immediately — including while offline and before load() ever gets a
-  // chance to run — instead of blocking on a network round trip. This is the
-  // fix for "refresh while offline loses the score."
-  const initialSnapshot = readMatchSnapshot();
-  const cachedForThisMatch = initialSnapshot?.matchId === matchId ? initialSnapshot : null;
-
-  const [match, setMatch] = useState(() => cachedForThisMatch?.match ?? null);
-  const [sides, setSides] = useState([]);
-  const [participants, setParticipants] = useState([]);
-  const [court, setCourt] = useState(null);
+function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut }) {
+  const { store, owner, engine, status: syncStatus, getAuth } = sync;
+  // `base` = this match's last CONFIRMED (server-acknowledged) context, kept
+  // on disk; `entries` = this device's durable, not-yet-acknowledged actions
+  // for the match. What's on screen is always derived from the two.
+  const [base, setBase] = useState(null);
+  const [entries, setEntries] = useState([]);
+  const [hydrated, setHydrated] = useState(false);
   const [error, setError] = useState("");
   const [loadError, setLoadError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [pending, setPending] = useState(0);
+  const [laneBusy, setLaneBusy] = useState(false);
   const [confirmComplete, setConfirmComplete] = useState(false);
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [showEditScore, setShowEditScore] = useState(false);
@@ -687,130 +1055,128 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   const [showHold, setShowHold] = useState(false);
   const [holdReason, setHoldReason] = useState("");
   const [holding, setHolding] = useState(false);
-  const [pendingSync, setPendingSync] = useState(0);
-  // "offline" | "syncing" | "synced" | "stuck" | "idle" — drives the Step 5
-  // status indicator; "stuck" means drainQueue hit a real (non-network)
-  // rejection that needs a human decision, see stuckEntry/resolveStuck below.
-  const [syncStatus, setSyncStatus] = useState("idle");
-  const [stuckEntry, setStuckEntry] = useState(null);
-  const [showStuckConfirm, setShowStuckConfirm] = useState(false);
-  const [resolvingStuck, setResolvingStuck] = useState(false);
-  const matchRef = useRef(null);
-  const seqRef = useRef(cachedForThisMatch ? Number(cachedForThisMatch.seq || 0) : 0);
-  const epochRef = useRef(0);
-  const pendingRef = useRef(0);
-  const drainRef = useRef(null);
-  const outboxRef = useRef(null);
-  if (!outboxRef.current) outboxRef.current = defaultStore("tournament-umpire-outbox");
-  matchRef.current = match;
+  const [confirmKeepServer, setConfirmKeepServer] = useState(false);
+  const [reapplyLocal, setReapplyLocal] = useState(null);
+  const [resolving, setResolving] = useState(false);
+  const [justSynced, setJustSynced] = useState(false);
+  const baseRef = useRef(null);
+  baseRef.current = base;
 
-  // Keep the durable snapshot current with whatever's on screen — optimistic
-  // taps, drained server confirmations, and fresh loads all flow through
-  // setMatch, so persisting here (rather than at every call site) covers all
-  // of them once. Best-effort: writeMatchSnapshot never throws.
+  // The single seq allocator + write-ahead path for this match. Every
+  // offline-capable action below goes through lane.enqueue — there is no
+  // other way to mint a seq for this match.
+  const lane = useMemo(
+    () => createMatchLane({ store, matchId, owner, commandUrl: cfg.commandUrl, publishableKey: cfg.publishableKey }),
+    [store, matchId, owner, cfg.commandUrl, cfg.publishableKey],
+  );
+
+  const refreshLocal = useCallback(async () => {
+    const [rec, all] = await Promise.all([store.getMatch(matchId), store.list()]);
+    setBase(rec && rec.owner === owner ? rec : null);
+    setEntries(all.filter((e) => e.owner === owner && e.payload?.match_id === matchId));
+    setHydrated(true);
+  }, [store, matchId, owner]);
+
+  const view = useMemo(() => {
+    if (!base?.match) return null;
+    return reconstructMatchView({ baseMatch: base.match, entries, applyEntry: applyEntryToMatch });
+  }, [base, entries]);
+  const match = view?.match ?? null;
+  const sides = base?.sides || [];
+  const participants = base?.participants || [];
+  const court = base?.court || null;
+
+  // Keep the allocator at or above everything known for this match (confirmed
+  // lastSeq and every seq already in the queue) — it never goes backwards.
   useEffect(() => {
-    if (match) writeMatchSnapshot(matchId, match, seqRef.current);
-  }, [match, matchId]);
+    if (view) lane.observeSeq(view.localLastSeq);
+  }, [view, lane]);
 
-  // Any command mutating this match (a score_event above all — its `seq`
-  // must be strictly gap-free) must never be sent live while an earlier one
-  // for this same match is still sitting undrained in the outbox: on a flaky
-  // connection a later tap can otherwise slip through before an earlier
-  // queued one, creating a gap that later gets the earlier command
-  // permanently rejected once it's finally replayed. Callers pass the
-  // result as sendCommandDurable's forceQueue option.
-  async function hasQueuedForMatch(id) {
-    const store = outboxRef.current;
-    if (!store) return false;
-    const all = await store.list();
-    return all.some((e) => e.payload?.match_id === id);
-  }
+  // Re-read the durable state whenever the sync engine reports progress
+  // (an ack moves an entry out of the queue and into the confirmed base).
+  useEffect(() => {
+    refreshLocal().catch(() => {});
+  }, [refreshLocal, syncStatus]);
+
+  const unsyncedHere = view ? view.unsynced : 0;
+  const prevUnsynced = useRef(0);
+  useEffect(() => {
+    if (prevUnsynced.current > 0 && unsyncedHere === 0 && hydrated) {
+      setJustSynced(true);
+      const t = window.setTimeout(() => setJustSynced(false), 2500);
+      prevUnsynced.current = unsyncedHere;
+      return () => window.clearTimeout(t);
+    }
+    prevUnsynced.current = unsyncedHere;
+    return undefined;
+  }, [unsyncedHere, hydrated]);
 
   const load = useCallback(async () => {
-    if (pendingRef.current > 0) return;
-    const store = outboxRef.current;
-    const queued = store ? await store.list() : [];
-    // This match still has commands sitting in the durable outbox awaiting
-    // replay — applyResult() is already advancing `match` correctly as each
-    // one drains, so a fetch here would only show a stale, pre-drain
-    // snapshot. Once the backlog clears (or its stuck entry is resolved),
-    // load() resumes overwriting freely — this is recomputed fresh on every
-    // call, never a lingering flag.
-    const hasQueuedForThisMatch = queued.some((e) => e.payload?.match_id === matchId);
-    if (station) {
-      try {
-        const body = await sendCommand({
-          commandUrl: cfg.commandUrl,
-          accessToken: session.access_token,
-          publishableKey: cfg.publishableKey,
-          type: "station_sync",
-          payload: {},
-        });
-        const sync = body.result;
-        const m = (sync.matches || []).find((row) => row.id === matchId);
-        if (!m) { setLoadError("This match is not on this court."); setMatch(null); return; }
-        if (!hasQueuedForThisMatch) {
-          setMatch(m);
-          seqRef.current = Number(m.score_state?.lastSeq || 0);
+    try {
+      let record;
+      if (station) {
+        const body = await liveCommand({ cfg, getAuth, type: "station_sync", payload: {} });
+        const result = body.result;
+        const m = (result.matches || []).find((row) => row.id === matchId);
+        if (!m) {
+          if (baseRef.current) setError("This match is no longer assigned to this court. Scores already saved on this device are kept.");
+          else setLoadError("This match is not on this court.");
+          return;
         }
-        setSides((sync.sides || []).filter((row) => row.match_id === matchId));
-        setParticipants(sync.participants || []);
-        setCourt(sync.court || null);
-        setLoadError("");
-        setError("");
-        if (queued.length > 0) drainRef.current?.();
-      } catch (err) {
-        // A plain connectivity blip with something already on screen (cached
-        // from a prior load or rehydrated from the durable snapshot) must
-        // not blank the scoreboard — the umpire keeps scoring from the
-        // durable local view, and the next successful load/drain catches up.
-        // A genuine server rejection (station revoked, etc. — has a status)
-        // always still surfaces, since that's a real problem to act on.
-        if (isNetworkError(err) && matchRef.current) return;
-        setLoadError(isStationInactiveError(err)
-          ? "This court station was revoked. Pair again with a new QR."
-          : err.message);
+        record = matchContextRecord({
+          owner,
+          match: m,
+          sides: (result.sides || []).filter((row) => row.match_id === matchId),
+          participants: result.participants || [],
+          court: result.court || null,
+        });
+      } else {
+        const [m, s, ca] = await Promise.all([
+          supabase.from("matches").select("*").eq("id", matchId).maybeSingle(),
+          supabase.from("match_participants").select("*").eq("match_id", matchId),
+          supabase.from("court_assignments").select("*").eq("match_id", matchId).maybeSingle(),
+        ]);
+        // supabase-js doesn't separate "offline" from other failures; the
+        // rule is simple: never blank a match that is already on screen (or
+        // saved on this device) — the Reload button retries.
+        const firstErr = m.error || s.error || ca.error;
+        if (firstErr) {
+          if (!baseRef.current) setLoadError(`This match isn't saved on this device yet and couldn't be loaded (${firstErr.message}). Reconnect and try again.`);
+          return;
+        }
+        if (!m.data) { if (!baseRef.current) setLoadError("Match not found."); return; }
+        const participantIds = [...new Set((s.data || []).map((x) => x.participant_id).filter(Boolean))];
+        const [p, c] = await Promise.all([
+          participantIds.length ? supabase.from("participants").select("*").in("id", participantIds) : Promise.resolve({ data: [] }),
+          ca.data?.court_id ? supabase.from("courts").select("*").eq("id", ca.data.court_id).maybeSingle() : Promise.resolve({ data: null }),
+        ]);
+        if (p.error || c?.error) {
+          if (!baseRef.current) setLoadError((p.error || c.error).message);
+          return;
+        }
+        record = matchContextRecord({ owner, match: m.data, sides: s.data || [], participants: p.data || [], court: c?.data || null });
       }
-      return;
+      // Confirmed server truth goes to disk first (the store only ever moves
+      // the confirmed score forward); the screen is then rebuilt from it plus
+      // any unsynced local actions — a reload never replaces them.
+      await store.putMatch(record);
+      await refreshLocal();
+      setLoadError("");
+      setError("");
+      engine?.kick();
+    } catch (err) {
+      if (isNetworkError(err)) {
+        if (!baseRef.current) setLoadError("You're offline and this match isn't saved on this device yet. Reconnect to load it.");
+        return;
+      }
+      const message = isStationInactiveError(err) ? "This court station was revoked. Pair again with a new QR." : err.message;
+      if (baseRef.current) setError(message); else setLoadError(message);
     }
-    const [m, s, ca] = await Promise.all([
-      supabase.from("matches").select("*").eq("id", matchId).maybeSingle(),
-      supabase.from("match_participants").select("*").eq("match_id", matchId),
-      supabase.from("court_assignments").select("*").eq("match_id", matchId).maybeSingle(),
-    ]);
-    // Any of these can fail on a plain connectivity blip; supabase-js doesn't
-    // give a clean network-vs-real-error signal the way sendCommand's
-    // err.status does, so the safe rule here is simpler: never blank an
-    // already-populated scoreboard, whatever the cause — the explicit
-    // "Reload" button remains available to retry.
-    if (m.error) { if (!matchRef.current) setLoadError(m.error.message); return; }
-    if (s.error) { if (!matchRef.current) setLoadError(s.error.message); return; }
-    if (ca.error) { if (!matchRef.current) setLoadError(ca.error.message); return; }
-    if (!m.data) { setLoadError("Match not found."); return; }
-    const participantIds = [...new Set((s.data || []).map((x) => x.participant_id).filter(Boolean))];
-    const [p, c] = await Promise.all([
-      participantIds.length
-        ? supabase.from("participants").select("*").in("id", participantIds)
-        : Promise.resolve({ data: [] }),
-      ca.data?.court_id
-        ? supabase.from("courts").select("*").eq("id", ca.data.court_id).maybeSingle()
-        : Promise.resolve({ data: null }),
-    ]);
-    if (p.error) { if (!matchRef.current) setLoadError(p.error.message); return; }
-    if (c?.error) { if (!matchRef.current) setLoadError(c.error.message); return; }
-    if (!hasQueuedForThisMatch) {
-      setMatch(m.data);
-      seqRef.current = Number(m.data.score_state?.lastSeq || 0);
-    }
-    setSides(s.data || []);
-    setParticipants(p.data || []);
-    setCourt(c.data || null);
-    setLoadError("");
-    setError("");
-    if (queued.length > 0) drainRef.current?.();
-  }, [supabase, matchId, station, cfg, session]);
+  }, [supabase, matchId, station, cfg, getAuth, owner, store, refreshLocal, engine]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    refreshLocal().catch(() => {}).finally(() => load());
+  }, [refreshLocal, load]);
   useEffect(() => {
     function onVis() {
       if (document.visibilityState === "visible") load();
@@ -823,104 +1189,68 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
     };
   }, [load]);
 
-  const refreshPendingSync = useCallback(async () => {
-    setPendingSync(await queueSize(outboxRef.current));
-  }, []);
-
-  const drain = useCallback(async () => {
-    if (stuckEntry) return { drained: 0, remaining: 0, stoppedOn: "stuck" };
-    const store = outboxRef.current;
-    const before = store ? (await store.list()).length : 0;
-    if (before > 0) setSyncStatus((s) => (s === "stuck" ? s : "syncing"));
-    const outcome = await drainQueue({
-      store,
-      getAccessToken: async () => session?.access_token,
-      publishableKey: cfg.publishableKey,
-      onEach: (entry, result, err) => {
-        if (result) { applyResult(result); return; }
-        // A real (non-network) rejection is a genuine conflict — e.g. this
-        // match moved on (completed, or a correction changed its seq) while
-        // this device was offline. Surface it as an actionable choice rather
-        // than silently deleting the entry or looping on it forever.
-        if (err && !isNetworkError(err)) setStuckEntry({ entry, error: err });
-      },
-    });
-    if (outcome.drained > 0) await load();
-    await refreshPendingSync();
-    if (outcome.stoppedOn === "rejected") {
-      setSyncStatus("stuck");
-    } else if (outcome.stoppedOn === "offline") {
-      setSyncStatus("offline");
-    } else if (outcome.stoppedOn !== "already_draining" && before > 0 && outcome.remaining === 0) {
-      setSyncStatus("synced");
-      window.setTimeout(() => setSyncStatus((s) => (s === "synced" ? "idle" : s)), 2500);
-    }
-    return outcome;
-  }, [session, cfg, refreshPendingSync, load, stuckEntry]);
-  drainRef.current = drain;
-
-  async function resolveStuck() {
-    if (!stuckEntry) return;
-    setResolvingStuck(true);
+  // Offline-capable match action: allocate seq → persist → show → sync.
+  async function enqueue(kind, fields) {
+    if (!view) return { accepted: false, reason: "not_ready" };
+    lane.observeSeq(view.localLastSeq);
+    const current = view.match;
+    setLaneBusy(true);
+    setError("");
+    let res;
     try {
-      const store = outboxRef.current;
-      const all = store ? await store.list() : [];
-      const thisMatchId = stuckEntry.entry?.payload?.match_id;
-      for (const e of all) {
-        if (!thisMatchId || e.payload?.match_id === thisMatchId) await store.delete(e.command_id);
-      }
-      setStuckEntry(null);
-      setSyncStatus("idle");
-      await refreshPendingSync();
-      await load();
+      res = await lane.enqueue(kind, fields, {
+        validate: (payload) => {
+          const type = kind === "coin_toss" || kind === "complete_match" ? kind : "score_event";
+          const next = applyEntryToMatch(current, { type, payload });
+          return { result: scoreSummary(next.score_state) };
+        },
+      });
     } finally {
-      setResolvingStuck(false);
+      setLaneBusy(false);
     }
+    if (!res.accepted) {
+      if (res.reason === "invalid") setError(res.error?.message || "That action can't be applied to the current score.");
+      else if (res.reason === "persist_failed") setError("This device could not save that action, so it was NOT recorded. Please try again.");
+      return res;
+    }
+    setEntries((prev) => [...prev, res.entry]);
+    engine?.kick();
+    return res;
   }
 
-  useEffect(() => {
-    refreshPendingSync();
-    drain();
-    function onOnline() { drain(); }
-    function onOffline() { setSyncStatus((s) => (s === "stuck" ? s : "offline")); }
-    window.addEventListener("online", onOnline);
-    window.addEventListener("offline", onOffline);
-    const interval = setInterval(drain, 20000);
-    return () => {
-      window.removeEventListener("online", onOnline);
-      window.removeEventListener("offline", onOffline);
-      clearInterval(interval);
-    };
-  }, [drain, refreshPendingSync]);
-
-  function applyResult(result) {
-    const current = matchRef.current;
-    if (!current) return;
-    const next = mergeMatchFromResult(current, result);
-    const rec = reconcileAuthoritativeScore(current.score_state, next.score_state);
-    const merged = { ...next, score_state: rec.state };
-    setMatch(merged);
-    seqRef.current = Number(merged.score_state?.lastSeq || seqRef.current);
+  function sendScore(type, extra = {}) {
+    return enqueue(type, extra);
   }
 
-  async function command(type, payload) {
+  async function sendCorrection(correctionPayload) {
+    const res = await enqueue("correction", correctionPayload);
+    if (!res.accepted) throw new Error(res.error?.message || "Could not save the correction");
+    return res;
+  }
+
+  // Start and Hold change the match lifecycle that other devices act on, so
+  // they stay online-only, and only once this match has nothing unsynced
+  // (otherwise the server would see them out of order).
+  async function onlineOnly(type, payload, offlineMessage) {
+    if (unsyncedHere > 0) {
+      setError("This match still has actions saved on this device that haven't synced. Connect to the internet and wait for SYNCED first.");
+      engine?.kick({ resetBackoff: true });
+      return false;
+    }
     setBusy(true);
     setError("");
     try {
-      const body = await sendCommandDurable({
-        store: outboxRef.current,
-        commandUrl: cfg.commandUrl,
-        accessToken: session.access_token,
-        publishableKey: cfg.publishableKey,
-        type,
-        payload,
-      });
-      if (body.queued) { setSyncStatus((s) => (s === "stuck" ? s : "offline")); await refreshPendingSync(); }
-      else if (body.result) applyResult(body.result);
-      else await load();
+      const body = await liveCommand({ cfg, getAuth, type, payload });
+      if (body?.result && baseRef.current) {
+        await store.putMatch({ ...baseRef.current, match: mergeMatchFromResult(baseRef.current.match, body.result), savedAt: Date.now() });
+        await refreshLocal();
+      } else {
+        await load();
+      }
+      return true;
     } catch (err) {
-      setError(err.message);
-      await load();
+      setError(isNetworkError(err) ? offlineMessage : err.message);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -929,107 +1259,58 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   async function confirmHold() {
     setHolding(true);
     try {
-      await command("transition_match", { match_id: match.id, status: "postponed", reason: holdReason.trim() || undefined });
-      setShowHold(false);
-      setHoldReason("");
+      const ok = await onlineOnly(
+        "transition_match",
+        { match_id: match.id, status: "postponed", reason: holdReason.trim() || undefined },
+        "You're offline — the match was NOT put on hold. Holding a match needs an internet connection.",
+      );
+      if (ok) {
+        setShowHold(false);
+        setHoldReason("");
+      }
     } finally {
       setHolding(false);
     }
   }
 
-  async function sendCorrection(correctionPayload) {
-    const current = matchRef.current;
-    if (!current) return;
-    setBusy(true);
-    setError("");
-    const event_id = crypto.randomUUID();
-    const forceQueue = await hasQueuedForMatch(current.id);
+  // Conflict resolution — every option keeps the local actions on disk.
+  async function keepServerScore() {
+    setResolving(true);
     try {
-      const body = await sendCommandDurable({
-        store: outboxRef.current,
-        commandUrl: cfg.commandUrl,
-        accessToken: session.access_token,
-        publishableKey: cfg.publishableKey,
-        type: "score_event",
-        commandId: event_id,
-        payload: {
-          match_id: current.id,
-          event_id,
-          seq: seqRef.current + 1,
-          type: "correction",
-          payload: correctionPayload,
-        },
-        forceQueue,
-      });
-      if (body.queued) { setSyncStatus((s) => (s === "stuck" ? s : "offline")); await refreshPendingSync(); return null; }
-      if (body.result) applyResult(body.result);
-      return body.result;
-    } catch (err) {
-      setError(err.message);
-      await load();
-      throw err;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function sendScore(type, extra = {}) {
-    const current = matchRef.current;
-    if (!current) return;
-    const event_id = crypto.randomUUID();
-    const seq = seqRef.current + 1;
-    const event = { id: event_id, seq, type, payload: extra };
-    const snapshot = current;
-    const snapshotSeq = seqRef.current;
-    const epoch = epochRef.current;
-    const forceQueue = await hasQueuedForMatch(current.id);
-    try {
-      const optimistic = applyOptimisticScore(current, event);
-      seqRef.current = seq;
-      setMatch(optimistic.match);
+      await engine?.archiveLane(matchId);
+      lane.reset(Number(baseRef.current?.match?.score_state?.lastSeq || 0));
+      await refreshLocal();
       setError("");
-    } catch (err) {
-      setError(err.message || "Could not apply that score locally");
-      return;
-    }
-    setPending((n) => {
-      const next = n + 1;
-      pendingRef.current = next;
-      return next;
-    });
-    try {
-      const body = await sendCommandDurable({
-        store: outboxRef.current,
-        commandUrl: cfg.commandUrl,
-        accessToken: session.access_token,
-        publishableKey: cfg.publishableKey,
-        type: "score_event",
-        commandId: event_id,
-        payload: { match_id: current.id, event_id, seq, type, payload: extra },
-        forceQueue,
-      });
-      if (epochRef.current !== epoch) return;
-      if (body.queued) { setSyncStatus((s) => (s === "stuck" ? s : "offline")); await refreshPendingSync(); return; }
-      if (body.result) applyResult(body.result);
-    } catch (err) {
-      // A real server rejection (not a network failure — sendCommandDurable
-      // already queued and returned normally for those) means this point is
-      // genuinely invalid against the authoritative match state, so the
-      // optimistic tap must be rolled back rather than left showing.
-      epochRef.current += 1;
-      seqRef.current = snapshotSeq;
-      setMatch(snapshot);
-      setError(err.message || "Score was not saved. Showing the official score.");
-      await load();
     } finally {
-      setPending((n) => {
-        const next = Math.max(0, n - 1);
-        pendingRef.current = next;
-        return next;
-      });
+      setResolving(false);
+      setConfirmKeepServer(false);
     }
   }
 
+  async function applyLocalAsCorrection(correctionPayload) {
+    const serverMatch = baseRef.current?.match;
+    if (!serverMatch || !engine) throw new Error("Match not ready");
+    await engine.archiveLane(matchId);
+    lane.reset(Number(serverMatch.score_state?.lastSeq || 0));
+    const res = await lane.enqueue("correction", correctionPayload, {
+      validate: (payload) => {
+        const next = applyEntryToMatch(serverMatch, { type: "score_event", payload });
+        return { result: scoreSummary(next.score_state) };
+      },
+    });
+    await refreshLocal();
+    if (!res.accepted) throw new Error(res.error?.message || "Could not save the correction");
+    engine.kick();
+    return res;
+  }
+
+  if (!hydrated && !match) {
+    return (
+      <div className="ump-shell ump-desk">
+        <div className="ump-top"><LoadingState label="Loading match" /></div>
+      </div>
+    );
+  }
   if (loadError && !match) {
     return (
       <div className="ump-shell ump-desk">
@@ -1071,6 +1352,18 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
   const completed = match.status === "completed";
   const showToss = (match.status === "assigned" || match.status === "in_progress" || match.status === "ready") && !completed;
 
+  const inConflict = Boolean(view && (view.conflicts.length > 0 || view.blocked.length > 0));
+  const conflictEntries = view ? [...view.conflicts, ...view.blocked] : [];
+  const conflictReason = view?.conflicts[0]?.lastError?.message
+    || (view?.blocked.length ? "The score on the server changed while this device was offline (another device or the organizer scored this match)." : "");
+  const localResult = [...conflictEntries].reverse().find((e) => e.local?.result)?.local?.result || null;
+  const serverScore = base?.match?.score_state || {};
+  const pendingHere = view ? view.pending.length : 0;
+  const offlineNow = Boolean(syncStatus?.offline) || (typeof navigator !== "undefined" && navigator.onLine === false);
+  const canReapply = Boolean(localResult) && (localResult.bestOf || 1) <= 1
+    && ["in_progress", "completed"].includes(base?.match?.status);
+  const actionsLocked = laneBusy || inConflict;
+
   return (
     <div className="ump-shell ump-desk">
       <header className="ump-top">
@@ -1110,20 +1403,21 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
             <>
               <div className="game">Game {score.gameNumber || 1}</div>
               <StatusBadge status={match.status} />
-              {pending > 0 ? <div className="ump-sync"><span className="ump-sync-dot" aria-hidden="true" /> Saving…</div> : null}
-              {syncStatus === "stuck" ? (
+              {laneBusy ? <div className="ump-sync"><span className="ump-sync-dot" aria-hidden="true" /> Saving…</div> : null}
+              {inConflict ? (
                 <div className="ump-sync ump-sync-offline">
                   <span className="ump-sync-dot" aria-hidden="true" /> Sync conflict — action needed
                 </div>
-              ) : syncStatus === "offline" && pendingSync > 0 ? (
+              ) : pendingHere > 0 ? (
                 <div className="ump-sync ump-sync-offline">
-                  <span className="ump-sync-dot" aria-hidden="true" /> OFFLINE — {pendingSync} score{pendingSync === 1 ? "" : "s"} saved on this device
+                  <span className="ump-sync-dot" aria-hidden="true" />{" "}
+                  {syncStatus?.needsAuth
+                    ? `SAVED ON THIS DEVICE — ${pendingHere} waiting for sign-in`
+                    : offlineNow
+                      ? `OFFLINE — ${pendingHere} saved on this device`
+                      : `SYNCING — ${pendingHere} saved on this device`}
                 </div>
-              ) : syncStatus === "syncing" ? (
-                <div className="ump-sync">
-                  <span className="ump-sync-dot" aria-hidden="true" /> SYNCING SCORES…
-                </div>
-              ) : syncStatus === "synced" ? (
+              ) : justSynced ? (
                 <div className="ump-sync">SYNCED</div>
               ) : null}
             </>
@@ -1137,15 +1431,40 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
             )}
           </p>
         )}
+        {pendingHere > 0 && !inConflict && (
+          <p className="muted" style={{ color: "var(--muted-court)", margin: 0 }}>
+            Confirmed by server: {serverScore.scoreA ?? 0}–{serverScore.scoreB ?? 0}. The score above includes {pendingHere} action{pendingHere === 1 ? "" : "s"} saved only on this device.
+            {" "}
+            <Button variant="ghost" className="compact" onClick={() => engine?.kick({ resetBackoff: true })}>Sync now</Button>
+          </p>
+        )}
       </div>
 
       <div className="ump-actions">
         {error && <Alert>{error}</Alert>}
-        {stuckEntry && (
+        {store.durable === false && (
+          <Alert>This device can't store scores offline (browser storage is unavailable). Keep the internet connection on while scoring.</Alert>
+        )}
+        {syncStatus?.needsAuth && pendingHere > 0 && <Alert tone="warn">{syncStatus.needsAuth}</Alert>}
+        {inConflict && (
           <Alert>
-            A locally-saved action could not be synced: {stuckEntry.error?.message || "sync conflict"}. It will keep failing the same way until this is resolved.
-            <div className="row" style={{ marginTop: 8 }}>
-              <Button variant="secondary" onClick={() => setShowStuckConfirm(true)}>Resolve sync conflict</Button>
+            <strong>Sync conflict.</strong> {conflictReason}
+            <div style={{ marginTop: 6 }}>
+              Server score: {serverScore.scoreA ?? 0}–{serverScore.scoreB ?? 0}
+              {localResult ? ` · This device's unsynced score: ${localResult.scoreA}–${localResult.scoreB}` : ""}
+              {` · ${conflictEntries.length} action${conflictEntries.length === 1 ? "" : "s"} kept on this device`}
+            </div>
+            <div className="row" style={{ marginTop: 8, flexWrap: "wrap" }}>
+              {view.conflicts.length > 0 && (
+                <Button variant="secondary" disabled={resolving} onClick={() => engine?.retryLane(matchId)}>Retry sync</Button>
+              )}
+              <Button variant="secondary" disabled={resolving} onClick={() => setConfirmKeepServer(true)}>Keep server score</Button>
+              {canReapply && (
+                <Button variant="secondary" disabled={resolving} onClick={() => setReapplyLocal(localResult)}>Apply this device's score as a correction</Button>
+              )}
+            </div>
+            <div className="muted" style={{ marginTop: 6 }}>
+              Nothing is deleted. You can also leave this for now — the saved actions stay on this device until you choose.
             </div>
           </Alert>
         )}
@@ -1178,7 +1497,11 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
                   disabled={busy}
                   onClick={async () => {
                     setShowScoringConfirm(false);
-                    await command("start_match", { match_id: match.id });
+                    await onlineOnly(
+                      "start_match",
+                      { match_id: match.id },
+                      "You're offline — the match was NOT started. Starting a match needs an internet connection.",
+                    );
                   }}
                 >
                   Start Match
@@ -1193,48 +1516,22 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
             match={match}
             nameA={nameA}
             nameB={nameB}
-            busy={busy}
+            busy={busy || actionsLocked}
             lastSeq={lastSeq}
             onCommit={async (payload) => {
-              if (isCoinTossCommitted(matchRef.current)) return { match: matchRef.current };
-              setBusy(true);
-              setError("");
-              const forceQueue = await hasQueuedForMatch(payload.match_id);
-              try {
-                const body = await sendCommandDurable({
-                  store: outboxRef.current,
-                  commandUrl: cfg.commandUrl,
-                  accessToken: session.access_token,
-                  publishableKey: cfg.publishableKey,
-                  type: "coin_toss",
-                  commandId: payload.event_id,
-                  payload,
-                  forceQueue,
-                });
-                if (body.queued) {
-                  // Same network-drop path as scoring: keep the umpire
-                  // moving instead of reopening the toss form (which would
-                  // invite a resubmission the server would then silently
-                  // ignore, since it only keeps whichever toss it saw
-                  // first). Patch the exact shape readCoinToss()/
-                  // normalizeCoinTossPayload() already interpret — the real
-                  // drained confirmation later overwrites with identical
-                  // data, so there's no visible change when it lands.
-                  const current = matchRef.current;
-                  if (current) setMatch({ ...current, coin_toss: payload, serving_team: payload.serving_team });
-                  setSyncStatus((s) => (s === "stuck" ? s : "offline"));
-                  await refreshPendingSync();
-                  return { match: matchRef.current, queued: true };
-                }
-                if (body.result) applyResult(body.result);
-                return body.result;
-              } catch (err) {
-                setError(err.message);
-                await load();
-                throw err;
-              } finally {
-                setBusy(false);
-              }
+              if (isCoinTossCommitted(match)) return { match };
+              // Same durable path as scoring. The lane allocates the seq and
+              // event id itself; the panel's own seq/event_id are ignored so
+              // there is exactly one seq counter for this match. The saved
+              // toss is shown immediately (readCoinToss() reads this shape).
+              const res = await enqueue("coin_toss", {
+                result: payload.result,
+                winner: payload.winner,
+                serving_team: payload.serving_team,
+                court_side: payload.court_side,
+              });
+              if (!res.accepted) throw new Error(res.error?.message || "Could not save the coin toss");
+              return { queued: true };
             }}
           />
         )}
@@ -1242,18 +1539,18 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         {scoring && !readyToComplete && (
           <>
             <div className="pads">
-              <Button className="point a" disabled={pending > 0} aria-label={`Point ${nameA}`} onClick={() => sendScore("point", { team: "A" })}>
+              <Button className="point a" disabled={actionsLocked} aria-label={`Point ${nameA}`} onClick={() => sendScore("point", { team: "A" })}>
                 Point {nameA}
               </Button>
-              <Button className="point b" disabled={pending > 0} aria-label={`Point ${nameB}`} onClick={() => sendScore("point", { team: "B" })}>
+              <Button className="point b" disabled={actionsLocked} aria-label={`Point ${nameB}`} onClick={() => sendScore("point", { team: "B" })}>
                 Point {nameB}
               </Button>
             </div>
             <div className="row">
-              <Button variant="secondary" disabled={busy || pending > 0} onClick={() => setConfirmUndo(true)}>
+              <Button variant="secondary" disabled={busy || actionsLocked} onClick={() => setConfirmUndo(true)}>
                 Undo last point
               </Button>
-              <Button variant="ghost" className="compact" disabled={pending > 0} onClick={() => setShowEditScore(true)}>
+              <Button variant="ghost" className="compact" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
                 Edit score
               </Button>
             </div>
@@ -1261,7 +1558,7 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
         )}
 
         {readyToComplete && !confirmComplete && (
-          <Button disabled={busy} onClick={() => setConfirmComplete(true)}>Complete match</Button>
+          <Button disabled={busy || actionsLocked} onClick={() => setConfirmComplete(true)}>Complete match</Button>
         )}
 
         {completed && (
@@ -1270,7 +1567,7 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
             <h2>Winner {winnerName}</h2>
             <p>Final score {gamesA} – {gamesB}</p>
             <p className="muted">{score.scoreA ?? 0}–{score.scoreB ?? 0} in the last game</p>
-            <Button variant="ghost" className="compact" onClick={() => setShowEditScore(true)}>
+            <Button variant="ghost" className="compact" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
               Edit score
             </Button>
           </Card>
@@ -1284,6 +1581,30 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
           nameB={nameB}
           sendCorrection={sendCorrection}
           onClose={() => setShowEditScore(false)}
+        />
+      )}
+
+      {reapplyLocal && base?.match && (
+        <EditScoreModal
+          match={base.match}
+          nameA={nameA}
+          nameB={nameB}
+          title="Apply this device's score"
+          initialScoreA={reapplyLocal.scoreA}
+          initialScoreB={reapplyLocal.scoreB}
+          sendCorrection={applyLocalAsCorrection}
+          onClose={() => setReapplyLocal(null)}
+        />
+      )}
+
+      {confirmKeepServer && (
+        <ConfirmDialog
+          title="Keep the server's score?"
+          body={`The server's score (${serverScore.scoreA ?? 0}–${serverScore.scoreB ?? 0}) stays official. The ${conflictEntries.length} unsynced action${conflictEntries.length === 1 ? "" : "s"} saved on this device for this match are moved to this device's archive (kept for 30 days) and are not sent.`}
+          confirmLabel="Keep server score"
+          busy={resolving}
+          onCancel={() => setConfirmKeepServer(false)}
+          onConfirm={keepServerScore}
         />
       )}
 
@@ -1318,7 +1639,7 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
           onCancel={() => setConfirmComplete(false)}
           onConfirm={() => {
             setConfirmComplete(false);
-            command("complete_match", { match_id: match.id });
+            enqueue("complete_match", {});
           }}
         />
       )}
@@ -1332,20 +1653,6 @@ function MatchDesk({ cfg, supabase, session, station, matchId, onBack, onSignOut
           onConfirm={() => {
             setConfirmUndo(false);
             sendScore("undo");
-          }}
-        />
-      )}
-
-      {showStuckConfirm && (
-        <ConfirmDialog
-          title="Resolve sync conflict"
-          body="This device has scores that the server has rejected — usually because this match changed elsewhere while it was offline. Discarding them reloads the official score from the server; any point saved only on this device since the conflict began will need to be re-entered."
-          confirmLabel="Discard local scores and reload"
-          busy={resolvingStuck}
-          onCancel={() => setShowStuckConfirm(false)}
-          onConfirm={async () => {
-            setShowStuckConfirm(false);
-            await resolveStuck();
           }}
         />
       )}
