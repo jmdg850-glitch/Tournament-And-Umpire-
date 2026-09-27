@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, classifySendError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, createSyncEngine, createMatchLane, createUserAuthProvider, reconstructMatchView, laneOf, ownerKey } from "@tournament/client";
+import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, classifySendError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, createSyncEngine, createMatchLane, createUserAuthProvider, reconstructMatchView, laneOf, ownerKey, classifyQueryFailure, applyLoadOutcome, stateFromCache, createDashboardCache } from "@tournament/client";
 import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, stageScoringTarget, validateFinalScore } from "@tournament/engine";
 import { clearStation, parsePairingInput, readStation, writeStation, stationDeviceId, stationTokenExpiresSoon } from "./stationSession.js";
 import PairingScanner from "./PairingScanner.jsx";
@@ -421,6 +421,97 @@ function SyncNotices({ sync, who }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Match lists (MyMatches / CourtQueue): "last known good" data.
+// A failed load never replaces rows the server already returned — only a
+// successful response (even an empty one) changes them. The last good list
+// is also kept per owner in localStorage so a restart can show it offline.
+// ---------------------------------------------------------------------------
+const LIVE_OR_READY = ["in_progress", "assigned", "ready"];
+
+function listCacheKey(owner) {
+  return owner ? `tournament.umpire.dashboard.${owner}` : null;
+}
+
+// Only what the list renders (MatchGroup / participantNameFor).
+function trimListRow(m, courtName) {
+  return {
+    id: m.id,
+    status: m.status,
+    stage_label: m.stage_label ?? null,
+    round: m.round ?? null,
+    bracket_side: m.bracket_side ?? null,
+    courtName: courtName ?? null,
+    score_state: m.score_state && typeof m.score_state === "object"
+      ? { scoreA: m.score_state.scoreA ?? null, scoreB: m.score_state.scoreB ?? null }
+      : null,
+  };
+}
+
+function trimListMeta(sides, participants) {
+  const ids = new Set((sides || []).map((s) => s.participant_id).filter(Boolean));
+  return {
+    sides: (sides || []).map((s) => ({ match_id: s.match_id, slot: s.slot, participant_id: s.participant_id ?? null, team_id: s.team_id ?? null })),
+    participants: (participants || []).filter((p) => ids.has(p.id)).map((p) => ({ id: p.id, display_name: p.display_name })),
+  };
+}
+
+// Makes live/ready matches from a successful list load openable offline even
+// if this device never opened them. Confirmed context only (the store never
+// moves a confirmed score backwards); the command queue is not touched, and
+// `openedAt` is left alone so pruning still favours matches actually opened.
+async function seedMatchContexts(store, owner, matches, sides, participants, courtFor) {
+  if (!store || !owner) return;
+  for (const m of matches || []) {
+    if (!LIVE_OR_READY.includes(m.status)) continue;
+    const existing = await store.getMatch(m.id);
+    if (existing && existing.owner !== owner) continue; // another account's context on this device
+    const record = matchContextRecord({
+      owner,
+      match: m,
+      sides: (sides || []).filter((s) => s.match_id === m.id),
+      participants,
+      court: courtFor(m.id),
+    });
+    delete record.openedAt;
+    await store.putMatch(record);
+  }
+}
+
+// Non-destructive status for a list. Network trouble says "offline —
+// showing saved data"; auth/permission/app errors say what they are.
+function ListStatusBanner({ state, onRetry, noun }) {
+  const { status, error, lastUpdatedAt, rows } = state;
+  const hasData = Array.isArray(rows);
+  const when = lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString() : null;
+  const saved = hasData ? ` Showing saved data${when ? ` (last updated ${when})` : ""}.` : "";
+  let tone = "warn";
+  let text = null;
+  if (status === "offline") {
+    text = hasData
+      ? `Offline — showing saved data${when ? ` (last updated ${when})` : ""}. Matches saved on this device can still be opened and scored; everything syncs when you're back online.`
+      : `Offline — ${noun} can't be loaded right now. Matches saved on this device are listed below.`;
+  } else if (status === "server") {
+    text = `The server isn't responding right now (${error}).${saved} It will refresh automatically.`;
+  } else if (status === "auth") {
+    tone = "error";
+    text = `Your sign-in needs to be renewed (${error}).${hasData ? " The list below may be out of date." : ""}`;
+  } else if (status === "forbidden") {
+    tone = "error";
+    text = `The server refused access (${error}).${hasData ? " The list below may be out of date." : ""}`;
+  } else if (status === "error") {
+    tone = "error";
+    text = `Couldn't load ${noun} (${error}).${hasData ? " The list below may be out of date." : ""}`;
+  }
+  if (!text) return null;
+  return (
+    <>
+      <Alert tone={tone}>{text}</Alert>
+      <Button onClick={onRetry}>Retry</Button>
+    </>
+  );
+}
+
 // Matches this device can reopen with no network (confirmed context on disk).
 function SavedMatches({ sync, onOpen, showAll }) {
   const [rows, setRows] = useState([]);
@@ -654,23 +745,33 @@ function groupMatches(rows) {
 }
 
 function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
-  const [rows, setRows] = useState(null);
-  const [meta, setMeta] = useState({ courts: [], sides: [], participants: [] });
-  const [error, setError] = useState("");
+  const owner = ownerKey("user", session.user.id);
+  const cache = useMemo(() => createDashboardCache(listCacheKey(owner)), [owner]);
+  // Starts from the last good list saved on this device (instant, works
+  // offline), then refreshes from the server.
+  const [list, setList] = useState(() => stateFromCache(cache.read()));
   const [query, setQuery] = useState("");
   const [showAllDone, setShowAllDone] = useState(false);
+  const rows = list.rows;
+  const meta = list.meta || { sides: [], participants: [] };
+  const store = sync?.store;
 
   const load = useCallback(async () => {
-    const { data: assigned, error: e1 } = await supabase
+    // A failed query only records WHY it failed; rows already on screen stay.
+    const fail = (res) => {
+      setList((prev) => applyLoadOutcome(prev, { ok: false, kind: classifyQueryFailure(res), message: res.error?.message || res.message }));
+    };
+    const assigned = await supabase
       .from("umpire_assignments")
       .select("*")
       .eq("user_id", session.user.id);
-    if (e1) { setError(e1.message); setRows(null); return; }
-    const ids = (assigned || []).map((a) => a.match_id);
+    if (assigned.error) return fail(assigned);
+    const ids = (assigned.data || []).map((a) => a.match_id);
     if (!ids.length) {
-      setError("");
-      setRows([]);
-      setMeta({ courts: [], sides: [], participants: [] });
+      // The server positively answered "no assignments" — a real empty list.
+      const snapshot = { rows: [], meta: { sides: [], participants: [] } };
+      cache.write(snapshot);
+      setList((prev) => applyLoadOutcome(prev, { ok: true, ...snapshot }));
       return;
     }
     const [matches, courtsA, sides, courts, participants] = await Promise.all([
@@ -680,24 +781,33 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
       supabase.from("courts").select("*"),
       supabase.from("participants").select("*"),
     ]);
-    const first = [matches, courtsA, sides].find((x) => x.error);
-    if (first?.error) { setError(first.error.message); setRows(null); return; }
-    setError("");
+    const firstFailure = [matches, courtsA, sides].find((x) => x.error);
+    if (firstFailure) return fail(firstFailure);
     const courtByMatch = Object.fromEntries((courtsA.data || []).map((a) => [a.match_id, a.court_id]));
-    const courtName = Object.fromEntries((courts.data || []).map((c) => [c.id, c.name]));
-    setRows((matches.data || []).map((m) => ({ ...m, courtName: courtName[courtByMatch[m.id]] || null })));
-    setMeta({ sides: sides.data || [], participants: participants.data || [] });
-  }, [supabase, session.user.id]);
+    const courtById = Object.fromEntries((courts.data || []).map((c) => [c.id, c]));
+    const courtFor = (matchId) => courtById[courtByMatch[matchId]] || null;
+    const snapshot = {
+      rows: (matches.data || []).map((m) => trimListRow(m, courtFor(m.id)?.name)),
+      meta: trimListMeta(sides.data, participants.data),
+    };
+    cache.write(snapshot);
+    setList((prev) => applyLoadOutcome(prev, { ok: true, ...snapshot }));
+    seedMatchContexts(store, owner, matches.data, sides.data, participants.data, courtFor).catch(() => {});
+  }, [supabase, session.user.id, cache, store, owner]);
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
     function onVis() {
       if (document.visibilityState === "visible") load();
     }
+    // Reload when the device says it's back online. `navigator.onLine` is
+    // never trusted as proof of connectivity — only the request result is.
     window.addEventListener("focus", load);
+    window.addEventListener("online", load);
     document.addEventListener("visibilitychange", onVis);
     return () => {
       window.removeEventListener("focus", load);
+      window.removeEventListener("online", load);
       document.removeEventListener("visibilitychange", onVis);
     };
   }, [load]);
@@ -736,14 +846,9 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
       </header>
       <div className="ump-list">
         <SyncNotices sync={sync} who={session.user.email} />
-        {error && (
-          <>
-            <Alert>Couldn't load your assigned matches ({error}). If you're offline, matches saved on this device are listed below and can still be scored; they sync when you're back online.</Alert>
-            <Button onClick={load}>Retry</Button>
-          </>
-        )}
-        <SavedMatches sync={sync} onOpen={onOpen} showAll={Boolean(error)} />
-        {rows === null && !error && <LoadingState label="Loading assignments" />}
+        <ListStatusBanner state={list} onRetry={load} noun="your assigned matches" />
+        <SavedMatches sync={sync} onOpen={onOpen} showAll={list.status !== "online" && list.status !== "loading"} />
+        {rows === null && list.status === "loading" && <LoadingState label="Loading assignments" />}
         {rows?.length === 0 && <EmptyState title="No assigned matches">When an organizer assigns you, matches appear here.</EmptyState>}
         {rows?.length > 0 && (
           <Input label="Search matches" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Court, player, status" />
@@ -819,14 +924,19 @@ function MatchGroup({ title, rows, onOpen, nameFor }) {
 }
 
 function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
-  const [rows, setRows] = useState(null);
-  const [meta, setMeta] = useState({ sides: [], participants: [] });
-  const [error, setError] = useState("");
-  const [offline, setOffline] = useState(false);
+  const owner = sync?.owner;
+  const store = sync?.store;
+  const cache = useMemo(() => createDashboardCache(listCacheKey(owner)), [owner]);
+  // Last good court list from this device (instant, works offline) — only a
+  // successful station_sync replaces it.
+  const [list, setList] = useState(() => stateFromCache(cache.read()));
+  const [revoked, setRevoked] = useState("");
   const [court, setCourt] = useState(station.court || null);
   const stationRef = useRef(station);
   stationRef.current = station;
   const getAuth = sync.getAuth;
+  const rows = list.rows;
+  const meta = list.meta || { sides: [], participants: [] };
 
   const load = useCallback(async () => {
     try {
@@ -835,10 +945,15 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
       const body = await liveCommand({ cfg, getAuth, type: "station_sync", payload: {} });
       const result = body.result;
       setCourt(result.court);
-      setRows((result.matches || []).map((m) => ({ ...m, courtName: result.court?.name || null })));
-      setMeta({ sides: result.sides || [], participants: result.participants || [] });
-      setError("");
-      setOffline(false);
+      const courtFor = () => result.court || null;
+      const snapshot = {
+        rows: (result.matches || []).map((m) => trimListRow(m, result.court?.name)),
+        meta: trimListMeta(result.sides, result.participants),
+      };
+      cache.write(snapshot);
+      setList((prev) => applyLoadOutcome(prev, { ok: true, ...snapshot }));
+      setRevoked("");
+      seedMatchContexts(store, owner, result.matches, result.sides, result.participants, courtFor).catch(() => {});
       if (result.court) {
         const next = { ...readStation(), court: result.court };
         writeStation(next);
@@ -850,19 +965,15 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
         }
       }
     } catch (err) {
-      if (isNetworkError(err)) {
-        // Keep whatever list is already on screen; saved matches below stay usable.
-        setOffline(true);
-        setError("");
+      if (isStationInactiveError(err)) {
+        // A real answer, not an outage: this pairing is no longer valid.
+        setRevoked("This court station was revoked. Pair again with a new QR.");
         return;
       }
-      setOffline(false);
-      setError(isStationInactiveError(err)
-        ? "This court station was revoked. Pair again with a new QR."
-        : err.message);
-      setRows(null);
+      // Network / server / other failures keep the list already on screen.
+      setList((prev) => applyLoadOutcome(prev, { ok: false, kind: classifyQueryFailure(err), message: err.message }));
     }
-  }, [cfg, getAuth, setStation]);
+  }, [cfg, getAuth, setStation, cache, store, owner]);
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
@@ -870,15 +981,18 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
       if (document.visibilityState === "visible") load();
     }
     window.addEventListener("focus", load);
+    window.addEventListener("online", load);
     document.addEventListener("visibilitychange", onVis);
     return () => {
       window.removeEventListener("focus", load);
+      window.removeEventListener("online", load);
       document.removeEventListener("visibilitychange", onVis);
     };
   }, [load]);
 
   const nameFor = (id, slot) => participantNameFor(meta.sides, meta.participants, id, slot);
-  const grouped = rows ? groupMatches(rows) : null;
+  // A revoked pairing can't open these matches any more — don't list them.
+  const grouped = rows && !revoked ? groupMatches(rows) : null;
 
   return (
     <div className="ump-shell">
@@ -895,23 +1009,17 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
       </header>
       <div className="ump-list">
         <SyncNotices sync={sync} who={`this court (${court?.name || "paired device"})`} />
-        {offline && (
+        {revoked ? (
           <>
-            <Alert tone="warn">You're offline — this court's match list can't be refreshed. Matches saved on this device are listed below and can still be scored; they sync when you're back online.</Alert>
-            <Button onClick={load}>Retry</Button>
+            <Alert>{revoked}</Alert>
+            <Button onClick={onUnpair}>Pair again</Button>
           </>
+        ) : (
+          <ListStatusBanner state={list} onRetry={load} noun="this court's matches" />
         )}
-        {error && (
-          <>
-            <Alert>{error}</Alert>
-            {/revoked/i.test(error)
-              ? <Button onClick={onUnpair}>Pair again</Button>
-              : <Button onClick={load}>Retry</Button>}
-          </>
-        )}
-        <SavedMatches sync={sync} onOpen={onOpen} showAll={offline || Boolean(error)} />
-        {rows === null && !error && !offline && <LoadingState label="Loading court" />}
-        {rows?.length === 0 && <EmptyState title="No matches on this court">When an organizer assigns a match here, it appears without a new QR scan.</EmptyState>}
+        <SavedMatches sync={sync} onOpen={onOpen} showAll={Boolean(revoked) || (list.status !== "online" && list.status !== "loading")} />
+        {rows === null && list.status === "loading" && !revoked && <LoadingState label="Loading court" />}
+        {!revoked && rows?.length === 0 && <EmptyState title="No matches on this court">When an organizer assigns a match here, it appears without a new QR scan.</EmptyState>}
         {grouped && (
           <>
             <MatchGroup title="Live now" rows={grouped.live} onOpen={onOpen} nameFor={nameFor} />

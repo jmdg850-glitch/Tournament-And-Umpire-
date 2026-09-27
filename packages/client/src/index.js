@@ -4,6 +4,7 @@ export { isNetworkError, classifySendError, createMemoryStore, createIndexedDBSt
 export { readMatchSnapshot, writeMatchSnapshot, clearMatchSnapshot } from "./matchSnapshot.js";
 export { createMatchLane, reconstructMatchView, laneOf, sortLaneEntries } from "./matchLane.js";
 export { createSyncEngine, createStorageLease, DEFAULT_BACKOFF_MS } from "./syncEngine.js";
+export { classifyQueryFailure, applyLoadOutcome, stateFromCache, createDashboardCache, INITIAL_LOAD_STATE } from "./lastKnownGood.js";
 
 // fetch with an optional hard deadline. A timeout rejects with an error that
 // has NO `.status` (so isNetworkError() treats it as "never answered"), plus
