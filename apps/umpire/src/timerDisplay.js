@@ -30,6 +30,17 @@ export function markLocalCompletion(prev, next, entry) {
   return at ? { ...next, localCompletedAt: at } : next;
 }
 
+// The assigned umpire may set up the game time only before the match has ever
+// started (same rule as set_match_timer on the server, which is what actually
+// enforces it). A resumed match keeps its banked time, so started_at rules it
+// out; court stations never get timer control.
+const UMPIRE_TIMER_SETUP_STATUSES = new Set(["scheduled", "assigned", "ready"]);
+
+export function canUmpireSetGameTime(match, { station = false } = {}) {
+  if (station || !match) return false;
+  return UMPIRE_TIMER_SETUP_STATUSES.has(match.status) && !match.started_at;
+}
+
 export function timerDisplayMatch(match) {
   if (!match || match.status !== "in_progress" || !match.localCompletedAt) return match;
   return { ...match, status: "completed", completed_at: match.localCompletedAt };

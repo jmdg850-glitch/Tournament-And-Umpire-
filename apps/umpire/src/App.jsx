@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, classifySendError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, createSyncEngine, createMatchLane, createUserAuthProvider, reconstructMatchView, laneOf, ownerKey, classifyQueryFailure, applyLoadOutcome, stateFromCache, createDashboardCache, probeIdentity, rememberVerified, forgetVerified, sessionGate, startIdentity } from "@tournament/client";
-import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, stageScoringTarget, validateFinalScore, timerView, formatClock } from "@tournament/engine";
+import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, stageScoringTarget, validateFinalScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
 import { clearStation, parsePairingInput, readStation, writeStation, stationDeviceId, stationTokenExpiresSoon } from "./stationSession.js";
-import { markLocalCompletion, timerDisplayMatch } from "./timerDisplay.js";
+import { canUmpireSetGameTime, markLocalCompletion, timerDisplayMatch } from "./timerDisplay.js";
 import PairingScanner from "./PairingScanner.jsx";
 import CoinTossPanel from "./CoinTossPanel.jsx";
 import {
@@ -1021,6 +1021,58 @@ function MatchGameTimer({ match, onExpire }) {
   return <GameTimer view={view} clock={formatClock(view.remainingMs)} />;
 }
 
+// Game-time setup for the assigned umpire, before the match has ever started.
+// Online only (set_match_timer is authorized and validated on the server);
+// setting a time never starts the countdown — start_match does.
+function GameTimeModal({ match, busy, onClose, onSend }) {
+  const configured = timerView(match, Date.now());
+  const hasTimer = configured.state === "configured";
+  const [minutes, setMinutes] = useState(hasTimer ? String(Math.round(configured.durationSec / 60)) : "10");
+  const [error, setError] = useState("");
+  const minMin = MIN_GAME_TIME_SEC / 60;
+  const maxMin = MAX_GAME_TIME_SEC / 60;
+
+  async function submit(payload) {
+    setError("");
+    if (await onSend(payload)) onClose();
+  }
+
+  function submitSet() {
+    const n = Number(minutes);
+    if (!/^\d+$/.test(minutes.trim()) || !Number.isInteger(n) || n < minMin || n > maxMin) {
+      setError(`Enter whole minutes from ${minMin} to ${maxMin}.`);
+      return;
+    }
+    submit({ action: "set", duration_seconds: n * 60 });
+  }
+
+  return (
+    <Modal title="Game time" onClose={() => !busy && onClose()}>
+      <div className="stack">
+        <p className="muted" style={{ margin: 0 }}>
+          {hasTimer ? `Currently ${Math.round(configured.durationSec / 60)} minutes.` : "No game time is set for this match."}
+        </p>
+        <Input
+          label="Game time (minutes)"
+          inputMode="numeric"
+          value={minutes}
+          onChange={(e) => setMinutes(e.target.value.replace(/[^0-9]/g, "").slice(0, 3))}
+          hint="The countdown starts when the match is started, not now."
+          disabled={busy}
+        />
+        {error && <Alert>{error}</Alert>}
+        <div className="row" style={{ justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+          <Button variant="ghost" disabled={busy} onClick={onClose}>Cancel</Button>
+          {hasTimer && (
+            <Button variant="secondary" disabled={busy} onClick={() => submit({ action: "clear" })}>Remove</Button>
+          )}
+          <Button disabled={busy} onClick={submitSet}>{busy ? "Saving…" : "Set game time"}</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function knownScoringTarget(match) {
   const started = Number(match?.score_state?.winTo);
   if (Number.isInteger(started) && started > 0) return started;
@@ -1288,6 +1340,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [showEditScore, setShowEditScore] = useState(false);
   const [showScoringConfirm, setShowScoringConfirm] = useState(false);
+  const [showGameTime, setShowGameTime] = useState(false);
   const [showHold, setShowHold] = useState(false);
   const [holdReason, setHoldReason] = useState("");
   const [holding, setHolding] = useState(false);
@@ -1729,6 +1782,27 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
           >
             Start match
           </Button>
+        )}
+
+        {canUmpireSetGameTime(match, { station: Boolean(station) }) && (
+          <Button variant="secondary" disabled={busy} onClick={() => setShowGameTime(true)}>
+            {timerView(match, Date.now()).state === "configured"
+              ? `Game time: ${Math.round(timerView(match, Date.now()).durationSec / 60)} min`
+              : "Set game time"}
+          </Button>
+        )}
+
+        {showGameTime && canUmpireSetGameTime(match, { station: Boolean(station) }) && (
+          <GameTimeModal
+            match={match}
+            busy={busy}
+            onClose={() => setShowGameTime(false)}
+            onSend={(payload) => onlineOnly(
+              "set_match_timer",
+              { match_id: match.id, ...payload },
+              "You're offline — the game time was NOT changed. Changing it needs an internet connection.",
+            )}
+          />
         )}
 
         {showScoringConfirm && (

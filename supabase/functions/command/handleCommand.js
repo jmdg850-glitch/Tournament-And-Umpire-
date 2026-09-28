@@ -3435,7 +3435,13 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
   requireUserActor(actor);
   const match = await getMatch(admin, payload.match_id);
   const member = await loadMember(admin, match.tournament_id, actor.id);
-  await requireOrganizerLicensed(admin, actor, member);
+  const isOrganizer = Boolean(member) && ["organizer", "admin"].includes(member.role);
+  if (isOrganizer) {
+    await requireOrganizerLicensed(admin, actor, member);
+  } else {
+    const ump = await matchUmpire(admin, match.id);
+    requireScoreAccess(member, ump?.user_id, actor.id);
+  }
   if (!Object.hasOwn(match, "timer")) {
     throw httpError(409, "TIMER_UNAVAILABLE", "Game timer is not available on this server yet");
   }
@@ -3445,6 +3451,9 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
   const current = normalizeTimer(match.timer);
   let timer;
   const started = match.status === "in_progress" || TIMER_SETUP_STATUSES.has(match.status) && Boolean(match.started_at);
+  if (!isOrganizer && (started || action !== "set" && action !== "clear")) {
+    throw httpError(403, "FORBIDDEN", "Once the match has started, only the organizer can change the game timer");
+  }
   if (action === "set" || action === "clear") {
     if (started && (action === "clear" || current)) {
       throw httpError(409, "MATCH_ALREADY_STARTED", "The game has already started. Add or remove time, or reset the timer instead.");

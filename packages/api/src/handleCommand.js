@@ -2155,8 +2155,12 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
   return result;
 }
 
-// Game timer control (Operator). Organizer/admin only, enforced here — umpires
-// get FORBIDDEN, court stations never reach this (not in STATION_COMMANDS).
+// Game timer control. Enforced here, never in the client:
+//   - organizer/admin (licensed): every action below (Operator/SA override);
+//   - the umpire assigned to THIS match: only set/clear before the match has
+//     ever started (game-time setup). Anything once started → FORBIDDEN;
+//   - anyone else (other umpires, members, strangers) → FORBIDDEN; court
+//     stations never reach this (not in STATION_COMMANDS).
 // Only matches.timer changes: status, score, winner and progression are never
 // touched, and the countdown itself only starts in handleStartMatch.
 //   set    { duration_seconds }  before the match has ever started: configure.
@@ -2175,7 +2179,14 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
   requireUserActor(actor);
   const match = await getMatch(admin, payload.match_id);
   const member = await loadMember(admin, match.tournament_id, actor.id);
-  await requireOrganizerLicensed(admin, actor, member);
+  const isOrganizer = Boolean(member) && ["organizer", "admin"].includes(member.role);
+  if (isOrganizer) {
+    await requireOrganizerLicensed(admin, actor, member);
+  } else {
+    // Only this match's assigned umpire; like their own Hold, not license-gated.
+    const ump = await matchUmpire(admin, match.id);
+    requireScoreAccess(member, ump?.user_id, actor.id);
+  }
   if (!Object.hasOwn(match, "timer")) {
     throw httpError(409, "TIMER_UNAVAILABLE", "Game timer is not available on this server yet");
   }
@@ -2185,6 +2196,9 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
   const current = normalizeTimer(match.timer);
   let timer;
   const started = match.status === "in_progress" || (TIMER_SETUP_STATUSES.has(match.status) && Boolean(match.started_at));
+  if (!isOrganizer && (started || (action !== "set" && action !== "clear"))) {
+    throw httpError(403, "FORBIDDEN", "Once the match has started, only the organizer can change the game timer");
+  }
   if (action === "set" || action === "clear") {
     // A started match may only be given a timer it doesn't have yet; one that
     // already has a timer is adjusted or reset, never replaced or removed.

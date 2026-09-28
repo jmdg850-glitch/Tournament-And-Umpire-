@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyOptimisticScore, configureTimer, createInitialScoreState, startTimer, timerView } from "@tournament/engine";
-import { markLocalCompletion, timerDisplayMatch } from "./timerDisplay.js";
+import { canUmpireSetGameTime, markLocalCompletion, timerDisplayMatch } from "./timerDisplay.js";
 
 const T0 = Date.parse("2026-09-28T10:00:00.000Z");
 const SETTINGS = { winTo: 11, winBy: "two", bestOf: 1, isDoubles: false, servingTeam: "A" };
@@ -79,4 +79,22 @@ test("no timer, or no queue timestamp: nothing changes", () => {
   assert.equal(timerView(timerDisplayMatch(match), T0).state, "none");
   const r = applyOptimisticScore(liveMatch(), { id: "x", seq: 1, type: "point", payload: { team: "A" } });
   assert.equal(markLocalCompletion(liveMatch(), r.match, {}).localCompletedAt, undefined);
+});
+
+test("game-time setup is offered only before the match has ever started", () => {
+  for (const status of ["scheduled", "assigned", "ready"]) {
+    assert.equal(canUmpireSetGameTime({ status, started_at: null }), true, status);
+  }
+});
+
+test("no game-time setup once started, after a resume, or when finished", () => {
+  assert.equal(canUmpireSetGameTime({ status: "in_progress", started_at: "2026-09-28T10:00:00.000Z" }), false);
+  assert.equal(canUmpireSetGameTime({ status: "ready", started_at: "2026-09-28T10:00:00.000Z" }), false); // resumed after Hold
+  assert.equal(canUmpireSetGameTime({ status: "postponed", started_at: "2026-09-28T10:00:00.000Z" }), false);
+  assert.equal(canUmpireSetGameTime({ status: "completed", started_at: "2026-09-28T10:00:00.000Z" }), false);
+  assert.equal(canUmpireSetGameTime(null), false);
+});
+
+test("a court station never gets game-time setup", () => {
+  assert.equal(canUmpireSetGameTime({ status: "ready", started_at: null }, { station: true }), false);
 });

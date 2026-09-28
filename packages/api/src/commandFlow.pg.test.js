@@ -350,11 +350,17 @@ describe.skipIf(!PG_BIN)("Phase F end to end — real handleCommand on real Post
     const timerOf = () => JSON.parse(scalar(`select coalesce(timer, 'null'::jsonb) from public.matches where id = '${m}';`));
     await send(createPgAdmin(), ORG, "set_match_timer", { match_id: m, action: "set", duration_seconds: 600 });
     expect(timerOf()).toMatchObject({ v: 1, durationSec: 600, remainingMs: 600000, runningSince: null });
-    const refused = await send(createPgAdmin(), UMP, "set_match_timer", { match_id: m, action: "set", duration_seconds: 60 }).catch((e) => e);
-    expect(refused).toMatchObject({ status: 403, code: "FORBIDDEN" });
+    // The assigned umpire may set up the game time before the start; it still
+    // doesn't start counting.
+    await send(createPgAdmin(), UMP, "set_match_timer", { match_id: m, action: "set", duration_seconds: 600 });
+    expect(timerOf()).toMatchObject({ durationSec: 600, remainingMs: 600000, runningSince: null });
     await send(createPgAdmin(), UMP, "start_match", { match_id: m });
     const startedTimer = timerOf();
     expect(startedTimer.runningSince).toBeTruthy();
+    // Once started, only the organizer may change it.
+    const refused = await send(createPgAdmin(), UMP, "set_match_timer", { match_id: m, action: "adjust", delta_seconds: 60 }).catch((e) => e);
+    expect(refused).toMatchObject({ status: 403, code: "FORBIDDEN" });
+    expect(timerOf()).toEqual(startedTimer);
     // +1 min read the match, then a point commits before it writes: the
     // override is re-run (TC412) and both the point and the added time survive.
     let release;

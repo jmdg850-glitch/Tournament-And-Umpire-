@@ -171,13 +171,79 @@ describe("set_match_timer — before the game starts", () => {
   });
 });
 
-describe("set_match_timer — authorization (server-side)", () => {
-  test("the assigned umpire cannot change the timer", async () => {
+describe("set_match_timer — assigned umpire, before the match starts", () => {
+  const OTHER_UMPIRE = { kind: "user", id: "88888888-8888-4888-8888-888888888888", email: "other.umpire@example.com" };
+  const withOtherUmpire = (admin) => {
+    admin.tables.tournament_members.push({ id: "tm-u2", tournament_id: T, user_id: OTHER_UMPIRE.id, role: "umpire" });
+    return admin;
+  };
+
+  test("sets the game time without starting the countdown; status untouched", async () => {
     const admin = fixture();
-    const err = await fail(setTimer(admin, UMPIRE, 600));
+    await setTimer(admin, UMPIRE, 600);
+    expect(row(admin).timer).toMatchObject({ durationSec: 600, remainingMs: 600000, runningSince: null, updatedBy: UMPIRE.id });
+    expect(row(admin).status).toBe("assigned");
+    advance(3600);
+    expect(timerView(row(admin), Date.now())).toMatchObject({ state: "configured", remainingMs: 600000 });
+  });
+
+  test("can change and remove it before the start; invalid values are rejected", async () => {
+    const admin = fixture();
+    await setTimer(admin, UMPIRE, 600);
+    await setTimer(admin, UMPIRE, 720);
+    expect(row(admin).timer.durationSec).toBe(720);
+    const bad = await fail(setTimer(admin, UMPIRE, 30));
+    expect(bad).toMatchObject({ status: 400, code: "INVALID_GAME_TIME" });
+    await send(admin, UMPIRE, "set_match_timer", { match_id: M, action: "clear" });
+    expect(row(admin).timer).toBeNull();
+  });
+
+  test("the countdown starts only through the real start_match", async () => {
+    const admin = fixture();
+    await setTimer(admin, UMPIRE, 600);
+    advance(120); // setting the time never starts it
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    advance(30);
+    expect(timerView(row(admin), Date.now())).toMatchObject({ state: "running", remainingMs: 570000 });
+  });
+
+  test("an umpire not assigned to this match is rejected", async () => {
+    const admin = withOtherUmpire(fixture());
+    const err = await fail(setTimer(admin, OTHER_UMPIRE, 600));
     expect(err).toMatchObject({ status: 403, code: "FORBIDDEN" });
     expect(row(admin).timer).toBeNull();
   });
+
+  test("once started, the assigned umpire has no override: adjust, reset, set and clear are refused", async () => {
+    const admin = fixture();
+    await setTimer(admin, UMPIRE, 600);
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    const before = row(admin).timer;
+    for (const payload of [
+      { action: "adjust", delta_seconds: 60 },
+      { action: "adjust", delta_seconds: -60 },
+      { action: "reset" },
+      { action: "set", duration_seconds: 900 },
+      { action: "clear" },
+    ]) {
+      const err = await fail(send(admin, UMPIRE, "set_match_timer", { match_id: M, ...payload }));
+      expect(err).toMatchObject({ status: 403, code: "FORBIDDEN" });
+    }
+    expect(row(admin).timer).toEqual(before);
+    // the Operator/SA override is untouched
+    await send(admin, ORGANIZER, "set_match_timer", { match_id: M, action: "adjust", delta_seconds: 60 });
+    expect(row(admin).timer.remainingMs).toBe(660000);
+  });
+
+  test("a completed match stays protected from the umpire", async () => {
+    const admin = fixture({ status: "completed" });
+    const err = await fail(setTimer(admin, UMPIRE, 600));
+    expect(err.status).toBe(409);
+    expect(row(admin).timer).toBeNull();
+  });
+});
+
+describe("set_match_timer — authorization (server-side)", () => {
 
   test("a court station cannot change the timer", async () => {
     const admin = fixture();
