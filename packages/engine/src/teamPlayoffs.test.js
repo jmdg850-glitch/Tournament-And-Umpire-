@@ -447,3 +447,22 @@ describe("qualified pairs -> semifinals (Direct Semifinals, 2 teams x 2)", () =>
     expect(semis(shell).some(m => m.teamAId === m.teamBId)).toBe(true);
   });
 });
+
+describe("generateQualifierBracketShell — 3 qualifiers (regression)", () => {
+  test("the bye semifinal's team is placed in the final, and no unplayable bronze is created", () => {
+    const qualifiers = [q("p1", "t1"), q("p2", "t2"), q("p3", "t3")];
+    const { teamMatchups, pairMatches } = generateQualifierBracketShell(qualifiers, { makeId: idGen() });
+    const semis = teamMatchups.filter((m) => m.stage === "semifinal");
+    const final = teamMatchups.find((m) => m.stage === "final");
+    const bye = semis.find((m) => m.status === "bye");
+    const played = semis.find((m) => m.status !== "bye");
+    expect(bye).toBeTruthy();
+    const byeSlot = bye.nextMatchupSlot;
+    expect(final[`team${byeSlot}Id`]).toBe(bye.winnerTeamId);
+    expect(final[`pair${byeSlot}Id`]).toBeTruthy();
+    expect(final[`team${played.nextMatchupSlot}Id`]).toBe(null);
+    expect(teamMatchups.some((m) => m.stage === "bronze")).toBe(false);
+    expect(semis.every((m) => !m.loserNextMatchupId)).toBe(true);
+    expect(pairMatches.length).toBe(1);
+  });
+});

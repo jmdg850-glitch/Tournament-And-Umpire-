@@ -67,6 +67,7 @@ export function mergeMatchFromResult(current, result) {
   if (src.winner !== undefined) next.winner = src.winner;
   if (src.started_at != null) next.started_at = src.started_at;
   if (src.completed_at != null) next.completed_at = src.completed_at;
+  if (src.timer !== undefined) next.timer = src.timer;
   return next;
 }
 

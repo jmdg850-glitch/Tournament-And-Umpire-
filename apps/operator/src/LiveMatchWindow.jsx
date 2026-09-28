@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, LoadingState, Scoreboard, ServeIndicator, StatusBadge } from "@tournament/ui";
 import { Radio } from "lucide-react";
 import { applyDeskRealtime, applyMatchIfScoped, matchLiveChannelName } from "@tournament/engine";
 import { useRealtimeChannel } from "./useRealtimeChannel.js";
 import { courtFor, sideOf } from "./lib.js";
+import { keepFresherMatch } from "./offlineData.js";
+import { MatchTimerClock } from "./screens/MatchesPanel.jsx";
 
 export default function LiveMatchWindow({ supabase, session, tournamentId, matchId }) {
   const [match, setMatch] = useState(null);
@@ -18,8 +20,14 @@ export default function LiveMatchWindow({ supabase, session, tournamentId, match
   });
   const [error, setError] = useState("");
 
+  // Loads overlap (subscribe, focus, tab visible): only the latest may apply,
+  // and a server read never replaces a newer score already on screen (a
+  // realtime update can arrive while a slower read is still in flight).
+  const loadSeqRef = useRef(0);
   const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
     const m = await supabase.from("matches").select("*").eq("id", matchId).maybeSingle();
+    if (seq !== loadSeqRef.current) return;
     if (m.error) {
       setError(m.error.message);
       return;
@@ -35,22 +43,23 @@ export default function LiveMatchWindow({ supabase, session, tournamentId, match
       supabase.from("courts").select("*").eq("tournament_id", tournamentId),
       supabase.from("participants").select("*").eq("tournament_id", tournamentId),
     ]);
+    if (seq !== loadSeqRef.current) return;
     const first = [sides, courtsA, courts, participants].find((x) => x.error);
     if (first?.error) {
       setError(first.error.message);
       return;
     }
     setError("");
-    setMatch(m.data);
-    setData({
-      matches: [m.data],
+    setMatch((current) => keepFresherMatch(current, m.data));
+    setData((current) => ({
+      matches: [keepFresherMatch(current.matches?.[0] ?? null, m.data)],
       courts: courts.data || [],
       courtAssignments: courtsA.data || [],
       matchParticipants: sides.data || [],
       participants: participants.data || [],
       teams: [],
       persons: [],
-    });
+    }));
   }, [supabase, matchId, tournamentId]);
 
   useRealtimeChannel({
@@ -142,6 +151,7 @@ export default function LiveMatchWindow({ supabase, session, tournamentId, match
         center={(
           <>
             <div className="game">Game {score.gameNumber || 1}</div>
+            <MatchTimerClock match={match} />
             <div className="muted">{match.stage_label ? String(match.stage_label).replaceAll("_", " ") : `Round ${match.round}`}</div>
             {score.winTo ? <div className="muted">Race to {score.winTo}</div> : null}
           </>

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Input, Select, SectionHeader } from "@tournament/ui";
 import { Trash2 } from "lucide-react";
-import { QUALIFICATION_TARGET, PLAYOFF_TARGET } from "@tournament/engine";
+import { QUALIFICATION_TARGET, PLAYOFF_TARGET, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
 import { FORMAT_LABEL } from "../lib.js";
 
 // Scoring is decided by the match's stage and enforced by the engine/API —
@@ -92,6 +92,43 @@ function QualificationFields({ cfg, onChange }) {
         </div>
       </section>
     </>
+  );
+}
+
+// Optional default game time for the division's matches (config.gameTimeSeconds).
+// Applied when a match with no game time of its own is started; a per-match
+// setting (Matches → More → Game timer) takes precedence. Empty = no timer.
+function GameTimeDefault({ division, busy, run }) {
+  const saved = Number.isInteger(division.config?.gameTimeSeconds) ? String(division.config.gameTimeSeconds / 60) : "";
+  const [minutes, setMinutes] = useState(saved);
+  const text = minutes.trim();
+  const n = Number(text);
+  const valid = text === "" || (/^\d+$/.test(text) && n >= MIN_GAME_TIME_SEC / 60 && n <= MAX_GAME_TIME_SEC / 60);
+  return (
+    <form className="division-section" aria-label="Game timer" onSubmit={(e) => {
+      e.preventDefault();
+      if (!valid) return;
+      run("Save game time", "update_division", {
+        division_id: division.id,
+        config: { gameTimeSeconds: text === "" ? null : n * 60 },
+      });
+    }}>
+      <h4 className="division-section-title">Game timer</h4>
+      <div className="division-grid">
+        <Input
+          label="Default game time (minutes)"
+          inputMode="numeric"
+          value={minutes}
+          placeholder="No timer"
+          onChange={(e) => setMinutes(e.target.value.replace(/[^0-9]/g, "").slice(0, 3))}
+          error={valid ? undefined : `Enter whole minutes from ${MIN_GAME_TIME_SEC / 60} to ${MAX_GAME_TIME_SEC / 60}, or leave empty.`}
+          hint="Counts down from when each match starts. Display only — it never ends a match or changes the score."
+        />
+      </div>
+      <div className="division-actions">
+        <Button type="submit" variant="secondary" disabled={!!busy || !valid || text === saved}>Save game time</Button>
+      </div>
+    </form>
   );
 }
 
@@ -206,6 +243,7 @@ export function DivisionsPanel({ data, busy, run }) {
                 </div>
               </form>
             )}
+            <GameTimeDefault division={d} busy={busy} run={run} />
             <div className="division-danger">
               <span className="division-note">Permanently removes this division and its matches.</span>
               <Button

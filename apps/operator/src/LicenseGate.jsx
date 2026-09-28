@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Button, Input, SplashScreen } from "@tournament/ui";
 import AuthLayout from "./AuthLayout.jsx";
-import { callLicense, createLicenseMonitor, rememberActive } from "./license.js";
+import { callLicense, createLicenseMonitor, offlineLicenseError, rememberActive } from "./license.js";
 import { getOperatorDevice } from "./licenseDevice.js";
 
 // After login: is this account's license activated on THIS PC? The server
 // decides. Password reset never touches licenses (they are keyed by email and PC).
-export function useLicense({ commandUrl, publishableKey, session }) {
-  const userId = session?.user?.id ?? null;
+// `userId` may be given without a session: the offline identity (sign-in not
+// verified, no token). Its checks never reach the server — they report
+// "unreachable", so only the existing 7-day offline allowance can apply.
+export function useLicense({ commandUrl, publishableKey, session, userId: identityUserId = null }) {
+  const userId = session?.user?.id ?? identityUserId ?? null;
   const token = session?.access_token ?? null;
   const tokenRef = useRef(token);
   tokenRef.current = token;
@@ -16,6 +19,7 @@ export function useLicense({ commandUrl, publishableKey, session }) {
   const [busy, setBusy] = useState(false);
 
   const call = useCallback(async (action, extra = {}) => {
+    if (!tokenRef.current) throw offlineLicenseError();
     const device = await getOperatorDevice();
     return callLicense({ commandUrl, publishableKey, accessToken: tokenRef.current, action, body: { device, ...extra } });
   }, [commandUrl, publishableKey]);
@@ -42,6 +46,15 @@ export function useLicense({ commandUrl, publishableKey, session }) {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [userId, call]);
+
+  // Offline identity → verified sign-in (same user): check with the server now
+  // instead of waiting for the next periodic check.
+  const hasToken = Boolean(token);
+  const hadTokenRef = useRef(hasToken);
+  useEffect(() => {
+    if (hasToken && !hadTokenRef.current) monitorRef.current?.refresh();
+    hadTokenRef.current = hasToken;
+  }, [hasToken]);
 
   const refresh = useCallback(() => { monitorRef.current?.refresh(); }, []);
   // Called when /command refuses a licensed operation (LICENSE_INVALID/REQUIRED).

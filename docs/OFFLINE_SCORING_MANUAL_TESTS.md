@@ -50,14 +50,25 @@ Record for every row: app version, device model/OS, PASS/FAIL, the server score,
 
 | # | Scenario | Pass criteria |
 |---|---|---|
-| B7 | Offline organizer action (for example, add a player) | The error "You're offline — this change was NOT saved…" is shown; nothing is queued; no "queued" toast |
+| B7 | Offline organizer action (for example, add a player) | The error "Couldn't reach the server — this change was not confirmed…" is shown (or, after about 30 s with no answer, "No response from the server…"); nothing is queued; no "queued" toast |
 | B8 | Old queue from a previous version | Install the previous version, queue a change offline, upgrade, and sign in | A banner offers "Send as <you>" or "Don't send". Nothing is sent until you choose |
 | B9 | Multiple windows | With a banner-confirmed old entry, open Live, Bracket and Match display popouts, then reconnect | Exactly one copy reaches the server (check `command_receipts` / `audit_logs` count = 1) |
 | B10 | Renderer reload / app restart / PC restart with an old entry pending | The entry is still listed; nothing is lost |
 
+### B-3. Operator offline tournament data (Electron)
+
+Prepare: sign in online, open the dashboard, then open the test tournament's desk once and wait a few seconds (this saves it on the PC).
+
+| # | Scenario | Pass criteria |
+|---|---|---|
+| B11 | Disconnect Wi-Fi/Ethernet with the dashboard and desk open; switch windows (focus reloads) | Tournaments, matches, brackets and scores stay on screen. The banner reads "Offline — working from saved tournament data (saved …)". No "Failed to fetch", no blank screen |
+| B12 | Offline, fully quit the Operator; wait **more than 1 hour**; reopen it offline | It opens without the sign-in screen, with the banner "Offline — sign-in not verified…", and shows the saved dashboard and desk. Any change is refused with "…this change was NOT sent" |
+| B13 | Offline, open the Bracket and Match display popouts for the saved tournament | Both render from saved data with the offline banner. A tournament never opened on this PC shows "…isn't saved on this device yet…" instead of spinning |
+| B14 | Reconnect after B12 | Within ~30 s (or right away on reconnect) the banner clears, data refreshes from the server, and changes work again. After **more than 7 days** offline, or after an explicit Sign out, reopening offline shows the sign-in screen (by design) |
+
 ## C. Sign-off
 
 - [ ] All of A1–A20 pass on at least one real Android device (record the model and Android version).
-- [ ] All of B1–B10 pass on a real Windows 10/11 machine.
+- [ ] All of B1–B14 pass on a real Windows 10/11 machine.
 - [ ] Server data checked for every sync row (event counts, no duplicates, no gaps).
 - [ ] Any FAIL is filed with its steps and the `score_events` dump before the release decision.

@@ -462,3 +462,40 @@ describe("applyScoreEvent — correction", () => {
     expect(second.duplicate).toBe(true);
   });
 });
+
+describe("undo after the match-winning point of a best-of-3 (regression)", () => {
+  const bo3 = { ...settings, bestOf: 3 };
+
+  test("rewinds the final game: games and gamesWon go back, and the match can be won again once", () => {
+    let st = createInitialScoreState(bo3);
+    st = pressUntil(st, "a", (s) => s.status === "completed");
+    expect(st.gamesWonA).toBe(2);
+    expect(st.games.length).toBe(2);
+    // Stored score_state round-trips through JSON on the server.
+    st = JSON.parse(JSON.stringify(st));
+    const undone = applyScoreEvent(st, ev("u1", "undo", st.lastSeq + 1)).state;
+    expect(undone.status).toBe("in_progress");
+    expect(undone.winner).toBe(null);
+    expect(undone.gamesWonA).toBe(1);
+    expect(undone.games.length).toBe(1);
+    expect(undone.scoreA).toBe(st.scoreA - 1);
+    const rewon = pressUntil(undone, "a", (s) => s.status === "completed");
+    expect(rewon.gamesWonA).toBe(2);
+    expect(rewon.games.length).toBe(2);
+  });
+
+  test("best-of-1 undo after the win is unchanged", () => {
+    let st = createInitialScoreState(settings);
+    st = pressUntil(st, "a", (s) => s.status === "completed");
+    const undone = applyScoreEvent(st, ev("u1", "undo", st.lastSeq + 1)).state;
+    expect(undone.status).toBe("in_progress");
+    expect(undone.scoreA).toBe(st.scoreA - 1);
+  });
+});
+
+describe("seq must be a positive integer (regression)", () => {
+  test.each([NaN, 1.5, Infinity, "2"])("rejects seq %s as OUT_OF_ORDER", (seq) => {
+    const st = createInitialScoreState(settings);
+    expect(() => applyScoreEvent(st, ev("x", "point", seq, { team: "A" }))).toThrow(expect.objectContaining({ code: "OUT_OF_ORDER" }));
+  });
+});

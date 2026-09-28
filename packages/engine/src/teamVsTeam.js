@@ -1,6 +1,6 @@
 // Team-vs-Team Cross Rotation — pure, no DB.
 
-const defaultId = () => `${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
+import { defaultId } from "./ids.js";
 
 export function rankTeams(teams){
   return [...teams].sort((a,b) => {

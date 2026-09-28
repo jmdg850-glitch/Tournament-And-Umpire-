@@ -1,7 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { handleCommand, resolveActor } from "./handleCommand.js";
+import { errorResponse, handleCommand, resolveActor } from "./handleCommand.js";
 import { handlePairStation } from "./stationAuth.js";
 
 function env(name) {
@@ -37,9 +37,13 @@ export function createApp(options = {}) {
     const header = c.req.header("authorization") || "";
     const jwt = header.replace(/^Bearer\s+/i, "");
     if (!jwt) return c.json({ ok: false, error: { code: "UNAUTHENTICATED", message: "Missing JWT" } }, 401);
+    let commandId = null;
     try {
       const actor = await resolveActor(admin, jwt);
-      const body = await c.req.json();
+      const body = await c.req.json().catch(() => {
+        throw Object.assign(new Error("Request body must be JSON"), { status: 400, code: "INVALID_COMMAND" });
+      });
+      commandId = typeof body?.command_id === "string" ? body.command_id : null;
       const result = await handleCommand({
         admin,
         actor,
@@ -47,8 +51,9 @@ export function createApp(options = {}) {
       });
       return c.json(result);
     } catch (err) {
-      const status = Number(err.status) || 500;
-      return c.json({ ok: false, error: { code: err.code || "INTERNAL", message: err.message } }, status);
+      // Same contract as the Edge Function (supabase/functions/command/index.ts).
+      const { status, body } = errorResponse(err, commandId);
+      return c.json(body, status);
     }
   });
 

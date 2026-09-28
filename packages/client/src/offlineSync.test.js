@@ -9,12 +9,12 @@
 //   - seq <= lastSeq → 409 OUT_OF_ORDER (scoring.js applyScoreEvent)
 // Assertions check the fake SERVER's data (event count, lastSeq, score), not
 // just local UI state.
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { createMemoryStore, enqueueCommand, classifySendError, mergeConfirmedRecord } from "./offlineQueue.js";
 import { createMatchLane, reconstructMatchView } from "./matchLane.js";
 import { createSyncEngine, createStorageLease } from "./syncEngine.js";
 import { sendCommand } from "./index.js";
-import { applyOptimisticScore, createInitialScoreState, mergeMatchFromResult } from "@tournament/engine";
+import { applyOptimisticScore, createInitialScoreState, mergeMatchFromResult, configureTimer, startTimer, pauseTimer, adjustTimer, timerView } from "@tournament/engine";
 
 const SETTINGS = { winTo: 11, winBy: "two", bestOf: 1, isDoubles: false, servingTeam: "A" };
 const USER_A = "user:aaaa";
@@ -57,7 +57,10 @@ function createFakeServer() {
       }
       if (!applied.applied && !applied.duplicate) throw httpError(400, "INVALID_COMMAND");
       m.score_state = applied.state;
-      if (applied.state.status === "completed") m.status = "completed";
+      if (applied.state.status === "completed" && m.status !== "completed") {
+        m.status = "completed";
+        m.completed_at = new Date().toISOString();
+      }
       events.set(event.id, { ...event, match_id: m.id });
       result = { match: structuredClone(m), score_state: m.score_state, duplicate: false };
     } else if (type === "complete_match") {
@@ -558,5 +561,194 @@ describe("identity isolation (sign-out / unpair)", () => {
     await engine.claimUnowned();
     expect(server.eventCount("m1")).toBe(1);
     expect(await store.list()).toHaveLength(0);
+  });
+});
+
+// Game timer + offline (scenarios A–E). The countdown is never sent over the
+// network: every device computes it from the match's saved timer anchor
+// (packages/engine gameTimer.js). These check that offline scoring, queued
+// sync and reconnect never restart, rewind or corrupt that anchor. Start and
+// Hold are online-only commands (umpire App.jsx onlineOnly), so here they are
+// applied on the fake server and reach the device the way load() does: a
+// fetched match row saved with store.putMatch.
+describe("game timer with offline scoring", () => {
+  const T0 = Date.parse("2026-09-28T10:00:00.000Z");
+  const at = (sec) => T0 + sec * 1000;
+  const setClock = (sec) => vi.setSystemTime(at(sec));
+  const TEN_MIN = 600_000;
+
+  function timedMatch() {
+    return { ...startedMatch(), started_at: new Date(T0).toISOString(), completed_at: null, timer: startTimer(configureTimer(600, { now: T0 }), T0) };
+  }
+
+  async function timedSetup() {
+    const store = createMemoryStore();
+    const server = createFakeServer();
+    const match = timedMatch();
+    server.seed(match);
+    await store.putMatch({ matchId: match.id, owner: USER_A, match, sides: [], participants: [], court: null, savedAt: 1 });
+    let online = true;
+    const send = async (req) => {
+      if (!online) throw new TypeError("Failed to fetch");
+      return server.send(req);
+    };
+    return { store, server, match, send, setOnline: (v) => { online = v; } };
+  }
+
+  // What the umpire's load() does on focus / Reload: save the fetched row.
+  async function reload(store, server) {
+    await store.putMatch({ matchId: "m1", owner: USER_A, match: structuredClone(server.match("m1")), savedAt: Date.now() });
+  }
+
+  const shown = async (store) => timerView((await localView(store, "m1")).match, Date.now());
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    setClock(0);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("A: running timer → offline → scoring continues → timer keeps counting → reconnect syncs without restarting it", async () => {
+    const { store, server, match, send, setOnline } = await timedSetup();
+    const anchor = structuredClone(server.match("m1").timer);
+    const lane = laneFor(store, match);
+    const engine = engineFor({ store, send });
+
+    setOnline(false);
+    for (const [sec, team] of [[30, "A"], [75, "A"], [140, "B"]]) {
+      setClock(sec);
+      await scoreOffline(lane, store, "m1", [team]);
+      await engine.kick(); // fails offline, entry kept
+      expect(await shown(store)).toEqual({ state: "running", remainingMs: TEN_MIN - sec * 1000, durationSec: 600 });
+    }
+    expect(server.eventCount("m1")).toBe(0);
+    expect(await store.list()).toHaveLength(3);
+
+    setClock(200);
+    setOnline(true);
+    await engine.kick();
+    await engine.kick(); // a second drain is a no-op
+    expect(await store.list()).toHaveLength(0);
+    expect(server.eventCount("m1")).toBe(3);
+    expect(server.match("m1").timer).toEqual(anchor); // scoring never touches the timer
+    expect(await shown(store)).toEqual({ state: "running", remainingMs: TEN_MIN - 200_000, durationSec: 600 });
+    await reload(store, server);
+    expect((await shown(store)).remainingMs).toBe(TEN_MIN - 200_000);
+  });
+
+  it("B: Hold banks 08:00 → offline → stays 08:00 however long → online Resume/Start continues from 08:00, not 10:00", async () => {
+    const { store, server, setOnline } = await timedSetup();
+    setClock(120);
+    const m = server.match("m1");
+    m.status = "postponed";
+    m.timer = pauseTimer(m.timer, Date.now());
+    await reload(store, server);
+    expect(await shown(store)).toMatchObject({ state: "paused", remainingMs: 480_000 });
+
+    setOnline(false);
+    setClock(120 + 3600);
+    expect(await shown(store)).toMatchObject({ state: "paused", remainingMs: 480_000 });
+
+    // Back online: organizer resumes (ready), umpire starts — both on the server.
+    setOnline(true);
+    m.status = "ready";
+    await reload(store, server);
+    expect(await shown(store)).toMatchObject({ state: "paused", remainingMs: 480_000 });
+    m.status = "in_progress";
+    m.timer = startTimer(m.timer, Date.now());
+    await reload(store, server);
+    setClock(120 + 3600 + 60);
+    expect(await shown(store)).toEqual({ state: "running", remainingMs: 420_000, durationSec: 600 });
+
+    // Repeated Hold/Resume only counts running time.
+    m.status = "postponed";
+    m.timer = pauseTimer(m.timer, Date.now());
+    setClock(120 + 3600 + 60 + 900);
+    m.status = "in_progress";
+    m.timer = startTimer(m.timer, Date.now());
+    await reload(store, server);
+    setClock(120 + 3600 + 60 + 900 + 20);
+    expect((await shown(store)).remainingMs).toBe(400_000);
+  });
+
+  it("C: Operator changes the timer while the umpire is offline → umpire keeps scoring → reconnect picks up the change, with no duplicate events", async () => {
+    const { store, server, match, send, setOnline } = await timedSetup();
+    const lane = laneFor(store, match);
+    const engine = engineFor({ store, send });
+    setOnline(false);
+    setClock(60);
+    await scoreOffline(lane, store, "m1", ["A"]);
+    const m = server.match("m1");
+    m.timer = adjustTimer(m.timer, 60, { now: Date.now(), by: "organizer" }); // +1 min, server only
+    setClock(90);
+    await scoreOffline(lane, store, "m1", ["A"]);
+    // The device hasn't seen the change yet: it keeps counting from its saved anchor.
+    expect((await shown(store)).remainingMs).toBe(510_000);
+
+    setOnline(true);
+    await engine.kick();
+    expect(server.eventCount("m1")).toBe(2);
+    expect((await localView(store, "m1")).match.timer).toEqual(m.timer);
+    expect((await shown(store)).remainingMs).toBe(570_000);
+
+    // A retried command (same command id) is idempotent and adds nothing.
+    await server.send(server.calls[0]);
+    expect(server.eventCount("m1")).toBe(2);
+
+    // A stale older row (lower lastSeq) never rolls the confirmed match back.
+    await store.putMatch({ matchId: "m1", owner: USER_A, match: timedMatch(), savedAt: 0 });
+    expect((await localView(store, "m1")).match.score_state.lastSeq).toBe(2);
+    expect((await shown(store)).remainingMs).toBe(570_000);
+  });
+
+  it("D: timer reaches 00:00 while offline → scoring unaffected → reconnect does not restart it", async () => {
+    const { store, server, match, send, setOnline } = await timedSetup();
+    const anchor = structuredClone(server.match("m1").timer);
+    const lane = laneFor(store, match);
+    const engine = engineFor({ store, send });
+    setOnline(false);
+    setClock(599);
+    expect(await shown(store)).toMatchObject({ state: "running", remainingMs: 1000 });
+    setClock(700);
+    expect(await shown(store)).toMatchObject({ state: "expired", remainingMs: 0 });
+    await scoreOffline(lane, store, "m1", ["A", "B"]);
+    const local = await localView(store, "m1");
+    expect(local.match.status).toBe("in_progress");
+    expect(local.match.score_state.lastSeq).toBe(2);
+
+    setOnline(true);
+    await engine.kick();
+    expect(server.eventCount("m1")).toBe(2);
+    expect(server.match("m1").status).toBe("in_progress");
+    expect(server.match("m1").winner ?? null).toBeNull();
+    expect(server.match("m1").timer).toEqual(anchor);
+    await reload(store, server);
+    setClock(900);
+    expect(await shown(store)).toMatchObject({ state: "expired", remainingMs: 0 });
+  });
+
+  it("E: winning point scored offline → synced later → match completes → timer frozen and never restarts", async () => {
+    const { store, server, match, send, setOnline } = await timedSetup();
+    const lane = laneFor(store, match);
+    const engine = engineFor({ store, send });
+    setOnline(false);
+    setClock(100);
+    // Side-out scoring with A serving: A wins every rally, 11-0.
+    await scoreOffline(lane, store, "m1", Array(11).fill("A"));
+    expect((await localView(store, "m1")).match.score_state.status).toBe("completed");
+
+    setClock(400);
+    setOnline(true);
+    await engine.kick();
+    const done = server.match("m1");
+    expect(done.status).toBe("completed");
+    expect(done.completed_at).toBe(new Date(at(400)).toISOString());
+    await reload(store, server);
+    const frozen = await shown(store);
+    expect(frozen).toEqual({ state: "finished", remainingMs: 200_000, durationSec: 600 });
+    setClock(5000);
+    expect(await shown(store)).toEqual(frozen);
+    await engine.kick();
+    expect(server.eventCount("m1")).toBe(11);
   });
 });

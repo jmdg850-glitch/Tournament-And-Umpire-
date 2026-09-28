@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, createSyncEngine, createUserAuthProvider, ownerKey, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl } from "@tournament/client";
+import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, createSyncEngine, createUserAuthProvider, ownerKey, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, probeIdentity, rememberVerified, forgetVerified, createTournamentRepository, applyLoadOutcome, stateFromCache, sessionGate, startIdentity, INITIAL_LOAD_STATE } from "@tournament/client";
 import { parseBracketHash, parseLiveHash, parseMatchDisplayHash } from "@tournament/engine";
 import {
   Alert,
@@ -33,7 +33,9 @@ import AuthLayout from "./AuthLayout.jsx";
 import AppBrand from "./AppBrand.jsx";
 import AttentionPanel from "./AttentionPanel.jsx";
 import { buildDeskHash, parseDeskHash } from "./deskHash.js";
-import { firstQueryError, isToday } from "./lib.js";
+import { selectAllPages } from "./lib.js";
+import OfflineStatusBanner from "./OfflineStatusBanner.jsx";
+import { commandFailureError, dashboardFromQueries, offlineUnverifiedError } from "./offlineData.js";
 import { version as APP_VERSION } from "../package.json";
 import { LicenseGate, useLicense } from "./LicenseGate.jsx";
 import { ActivationSetup } from "./ActivationSetup.jsx";
@@ -47,7 +49,12 @@ export default function App() {
   const cfg = useConfig();
   const supabase = useMemo(() => createBrowserClient(cfg.url, cfg.publishableKey), [cfg]);
   const [session, setSession] = useState(undefined);
+  const [offlineIdentity, setOfflineIdentity] = useState(null);
   const [error, setError] = useState("");
+  // The app's single local IndexedDB store: the durable outbox plus the
+  // offline tournament packages (snapshots). Shared by every window of this
+  // app; only the main window writes snapshots or syncs.
+  const outbox = useMemo(() => defaultStore("tournament-operator-outbox"), []);
   const [recovering, setRecovering] = useState(() => isRecoveryAuthUrl());
   const [liveRoute, setLiveRoute] = useState(() => parseLiveHash(typeof window === "undefined" ? "" : window.location.hash));
   const [bracketRoute, setBracketRoute] = useState(() => parseBracketHash(typeof window === "undefined" ? "" : window.location.hash));
@@ -70,17 +77,87 @@ export default function App() {
       applyAuthCallback(supabase, url);
       if (isRecoveryAuthUrl(url)) setRecovering(true);
     });
-    supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
+    let cancelled = false;
+    // Cold start: a stored session whose access token expired while the auth
+    // server is unreachable comes back as `null` from getSession(). Before
+    // showing sign-in, probe once: if the server simply can't be reached and
+    // this same account was verified here recently, open its locally saved
+    // data in "offline — sign-in not verified" mode (no token, nothing sent).
+    // startIdentity does this, and reports the saved offline identity after a
+    // short grace period instead of waiting ~25 s for supabase-js to give up
+    // retrying the refresh.
+    let liveSession = false;
+    const stopIdentity = startIdentity(supabase, ({ session: s, offlineIdentity: id, settled }) => {
+      if (cancelled || (!settled && liveSession)) return;
+      setSession(s ?? null);
+      setOfflineIdentity(id ?? null);
+    });
     const { data: sub } = supabase.auth.onAuthStateChange((event, next) => {
-      setSession(next);
+      // INITIAL_SESSION (null) fires before the probe above finishes; only a
+      // real session or an explicit sign-out may change identity from here.
+      if (next) {
+        liveSession = true;
+        setSession(next);
+        setOfflineIdentity(null);
+      } else if (event === "SIGNED_OUT") {
+        setSession(null);
+        setOfflineIdentity(null);
+      }
       if (event === "PASSWORD_RECOVERY") setRecovering(true);
       if (event === "SIGNED_OUT") setRecovering(false);
     });
-    return () => sub.subscription.unsubscribe();
+    return () => {
+      cancelled = true;
+      stopIdentity();
+      sub.subscription.unsubscribe();
+    };
   }, [supabase]);
 
+  // Every server-verified session refreshes this device's offline-identity window.
+  useEffect(() => {
+    if (session?.user?.id) rememberVerified(session.user.id);
+  }, [session]);
+
+  // While working offline-unverified, keep trying to verify the sign-in:
+  // on reconnect and every 30 s (an "online" event alone is unreliable on
+  // Wi-Fi without internet). A server refusal ends offline mode (sign-in).
+  useEffect(() => {
+    if (!offlineIdentity || session) return undefined;
+    let stopped = false;
+    async function recheck() {
+      const probed = await probeIdentity(supabase);
+      if (stopped) return;
+      if (probed.mode === "verified") {
+        setSession(probed.session);
+        setOfflineIdentity(null);
+      } else if (probed.mode === "signed-out") {
+        setOfflineIdentity(null);
+      }
+    }
+    const timer = setInterval(recheck, 30000);
+    window.addEventListener("online", recheck);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      window.removeEventListener("online", recheck);
+    };
+  }, [offlineIdentity, session, supabase]);
+
+  // Who this window shows data for. A verified session, or — offline only —
+  // a display-only account ({ user: { id, email } }, never a token) for the
+  // offline identity. Commands always use the real `session` below.
+  const account = useMemo(() => {
+    if (session?.user) return session;
+    if (offlineIdentity?.userId) return { user: { id: offlineIdentity.userId, email: offlineIdentity.email }, offline: true };
+    return null;
+  }, [session, offlineIdentity]);
+  const repository = useMemo(
+    () => (account?.user?.id ? createTournamentRepository({ store: outbox, owner: ownerKey("user", account.user.id) }) : null),
+    [account?.user?.id, outbox],
+  );
+
   // Licensing: the server decides whether this account's license is activated on this PC.
-  const license = useLicense({ commandUrl: cfg.commandUrl, publishableKey: cfg.publishableKey, session });
+  const license = useLicense({ commandUrl: cfg.commandUrl, publishableKey: cfg.publishableKey, session, userId: account?.user?.id ?? null });
   const reportLicenseDenial = license.reportDenial;
 
   // Operator writes are ONLINE-ONLY: setup/administration commands chain on
@@ -91,7 +168,6 @@ export default function App() {
   // account that created the entries — entries with no recorded owner wait
   // for explicit confirmation (see OperatorSyncBanner).
   const isPopout = Boolean(liveRoute || bracketRoute || matchDisplayRoute);
-  const outbox = useMemo(() => defaultStore("tournament-operator-outbox"), []);
   const operatorOwner = !isPopout && session?.user?.id ? ownerKey("user", session.user.id) : null;
   const [syncEngine, setSyncEngine] = useState(null);
   const [syncStatus, setSyncStatus] = useState(null);
@@ -141,9 +217,16 @@ export default function App() {
   }
 
   // `opts.durable` (still passed by some call sites) is intentionally ignored:
-  // nothing the operator does is presented as "saved offline".
+  // nothing the operator does is presented as "saved offline". One command_id
+  // per logical request, and a hard timeout so a hung request can't spin
+  // forever. A network failure or timeout is reported as NOT CONFIRMED (the
+  // server may or may not have applied it), never as "saved".
   async function sendOperatorCommand(type, payload) {
-    if (!session?.access_token) throw new Error("Not signed in");
+    if (!session?.access_token) {
+      if (offlineIdentity) throw offlineUnverifiedError();
+      throw new Error("Not signed in");
+    }
+    const commandId = crypto.randomUUID();
     try {
       return await sendCommand({
         commandUrl: cfg.commandUrl,
@@ -151,15 +234,26 @@ export default function App() {
         publishableKey: cfg.publishableKey,
         type,
         payload,
+        commandId,
+        timeoutMs: OPERATOR_COMMAND_TIMEOUT_MS,
       });
     } catch (err) {
-      if (isNetworkError(err)) {
-        const offline = new Error("You're offline — this change was NOT saved. Organizer changes need an internet connection; reconnect and try again.", { cause: err });
-        offline.code = "OFFLINE";
-        throw offline;
-      }
+      if (isNetworkError(err)) throw commandFailureError(err, commandId);
       throw err;
     }
+  }
+
+  // Explicit sign-out. Offline, supabase-js can't always clear its stored
+  // session (its refresh fails first), so forgetting the verification stamp
+  // is what guarantees an explicit sign-out is never resumed as an offline
+  // identity on the next start.
+  function signOut() {
+    const uid = account?.user?.id;
+    if (uid) forgetVerified(uid);
+    setOfflineIdentity(null);
+    // Don't open the next account straight into this account's tournament.
+    try { window.history.replaceState(null, "", window.location.pathname + window.location.search); } catch { /* ignore */ }
+    supabase.auth.signOut({ scope: "local" });
   }
 
   useEffect(() => { if (session?.user) rememberHasAccount(); }, [session]);
@@ -186,7 +280,8 @@ export default function App() {
     return (
       <BracketWindow
         supabase={supabase}
-        session={session}
+        session={account}
+        repository={repository}
         tournamentId={bracketRoute.tournamentId}
       />
     );
@@ -195,13 +290,14 @@ export default function App() {
     return (
       <MatchDisplayWindow
         supabase={supabase}
-        session={session}
+        session={account}
+        repository={repository}
         tournamentId={matchDisplayRoute.tournamentId}
         divisionId={matchDisplayRoute.divisionId}
       />
     );
   }
-  if (!session) {
+  if (!account) {
     return (
       <>
         <UpdateBanner />
@@ -209,7 +305,7 @@ export default function App() {
       </>
     );
   }
-  if (recovering) {
+  if (recovering && session) {
     return (
       <>
         <UpdateBanner />
@@ -217,7 +313,7 @@ export default function App() {
           supabase={supabase}
           title="Operator desk"
           onDone={() => setRecovering(false)}
-          onSignOut={() => supabase.auth.signOut({ scope: "local" })}
+          onSignOut={signOut}
         />
       </>
     );
@@ -226,23 +322,28 @@ export default function App() {
   return (
     <ToastProvider>
       <UpdateBanner />
-      <OperatorSyncBanner status={syncStatus} engine={syncEngine} email={session.user?.email} />
+      <OperatorSyncBanner status={syncStatus} engine={syncEngine} email={account.user?.email} />
       <LicenseGate
         license={license}
-        email={session.user?.email}
-        onSignOut={() => supabase.auth.signOut({ scope: "local" })}
+        email={account.user?.email}
+        onSignOut={signOut}
       >
         <SignedIn
+          key={account.user?.id}
           supabase={supabase}
-          session={session}
+          session={account}
+          identityMode={session ? "verified" : "offline-unverified"}
+          repository={repository}
           command={command}
           pendingSync={pendingSync}
-          onSignOut={() => supabase.auth.signOut({ scope: "local" })}
+          onSignOut={signOut}
         />
       </LicenseGate>
     </ToastProvider>
   );
 }
+
+const OPERATOR_COMMAND_TIMEOUT_MS = 30000;
 
 // Visible handling for anything left in the operator outbox by an earlier app
 // version (operator commands are no longer queued). Nothing here deletes
@@ -451,12 +552,17 @@ function RecoveryScreen({ supabase, title, onDone, onSignOut }) {
   );
 }
 
-function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
+function SignedIn({ supabase, session, identityMode, repository, command, pendingSync, onSignOut }) {
   const toast = useToast();
-  const [tournaments, setTournaments] = useState(null);
-  const [metrics, setMetrics] = useState(null);
-  const [recentMatches, setRecentMatches] = useState([]);
-  const [courtDevices, setCourtDevices] = useState([]);
+  // Last-known-good dashboard: a failed load never blanks it; a successful
+  // server answer (even an empty one) replaces it and is saved on this
+  // computer so a restart offline still shows it.
+  const [dash, setDash] = useState(INITIAL_LOAD_STATE);
+  const tournaments = dash.rows;
+  const metrics = dash.meta?.metrics ?? null;
+  const recentMatches = dash.meta?.recentMatches ?? [];
+  const courtDevices = dash.meta?.courtDevices ?? [];
+  const verified = identityMode !== "offline-unverified";
   const [selectedId, setSelectedId] = useState(() => parseDeskHash(typeof window === "undefined" ? "" : window.location.hash)?.tournamentId ?? null);
   const [loadError, setLoadError] = useState("");
   const [creating, setCreating] = useState(false);
@@ -474,44 +580,39 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
     enabled: !selectedId,
   });
 
+  // Saved dashboard first (instant, works offline); the server load replaces it.
+  useEffect(() => {
+    let cancelled = false;
+    repository?.loadDashboard().then((snap) => {
+      if (cancelled || !snap) return;
+      setDash((prev) => (prev.rows ? prev : stateFromCache({ rows: snap.data.rows, meta: snap.data.meta, savedAt: snap.savedAt })));
+    });
+    return () => { cancelled = true; };
+  }, [repository]);
+
   const reloadList = useCallback(async () => {
-    const queries = await Promise.all([
-      supabase.from("tournaments").select("*").order("created_at", { ascending: false }),
-      supabase.from("matches").select("id, status, started_at, completed_at, created_at, tournament_id"),
-      supabase.from("courts").select("id, tournament_id, name"),
-      supabase.from("persons").select("id"),
-      supabase.from("teams").select("id"),
-      supabase.from("umpire_assignments").select("id, user_id, match_id"),
-      supabase.from("court_devices").select("id, status, court_id, tournament_id"),
-    ]);
-    const err = firstQueryError(queries.slice(0, 6));
-    if (err) {
-      setLoadError(err.message);
-      setTournaments(null);
-      setMetrics(null);
+    // Without a verified sign-in, queries would run as an anonymous visitor
+    // and "succeed" with nothing — which must never replace saved data.
+    if (!verified) return;
+    // An expired session makes supabase-js query anonymously (RLS → empty).
+    const gate = await sessionGate(supabase);
+    if (gate) {
+      setDash((prev) => applyLoadOutcome(prev, gate));
       return;
     }
-    const [t, matches, courts, persons, teams, umpires, devices] = queries;
-    setLoadError("");
-    setTournaments(t.data || []);
-    const matchRows = matches.data || [];
-    setRecentMatches(matchRows);
-    setCourtDevices(devices.error ? [] : devices.data || []);
-    setMetrics({
-      tournaments: (t.data || []).length,
-      active: (t.data || []).filter((x) => ["registration", "registration_closed", "ready", "in_progress"].includes(x.status)).length,
-      today: matchRows.filter((m) => isToday(m.started_at || m.created_at)).length,
-      live: matchRows.filter((m) => m.status === "in_progress").length,
-      ready: matchRows.filter((m) => m.status === "ready" || m.status === "assigned").length,
-      scheduled: matchRows.filter((m) => m.status === "scheduled").length,
-      completed: matchRows.filter((m) => m.status === "completed" || m.status === "bye").length,
-      courts: (courts.data || []).length,
-      paired: devices.error ? 0 : (devices.data || []).filter((d) => d.status === "active").length,
-      umpires: new Set((umpires.data || []).map((u) => u.user_id)).size,
-      players: (persons.data || []).length,
-      teams: (teams.data || []).length,
-    });
-  }, [supabase]);
+    const queries = await Promise.all([
+      supabase.from("tournaments").select("*").order("created_at", { ascending: false }),
+      selectAllPages(() => supabase.from("matches").select("id, status, started_at, completed_at, created_at, tournament_id").order("id")),
+      selectAllPages(() => supabase.from("courts").select("id, tournament_id, name").order("id")),
+      selectAllPages(() => supabase.from("persons").select("id").order("id")),
+      selectAllPages(() => supabase.from("teams").select("id").order("id")),
+      selectAllPages(() => supabase.from("umpire_assignments").select("id, user_id, match_id").order("id")),
+      selectAllPages(() => supabase.from("court_devices").select("id, status, court_id, tournament_id").order("id")),
+    ]);
+    const outcome = dashboardFromQueries(queries);
+    setDash((prev) => applyLoadOutcome(prev, outcome));
+    if (outcome.ok) repository?.saveDashboard({ rows: outcome.rows, meta: outcome.meta }, outcome.at);
+  }, [supabase, verified, repository]);
 
   useEffect(() => { reloadList(); }, [reloadList]);
   useEffect(() => {
@@ -603,6 +704,8 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
       <TournamentDesk
         supabase={supabase}
         session={session}
+        identityMode={identityMode}
+        repository={repository}
         command={command}
         pendingSync={pendingSync}
         tournamentId={selectedId}
@@ -685,13 +788,14 @@ function SignedIn({ supabase, session, command, pendingSync, onSignOut }) {
               <Button className="hero-btn-solid" onClick={() => setShowCreate(true)}><Plus size={15} aria-hidden="true" /> New tournament</Button>
             </div>
           </div>
+          <OfflineStatusBanner load={dash} identityMode={identityMode} onRetry={reloadList} />
           {loadError && (
             <div className="stack">
               <Alert>{loadError}</Alert>
               <Button onClick={reloadList}>Retry</Button>
             </div>
           )}
-          {!loadError && tournaments === null && (
+          {!loadError && tournaments === null && dash.status === "loading" && (
             <div className="stack">
               <LoadingState label="Loading dashboard" />
               <Skeleton lines={5} />

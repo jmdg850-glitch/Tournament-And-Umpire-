@@ -273,6 +273,17 @@ function applyCorrection(st, scoreA, scoreB) {
 }
 
 function undoPoint(st) {
+  // Undoing the match-winning point of a best-of-N match: settleScore stored
+  // that final game in `games` and counted it in gamesWon, so take it back out.
+  const lastGame = st.games?.length ? st.games[st.games.length - 1] : null;
+  if (st.status === "completed" && (st.bestOf || 1) > 1 && lastGame && st.history.length) {
+    const prev = st.history[st.history.length - 1];
+    return { ...st, ...prev, history: st.history.slice(0, -1),
+      games: st.games.slice(0, -1),
+      gamesWonA: st.gamesWonA - (lastGame.winner === "A" ? 1 : 0),
+      gamesWonB: st.gamesWonB - (lastGame.winner === "B" ? 1 : 0),
+      status: "in_progress", winner: null };
+  }
   if (st.history.length) {
     const prev = st.history[st.history.length - 1];
     return { ...st, ...prev, history: st.history.slice(0, -1), status: "in_progress", winner: null };
@@ -314,7 +325,7 @@ export function applyScoreEvent(state, event) {
     return { state, applied: false, duplicate: true };
   }
   const lastSeq = state.lastSeq ?? 0;
-  if (typeof event.seq !== "number" || event.seq <= lastSeq) {
+  if (!Number.isSafeInteger(event.seq) || event.seq <= lastSeq) {
     const err = new Error(`Events must be applied in seq order (lastSeq=${lastSeq}, got ${event.seq})`);
     err.code = "OUT_OF_ORDER";
     throw err;

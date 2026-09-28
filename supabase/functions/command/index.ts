@@ -1,5 +1,5 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
-import { handleCommand, resolveActor } from "./handleCommand.js";
+import { errorResponse, handleCommand, resolveActor } from "./handleCommand.js";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -21,6 +21,7 @@ Deno.serve(async (req) => {
   const jwt = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
   if (!jwt) return json({ ok: false, error: { code: "UNAUTHENTICATED", message: "Missing JWT" } }, 401);
 
+  let commandId = null;
   try {
     const url = Deno.env.get("SUPABASE_URL");
     const service = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -28,11 +29,16 @@ Deno.serve(async (req) => {
       auth: { persistSession: false, autoRefreshToken: false },
     });
     const actor = await resolveActor(admin, jwt);
-    const body = await req.json();
+    const body = await req.json().catch(() => {
+      throw Object.assign(new Error("Request body must be JSON"), { status: 400, code: "INVALID_COMMAND" });
+    });
+    commandId = typeof body?.command_id === "string" ? body.command_id : null;
     const result = await handleCommand({ admin, actor, body });
     return json(result);
   } catch (err) {
-    const status = Number(err.status) || 500;
-    return json({ ok: false, error: { code: err.code || "INTERNAL", message: err.message } }, status);
+    // Deliberate API errors keep their code/message; anything else is
+    // reported generically (no database or runtime internals).
+    const { status, body } = errorResponse(err, commandId);
+    return json(body, status);
   }
 });

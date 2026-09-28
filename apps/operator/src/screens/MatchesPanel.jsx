@@ -1,7 +1,7 @@
-import { useState } from "react";
-import { Alert, Badge, Button, Card, Dropdown, EmptyState, Input, Modal, SectionHeader, Select, ServeIndicator, Stat, StatusBadge, Table } from "@tournament/ui";
+import { useRef, useState } from "react";
+import { Alert, Badge, Button, Card, Dropdown, EmptyState, GameTimer, Input, Modal, SectionHeader, Select, ServeIndicator, Stat, StatusBadge, Table, useNow } from "@tournament/ui";
 import { ExternalLink } from "lucide-react";
-import { validateFinalScore } from "@tournament/engine";
+import { validateFinalScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
 import { openLiveMatchWindow, openMatchDisplayWindow } from "../useRealtimeChannel.js";
 import {
   courtFor,
@@ -123,9 +123,120 @@ function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved
   );
 }
 
+// Game timer readout. Its own component so only it re-renders on each tick;
+// the value is always recomputed from the match's persisted timer (the same
+// anchor every device uses), so realtime updates and reloads never restart it.
+export function MatchTimerClock({ match, className }) {
+  const running = timerView(match, Date.now()).state === "running";
+  const now = useNow(running);
+  const view = timerView(match, now);
+  return <GameTimer view={view} clock={formatClock(view.remainingMs)} className={className} />;
+}
+
+// Same rules as the server (set_match_timer): the game time is set before the
+// match has ever started (no started_at); once started — live, held, or
+// resumed after a Hold — it can only be adjusted or reset, so a resumed
+// match keeps its remaining time.
+const TIMER_SETUP_STATUSES = new Set(["scheduled", "ready", "assigned", "postponed"]);
+function matchHasStarted(match) {
+  return match?.status === "in_progress" || (TIMER_SETUP_STATUSES.has(match?.status) && Boolean(match?.started_at));
+}
+export function canControlGameTimer(match) {
+  return match?.status === "in_progress" || TIMER_SETUP_STATUSES.has(match?.status);
+}
+
+// Organizer game-timer control, via the set_match_timer command (authorized
+// on the server — organizer/admin only). Before start: set/clear the game
+// time; the countdown itself only begins when the match is started. Live or
+// on hold: add/remove a minute or reset to the full time. Never changes the
+// score or the match status.
+function GameTimerModal({ match, data, command, onClose, onSaved }) {
+  const a = sideOf(match.id, "A", data);
+  const b = sideOf(match.id, "B", data);
+  const view = timerView(match, Date.now());
+  const hasTimer = view.state !== "none";
+  const started = matchHasStarted(match);
+  const setup = !started && TIMER_SETUP_STATUSES.has(match.status);
+  const live = started && hasTimer;
+  const [minutes, setMinutes] = useState(hasTimer ? String(Math.round(view.durationSec / 60)) : "10");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const minMin = MIN_GAME_TIME_SEC / 60;
+  const maxMin = MAX_GAME_TIME_SEC / 60;
+
+  async function send(payload) {
+    setBusy(true);
+    setError("");
+    try {
+      await command("set_match_timer", { match_id: match.id, ...payload });
+      await onSaved?.();
+      return true;
+    } catch (err) {
+      setError(err.message || "The timer change was not confirmed");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitSet() {
+    const n = Number(minutes);
+    if (!/^\d+$/.test(minutes.trim()) || !Number.isInteger(n) || n < minMin || n > maxMin) {
+      setError(`Enter whole minutes from ${minMin} to ${maxMin}.`);
+      return;
+    }
+    if (await send({ action: "set", duration_seconds: n * 60 })) onClose();
+  }
+
+  return (
+    <Modal title="Game timer" onClose={() => !busy && onClose()}>
+      <div className="stack">
+        <p className="muted" style={{ margin: 0 }}>{a.name} vs {b.name}</p>
+        <MatchTimerClock match={match} />
+        {setup && (
+          <>
+            <Input
+              label="Game time (minutes)"
+              inputMode="numeric"
+              value={minutes}
+              onChange={(e) => setMinutes(e.target.value.replace(/[^0-9]/g, "").slice(0, 3))}
+              hint="The countdown starts when the match is started, not now."
+              disabled={busy}
+            />
+            <div className="row">
+              {hasTimer && (
+                <Button variant="secondary" disabled={busy} onClick={async () => { if (await send({ action: "clear" })) onClose(); }}>
+                  Remove timer
+                </Button>
+              )}
+              <Button disabled={busy} onClick={submitSet}>{busy ? "Saving…" : "Set game time"}</Button>
+            </div>
+          </>
+        )}
+        {live && (
+          <div className="row" style={{ flexWrap: "wrap" }}>
+            <Button variant="secondary" disabled={busy} onClick={() => send({ action: "adjust", delta_seconds: 60 })}>+1 min</Button>
+            <Button variant="secondary" disabled={busy} onClick={() => send({ action: "adjust", delta_seconds: -60 })}>−1 min</Button>
+            <Button variant="secondary" disabled={busy} onClick={() => send({ action: "reset" })}>Reset to {Math.round(view.durationSec / 60)} min</Button>
+          </div>
+        )}
+        {started && !hasTimer && (
+          <p className="muted" style={{ margin: 0 }}>This match has no game timer. A game time can only be set before the match starts.</p>
+        )}
+        {error && <Alert>{error}</Alert>}
+        <div className="row">
+          <Button variant="ghost" onClick={onClose} disabled={busy}>Close</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
   const [editingId, setEditingId] = useState(null);
   const editingMatch = editingId ? matches.find((m) => m.id === editingId) : null;
+  const [timerId, setTimerId] = useState(null);
+  const timerMatch = timerId ? matches.find((m) => m.id === timerId) : null;
   return (
     <div className="live-strip">
       {matches.map((m) => {
@@ -148,6 +259,7 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
               {ump ? ` · ${ump.name}` : ""}
             </div>
             <ServeIndicator state={m.score_state} className="live-tile-serve" />
+            <MatchTimerClock match={m} className="live-tile-timer" />
             {onOpenLiveWindow ? (
               <Button
                 variant="tape"
@@ -167,9 +279,28 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
                 Edit score
               </Button>
             ) : null}
+            {command ? (
+              <Button
+                variant="ghost"
+                className="compact"
+                style={{ marginTop: 2, width: "100%" }}
+                onClick={() => setTimerId(m.id)}
+              >
+                Game timer
+              </Button>
+            ) : null}
           </div>
         );
       })}
+      {timerMatch && (
+        <GameTimerModal
+          match={timerMatch}
+          data={data}
+          command={command}
+          onClose={() => setTimerId(null)}
+          onSaved={load}
+        />
+      )}
       {editingMatch && (
         <EditScoreModal
           match={editingMatch}
@@ -218,6 +349,10 @@ function EditPlayersModal({ match, data, command, onClose, onSaved }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // Kept across a failed save so "Try again" doesn't create the same new
+  // person twice or re-apply a side that already succeeded.
+  const createdPeople = useRef(new Map());
+  const savedSides = useRef(new Map());
 
   function setText(slot, index, value) {
     setReplacementText((prev) => {
@@ -259,6 +394,8 @@ function EditPlayersModal({ match, data, command, onClose, onSaved }) {
       for (const side of sides) {
         const texts = replacementText[side.slot];
         if (!texts.some((t) => t.trim())) continue; // nothing typed on this side — skip entirely
+        const sideKey = JSON.stringify(texts);
+        if (savedSides.current.get(side.slot) === sideKey) continue; // already applied on an earlier attempt
         const personIds = [];
         for (let i = 0; i < side.players.length; i++) {
           const resolved = resolvePersonByName(texts[i], data.persons);
@@ -269,11 +406,18 @@ function EditPlayersModal({ match, data, command, onClose, onSaved }) {
           if (resolved.existingPerson) {
             personIds.push(resolved.existingPerson.id);
           } else {
-            const out = await command("add_person", { tournament_id: data.tournament.id, display_name: resolved.text });
-            personIds.push(out.result.person.id);
+            const key = normalizePersonName(resolved.text);
+            let personId = createdPeople.current.get(key);
+            if (!personId) {
+              const out = await command("add_person", { tournament_id: data.tournament.id, display_name: resolved.text });
+              personId = out.result.person.id;
+              createdPeople.current.set(key, personId);
+            }
+            personIds.push(personId);
           }
         }
         await command("update_match_participant", { match_id: match.id, slot: side.slot, person_ids: personIds });
+        savedSides.current.set(side.slot, sideKey);
       }
       await onSaved?.();
       onClose();
@@ -434,6 +578,8 @@ function MatchTable({ data, rows, busy, run, command, load }) {
   const editingPlayersMatch = editingPlayersId ? rows.find((m) => m.id === editingPlayersId) : null;
   const [overrideStartId, setOverrideStartId] = useState(null);
   const overrideStartMatch = overrideStartId ? rows.find((m) => m.id === overrideStartId) : null;
+  const [timerId, setTimerId] = useState(null);
+  const timerMatch = timerId ? rows.find((m) => m.id === timerId) : null;
   return (
     <>
     <Table
@@ -463,7 +609,7 @@ function MatchTable({ data, rows, busy, run, command, load }) {
             <Select
               label="Assign court"
               hideLabel
-              defaultValue={data.courtAssignments.find((c) => c.match_id === m.id)?.court_id || ""}
+              value={data.courtAssignments.find((c) => c.match_id === m.id)?.court_id || ""}
               disabled={!!busy}
               onChange={(e) => e.target.value && run("Assign court", "assign_court", { match_id: m.id, court_id: e.target.value })}
             >
@@ -479,7 +625,7 @@ function MatchTable({ data, rows, busy, run, command, load }) {
             <Select
               label="Assign umpire"
               hideLabel
-              defaultValue={data.umpireAssignments.find((c) => c.match_id === m.id)?.user_id || ""}
+              value={data.umpireAssignments.find((c) => c.match_id === m.id)?.user_id || ""}
               disabled={!!busy}
               onChange={(e) => e.target.value && run("Assign umpire", "assign_umpire", { match_id: m.id, user_id: e.target.value })}
             >
@@ -496,6 +642,7 @@ function MatchTable({ data, rows, busy, run, command, load }) {
           render: (m) => {
             const canEditPlayers = EDITABLE_PLAYERS_STATUSES.has(m.status);
             const canOverrideStart = ["ready", "assigned"].includes(m.status);
+            const canTimer = canControlGameTimer(m);
             const isHeld = m.status === "postponed";
             return (
               <div className="row" style={{ gap: 6, justifyContent: "flex-end", flexWrap: "nowrap" }}>
@@ -509,11 +656,16 @@ function MatchTable({ data, rows, busy, run, command, load }) {
                     Resume match
                   </Button>
                 )}
-                {(canEditPlayers || canOverrideStart) && (
+                {(canEditPlayers || canOverrideStart || canTimer) && (
                   <Dropdown label="More">
                     {canEditPlayers && (
                       <Button type="button" variant="ghost" style={{ width: "100%", justifyContent: "flex-start" }} onClick={() => setEditingPlayersId(m.id)}>
                         Edit players
+                      </Button>
+                    )}
+                    {canTimer && (
+                      <Button type="button" variant="ghost" style={{ width: "100%", justifyContent: "flex-start" }} onClick={() => setTimerId(m.id)}>
+                        Game timer…
                       </Button>
                     )}
                     {canOverrideStart && (
@@ -548,6 +700,15 @@ function MatchTable({ data, rows, busy, run, command, load }) {
         data={data}
         command={command}
         onClose={() => setEditingPlayersId(null)}
+        onSaved={load}
+      />
+    )}
+    {timerMatch && (
+      <GameTimerModal
+        match={timerMatch}
+        data={data}
+        command={command}
+        onClose={() => setTimerId(null)}
         onSaved={load}
       />
     )}

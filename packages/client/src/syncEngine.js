@@ -1,6 +1,7 @@
 import { sendCommand } from "./index.js";
 import { classifySendError } from "./offlineQueue.js";
 import { laneOf, sortLaneEntries } from "./matchLane.js";
+import { safeStorage as safeLocalStorage } from "./safeStorage.js";
 
 // One sync worker per app/profile. It replays a durable command queue
 // (offlineQueue.js store) in per-match FIFO lanes, always with each entry's
@@ -62,14 +63,6 @@ export function createStorageLease(key, { storage = safeLocalStorage(), ttlMs = 
       }
     },
   };
-}
-
-function safeLocalStorage() {
-  try {
-    return typeof localStorage === "undefined" ? null : localStorage;
-  } catch {
-    return null;
-  }
 }
 
 function randomId() {

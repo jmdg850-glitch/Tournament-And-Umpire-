@@ -32,6 +32,25 @@ export {
 } from "./scoring.js";
 
 export {
+  TIMER_VERSION,
+  MIN_GAME_TIME_SEC,
+  MAX_GAME_TIME_SEC,
+  MAX_ADJUST_SEC,
+  isValidGameTimeSec,
+  isValidTimerAdjustSec,
+  normalizeTimer,
+  timerRemainingMs,
+  configureTimer,
+  timerFromDivisionConfig,
+  startTimer,
+  pauseTimer,
+  adjustTimer,
+  resetTimer,
+  timerView,
+  formatClock,
+} from "./gameTimer.js";
+
+export {
   seedOrder,
   generateBracket,
   advanceBracket,

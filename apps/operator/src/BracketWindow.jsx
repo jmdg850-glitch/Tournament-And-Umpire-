@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Alert, EmptyState, LoadingState } from "@tournament/ui";
 import { Trophy } from "lucide-react";
 import { applyDeskRealtime, deskLiveChannelName } from "@tournament/engine";
 import { useRealtimeChannel } from "./useRealtimeChannel.js";
-import { loadDeskData } from "./lib.js";
+import { useSavedDeskData } from "./useSavedDeskData.js";
+import OfflineStatusBanner from "./OfflineStatusBanner.jsx";
 import { DivisionBracketCard } from "./brackets.jsx";
 
 // A read-only, display-first bracket view opened in its own window (see
@@ -13,24 +14,14 @@ import { DivisionBracketCard } from "./brackets.jsx";
 // bracket rendering (DivisionBracketCard/brackets.jsx) as the operator's own
 // Brackets tab: there is no second copy of bracket business logic here, and
 // this window never sends a command — it only ever reads.
-export default function BracketWindow({ supabase, session, tournamentId }) {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState("");
-
-  const load = useCallback(async () => {
-    const { data: next, error: err } = await loadDeskData(supabase, tournamentId);
-    if (err) {
-      setError(err.message);
-      return;
-    }
-    setError("");
-    setData(next);
-  }, [supabase, tournamentId]);
+export default function BracketWindow({ supabase, session, repository, tournamentId }) {
+  // Falls back to this computer's saved copy of the tournament when offline.
+  const { data, setData, error, load, verified, identityMode, bannerLoad, settled } = useSavedDeskData({ supabase, session, repository, tournamentId });
 
   useRealtimeChannel({
     supabase,
     name: deskLiveChannelName(tournamentId),
-    enabled: Boolean(session && tournamentId),
+    enabled: Boolean(session && tournamentId) && verified,
     specs: [
       { event: "*", schema: "public", table: "matches", filter: `tournament_id=eq.${tournamentId}` },
       { event: "*", schema: "public", table: "match_results" },
@@ -73,7 +64,7 @@ export default function BracketWindow({ supabase, session, tournamentId }) {
   if (!data) {
     return (
       <div className="live-window">
-        <LoadingState label="Loading bracket" />
+        {settled ? <OfflineStatusBanner load={bannerLoad} identityMode={identityMode} onRetry={load} /> : <LoadingState label="Loading bracket" />}
       </div>
     );
   }
@@ -93,6 +84,7 @@ export default function BracketWindow({ supabase, session, tournamentId }) {
         </div>
         <h1>{data.tournament.name}</h1>
       </header>
+      <OfflineStatusBanner load={bannerLoad} identityMode={identityMode} onRetry={load} />
       {error ? <Alert>{error}</Alert> : null}
       {data.divisions.length === 0 ? (
         <EmptyState title="No divisions yet" />

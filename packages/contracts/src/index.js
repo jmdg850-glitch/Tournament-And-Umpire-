@@ -29,6 +29,7 @@ export const COMMAND_TYPES = Object.freeze([
   "coin_toss",
   "score_event",
   "complete_match",
+  "set_match_timer",
 ]);
 
 export const TOURNAMENT_STATUSES = Object.freeze([

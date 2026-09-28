@@ -216,6 +216,13 @@ Event-sourced pickleball **side-out** scoring (not rally scoring). Core reducer:
 
 Every score event has a client-generated UUID (`event_id`) and monotonic `seq`; the server dedupes on `score_events.id` (unique `(match_id, seq)`) and rejects out-of-order `seq` with `OUT_OF_ORDER`. See Umpire Flow above for the full end-to-end write path.
 
+**Game timer** (added 2026-09-28; display only — never changes score/status/winner):
+- Stored in `matches.timer` jsonb (migration `0019_match_timer.sql`, **written locally, NOT applied**). NULL = no timer. Pure logic in `packages/engine/src/gameTimer.js` (`timerView`, `startTimer`, `pauseTimer`, `adjustTimer`, `resetTimer`, `formatClock`).
+- Remaining = `remainingMs − (now − runningSince)`; every client computes it from the same persisted anchor, and it is never decremented locally. Depends on device clocks being roughly correct.
+- The countdown starts only in `handleStartMatch`, using the match timer or else the division default `config.gameTimeSeconds`. A Hold (`transition_match` out of `in_progress`) banks the time; the next `start_match` resumes it. A completed match freezes at `completed_at`.
+- `set_match_timer` (`set`/`clear` only before the match has ever started, i.e. no `started_at`; `adjust`/`reset` once started, including held or resumed-to-`ready`; the division default likewise applies only on the first start) is organizer/admin only (`requireOrganizerLicensed`). Court stations are refused by the `STATION_COMMANDS` whitelist. If the column is missing, it returns 409 `TIMER_UNAVAILABLE`.
+- UI: `GameTimer` + `useNow` (`packages/ui`); umpire scoreboard (`MatchGameTimer`, one re-read at expiry); operator `MatchesPanel` (More → Game timer…, live tiles), `LiveMatchWindow`, `DivisionsPanel` (default). The umpire sees organizer changes on focus/visibility/Reload/own commands/expiry — no realtime, no polling.
+
 ---
 
 # Database Architecture
@@ -276,6 +283,7 @@ Project: **Tournament App** (`evuvgxruavnadpbiehgb`, `ap-southeast-1`). Confirme
 | `0007_official_writes_present_columns.sql` | Bug fix: only write columns actually present in the payload (avoids NULL-overwriting defaults) |
 | `0008_realtime.sql` | Enables Realtime on `matches`/`score_events`/`match_results`/`court_assignments` |
 | `0009_desktop_updates_storage.sql` | Public storage bucket `desktop-updates` for Electron auto-update artifacts |
+| `0019_match_timer.sql` | Nullable `matches.timer` jsonb for the game timer — **local only, not applied** (listed here out of order; 0011–0018 are described elsewhere in this doc) |
 | `0010_profiles_update_grant_revoke.sql` | Security fix: revokes the broad default `UPDATE` grant on `profiles` from `anon`/`authenticated` before re-asserting the intended `display_name`/`updated_at`-only column grant, matching the pattern every other table already used |
 
 **Note on the live migration ledger**: the local `supabase/migrations/` files are squashed/renamed relative to the project's actual 13-entry Supabase migration history (`list_migrations` shows 14 now, including `0010`), which still uses the original timestamp-prefixed version identifiers. CLI tooling (`supabase db push`/`migration list`/`migration repair`) may not recognize these local filenames as already-applied — reconcile before relying on CLI-driven migration workflows for this project.
@@ -300,16 +308,56 @@ Supabase Realtime `postgres_changes` — no custom WebSocket server, no polling 
 
 # Offline Architecture
 
-**A real, durable, IndexedDB-backed offline command queue exists** (`packages/client/src/offlineQueue.js` — `createIndexedDBStore`/`defaultStore`/`sendCommandDurable`/`drainQueue`/`queueSize`/`isNetworkError`), wired into both `apps/umpire/src/App.jsx` and `apps/operator/src/App.jsx`. This is a correction to an earlier version of this document, which — accurately, at the time — described no durable queue exists; that changed shortly afterward and further offline-lifecycle work has continued since.
+(Rewritten 2026-09-28. The earlier text described `sendCommandDurable`/`drainQueue`/`matchSnapshot` as wired into the apps; no app imports them any more — they remain exported and tested only.)
 
-- `sendCommandDurable` is a drop-in replacement for `sendCommand`: on a genuine network failure (`isNetworkError` — no `.status`, meaning the request never reached the server) it persists the command to `store` keyed by its own `command_id` and returns `{ok:true, queued:true}` instead of throwing, so the caller's already-applied optimistic update stays on screen. A real server rejection (has `.status`) is rethrown unchanged, never queued.
-- `drainQueue` replays queued commands FIFO on reconnect (`online` event, a 20s fallback interval, and on mount/focus), reusing each command's original `command_id` so the server's `command_receipts` idempotency guarantees a command already applied before a disconnect is never double-applied. A `WeakSet`-based `inFlight` guard prevents two overlapping drains of the *same client's* outbox (a live browser test caught a real duplicate-write bug here before the guard existed); the analogous cross-tab/cross-device race at the server's read-then-write `command_receipts` check is a known, accepted, out-of-scope gap (see `offlineQueue.js`'s inline comment).
-- `sendScore`/`sendCorrection` (score events) and the coin-toss commit in `apps/umpire/src/App.jsx` all route through this durable path; a `forceQueue` option on `sendCommandDurable` forces a command straight into the queue (skipping the live-send attempt) whenever an earlier command for the same match is still undrained, which keeps a strictly-ordered sequence (like `score_event`'s `seq`) gap-free even on a flaky ("network flapping") connection.
-- **Durable local match/score snapshot**: `packages/client/src/matchSnapshot.js` persists the umpire's currently-open match (including `score_state`/`lastSeq`) to `localStorage`, read synchronously on mount. This is what lets a hard reload while offline still show the correct in-progress score and keep scoring, instead of blocking on the network call `load()` would otherwise need — the queue itself already survived a reload (IndexedDB), but before this addition there was no way to *render* anything until a network round trip succeeded.
-- A genuine server-side conflict a queued command can't recover from automatically (e.g. an organizer's correction changed the match's `seq` baseline while the umpire was offline) surfaces as a `syncStatus === "stuck"` state with an explicit, user-confirmed recovery action (discard this match's queued backlog and reload the authoritative score) — not an automatic merge and not a silent drop.
-- Both apps' outboxes are a single flat, per-device queue (not partitioned per match) — a `mergeMatchFromResult` (`packages/engine/src/optimisticScore.js`) guard ignores a drained result whose match id doesn't match the match currently on screen, so a leftover backlog from a previously-opened match can't corrupt whatever match is open now when it drains in the background.
-- Reconnection recovery: `online`/`offline` window listeners, a 20s fallback interval, drain-on-mount, and an opportunistic drain triggered right after any successful `load()` — no `navigator.onLine` polling, no `@capacitor/network` native plugin (by explicit choice; not verifiable against a real Android device in this environment either way).
-- Tests: `packages/client/src/offlineQueue.test.js` (queue algorithm in isolation), `packages/client/src/matchSnapshot.test.js`, `packages/client/src/offlineScoringLifecycle.test.js` (the real scoring lifecycle — online, offline+reconnect, offline+simulated-reload, network flapping, lost-response/retry, cross-match contamination, and the organizer-correction-vs-offline-queue fork, all headless via dependency-injected `send` mocks), and `packages/api/src/live.test.js`'s `"offline sync — live DB and Realtime verification"` block (real dev-project, DB- and Realtime-verified).
+**Shared, `packages/client/src`:**
+- `offlineQueue.js` — one IndexedDB database per app (`tournament-umpire-outbox`, `tournament-operator-outbox`), **DB v3**, stores:
+  - `commands` — durable outbox; `enqueueCommand` persists **before** anything is shown or sent.
+  - `matches` — the umpire's confirmed match contexts.
+  - `snapshots` (v3) — offline tournament packages; `putSnapshot` only moves forward in `savedAt`.
+  - `ack()` removes a command and records the confirmed state in one transaction. `classifySendError`: no status = network, 401 = auth, 5xx/408/429 = retry, other 4xx = rejected.
+- `matchLane.js` — the only `seq` allocator per match (write-ahead, double-tap guard); `reconstructMatchView` = confirmed state + unsynced entries.
+- `syncEngine.js` — the single sync worker per app (Web Locks, localStorage-lease fallback); per-match FIFO lanes, backoff 2–60 s; 401 refreshes once, then `needsAuth` (never a conflict); other 4xx become a `conflict` that is kept and user-resolved (archived, never deleted).
+- `localRepository.js` — `createTournamentRepository({ store, owner })`: the one place screens save and read offline tournament packages (the `loadDeskData` shape plus the dashboard). Owner-scoped (`user:<id>`); `sanitizeDeskData` drops `court_devices.refresh_token_hash` before anything is written to disk.
+- `offlineIdentity.js` — offline identity. On a cold start with the auth server unreachable, supabase-js returns `session: null` once the access token has expired, even though the session is still stored. `probeIdentity` then allows **"offline — sign-in not verified"** only if **all** of these hold:
+  - a session for that user is still stored;
+  - the refresh failed as **network**, not a server refusal;
+  - the user was verified on this device within **7 days** (`tournament.identity.lastVerified.<uid>`);
+  - the clock was not rolled back.
+
+  It never yields a token. An explicit sign-out calls `forgetVerified`, which is required because supabase-js can fail to clear its stored session while offline.
+- `lastKnownGood.js` — `classifyQueryFailure`, `applyLoadOutcome` (a failed load never replaces data), and `deriveConnectionState` (user-facing offline/stale labels, never a raw "Failed to fetch").
+
+**Umpire:**
+- Scoring, undo, correction, coin toss and complete all go through the lane, then the engine; the durable queue survives close, force-stop and restart.
+- Lists never blank (localStorage dashboard cache).
+- Start match and hold are still **online-only**.
+- Offline identity is **not wired yet** (roadmap Phase D).
+
+**Operator:**
+- The dashboard, the desk and the Bracket/Match-display popouts render from the saved package when offline, with a staleness banner; the main window is the only writer of packages.
+- In offline-unverified mode no query is made at all: it would run as `anon` and "succeed" empty. Auto-`generate_team_playoffs` runs only on server-confirmed data.
+- Operator **writes remain online-only**. They use a 30 s timeout and one `command_id` per request; failures read "not confirmed", never "not saved".
+- The license gate treats offline identity as unreachable, so only the existing 7-day allowance applies.
+
+**Known limits and roadmap:**
+- A venue with no internet has no device-to-device path. Operator decisions and bracket advancement reach umpires only after sync; a LAN hub would be a separate architectural decision.
+- Backend hardening (Phase F) is **implemented, bundled and tested locally, but NOT deployed and NOT yet verified on a hosted Supabase**. Production runs the old behaviour until migration `0018_atomic_command_idempotency.sql` is applied and the `command` Edge Function (bundle already regenerated) is deployed — both need explicit approval, after a staging run.
+  - **Atomic idempotency:** `apply_official_writes` claims the `command_receipts` row first (insert-only). A duplicate raises `TC001` and the whole batch rolls back; the API then replays the winner's receipt.
+  - **Fingerprinted receipts:** `command_receipts.request_hash` stores a fingerprint of the request (canonical JSON of type + payload). The same `command_id` with a different request, or from a different actor, gets 409 `IDEMPOTENCY_KEY_REUSED`.
+  - **Match version checks:** every rewrite of an existing `matches` row in `transition_match`, `start_match`, `coin_toss`, `score_event`, `complete_match`, `assign_court`/`assign_umpire` (match row only) and bracket/team progression (`finishMatchIfWon`, including `applyIndividualPatch`) sends `expect` (the `updated_at` it read). Checked rows are locked in id order. A concurrent change raises `TC412` and the API re-runs the command up to 3 times, then answers 503.
+  - **Client preconditions:** `payload.precondition = { match_updated_at }` is accepted **only** for `transition_match`, `start_match`, `coin_toss`, `score_event`, `complete_match`; anywhere else (or malformed) it is refused with 400, never silently ignored. Stale → 409 `STALE_STATE` with `current_revision` (API timestamp format).
+  - **Error mapping:** write errors are classified by SQLSTATE (`packages/api/src/writes.js` `writeError`). A unique violation is 409 and never a retryable 500; a `(match_id, seq)` clash is reported as `OUT_OF_ORDER`. Database text is never returned to clients.
+  - **Bundle:** `supabase/functions/command/handleCommand.js` is regenerated from source; `commandBundle.test.js` fails if it ever drifts (rebuilds with `npx --no-install esbuild`, skipped where esbuild isn't cached) and runs the Phase F contract through the bundle itself.
+  - **Tests:** `commandIdempotency.test.js` (handler level), `commandHttpContract.test.js` (HTTP layer + real supabase-js), `commandBundle.test.js`, and the real-PostgreSQL suites `commandIdempotency.pg.test.js` and `commandFlow.pg.test.js` (the real `handleCommand` on real Postgres with forced interleavings) — the `.pg` suites run when `LOCAL_PG_BIN` is set.
+  - **Still excluded from offline writes:** `court_assignments`, `umpire_assignments`, courts, divisions, tournament settings (no version checks).
+- Remaining phases: D (umpire offline identity, offline start match, friendly errors), E (conditionally-offline operator match-day writes, which need Phase F deployed first), G (real-device testing), H (release).
+
+**Tests:**
+- `packages/client/src/{offlineSync,offlineIdentity,localRepository,lastKnownGood,offlineQueue,offlineScoringLifecycle,matchSnapshot}.test.js`
+- `apps/operator/src/offlineData.test.js`
+- The IndexedDB v2 → v3 upgrade was verified once in real Chromium (queued command and match record kept, snapshot restored after reopen, no secret on disk, other owner isolated).
+- Real devices: `docs/OFFLINE_SCORING_MANUAL_TESTS.md` (A1–A20, B1–B14), **not yet run**.
 
 ---
 

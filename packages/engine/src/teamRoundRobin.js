@@ -3,7 +3,7 @@
 import { rankTeams, buildPairMatchesForMatchup } from "./teamVsTeam.js";
 import { generateRoundRobinSchedule } from "./roundRobin.js";
 
-const defaultId = () => `${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
+import { defaultId } from "./ids.js";
 
 function stableTiebreak(idA, idB){
   const hash = s => { let h=0; for (let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))|0; return h; };
@@ -119,12 +119,6 @@ export function isTeamRoundRobinComplete(teamMatchups){
   return rows.length > 0 && rows.every(m => m.status === "completed");
 }
 
-function stablePairTiebreak(idA, idB){
-  const hash = s => { let h=0; for (let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))|0; return h; };
-  const parity = hash([idA,idB].sort().join("|")) % 2 === 0 ? -1 : 1;
-  return idA < idB ? parity : -parity;
-}
-
 export function rankIndividualPairsForSemifinals(teams, teamMatchups, pairMatches){
   const roundRobinMatchupIds = new Set((teamMatchups||[]).filter(m => m.stage === "round_robin").map(m => m.id));
   const completed = (pairMatches||[]).filter(m => m.status === "completed" && roundRobinMatchupIds.has(m.teamMatchupId));
@@ -155,7 +149,7 @@ export function rankIndividualPairsForSemifinals(teams, teamMatchups, pairMatche
     if (x.losses !== y.losses) return x.losses - y.losses;
     if (y.pointDiff !== x.pointDiff) return y.pointDiff - x.pointDiff;
     if (y.pointsFor !== x.pointsFor) return y.pointsFor - x.pointsFor;
-    return stablePairTiebreak(x.registrationId, y.registrationId);
+    return stableTiebreak(x.registrationId, y.registrationId);
   });
 
   // Rows equal on every official criterion were only separated by the stable

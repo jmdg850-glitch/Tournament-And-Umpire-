@@ -25,9 +25,21 @@ import {
   generateQualifierBracketShell,
   assignedPersonIds,
   validatePersonIdsForAssignment,
+  MIN_GAME_TIME_SEC,
+  MAX_GAME_TIME_SEC,
+  MAX_ADJUST_SEC,
+  isValidGameTimeSec,
+  isValidTimerAdjustSec,
+  normalizeTimer,
+  configureTimer,
+  timerFromDivisionConfig,
+  startTimer,
+  pauseTimer,
+  adjustTimer,
+  resetTimer,
 } from "@tournament/engine";
 import { parseCommandEnvelope, isUuid } from "@tournament/contracts";
-import { applyBatch, createBatch, httpError, nowIso, uuid } from "./writes.js";
+import { applyBatch, createBatch, httpError, isUniqueViolation, nowIso, uuid } from "./writes.js";
 import { ensureUniqueSlug } from "./slug.js";
 import {
   loadMember,
@@ -57,6 +69,15 @@ const KNOCKOUT_STAGE_UNIQUE_INDEX = "stages_one_team_knockout_per_division_uidx"
 // silently turned into some other number.
 function isValidQualifierCount(value) {
   return typeof value === "number" && Number.isInteger(value) && value >= 1;
+}
+
+// Optional division default game time. null clears it; anything else present
+// must be a valid whole number of seconds.
+function assertGameTimeConfig(config) {
+  if (!config || !Object.hasOwn(config, "gameTimeSeconds") || config.gameTimeSeconds === null) return;
+  if (!isValidGameTimeSec(config.gameTimeSeconds)) {
+    throw httpError(400, "INVALID_GAME_TIME", `Game time must be a whole number of seconds from ${MIN_GAME_TIME_SEC} to ${MAX_GAME_TIME_SEC}`);
+  }
 }
 
 function assertTeamQualificationConfig(config) {
@@ -111,12 +132,22 @@ async function matchScoringSettings(admin, division, match) {
   return { ...scoringSettings(division.config), winTo: matchScoringTarget(match, related), winBy: SCORING_WIN_BY };
 }
 
-async function commit(admin, batch, { command_id, type, actorId, actorDeviceId, tournamentId, matchId, result, detail }) {
+// One transaction (apply_official_writes): the receipt claim, the optional
+// version checks and every domain write commit together or not at all.
+async function commit(admin, batch, { command_id, type, request_hash, precondition, actorId, actorDeviceId, tournamentId, matchId, result, detail }) {
+  // Client-supplied "I last saw this version of the match" (optional; used by
+  // future offline writes; validated in handleCommand). Stale → 409
+  // STALE_STATE, nothing written. Never silently dropped.
+  if (precondition) {
+    if (!matchId) throw httpError(500, "INTERNAL", "precondition could not be applied");
+    batch.preconditionMatch(matchId, precondition.match_updated_at);
+  }
   batch.upsert("command_receipts", {
     id: command_id,
     actor_id: actorDeviceId ? null : actorId,
     actor_device_id: actorDeviceId || null,
     command_type: type,
+    ...(request_hash ? { request_hash } : {}),
     result,
     created_at: nowIso(),
   });
@@ -242,23 +273,31 @@ async function existingReceipt(admin, command_id) {
   return data;
 }
 
+// A malformed id makes Postgres refuse the query (22P02 invalid uuid). That is
+// the caller's mistake, not a server failure — a 500 here would be retried
+// by clients forever.
+function lookupError(error, what) {
+  if (error?.code === "22P02") return httpError(400, "INVALID_COMMAND", `${what} must be a UUID`);
+  return error;
+}
+
 async function getTournament(admin, id) {
   const { data, error } = await admin.from("tournaments").select("*").eq("id", id).maybeSingle();
-  if (error) throw error;
+  if (error) throw lookupError(error, "tournament_id");
   if (!data) throw httpError(404, "NOT_FOUND", "Tournament not found");
   return data;
 }
 
 async function getDivision(admin, id) {
   const { data, error } = await admin.from("divisions").select("*").eq("id", id).maybeSingle();
-  if (error) throw error;
+  if (error) throw lookupError(error, "division_id");
   if (!data) throw httpError(404, "NOT_FOUND", "Division not found");
   return data;
 }
 
 async function getMatch(admin, id) {
   const { data, error } = await admin.from("matches").select("*").eq("id", id).maybeSingle();
-  if (error) throw error;
+  if (error) throw lookupError(error, "match_id");
   if (!data) throw httpError(404, "NOT_FOUND", "Match not found");
   return data;
 }
@@ -397,7 +436,13 @@ function upsertMatchupSlot(batch, muSides, matchupId, slot, participantId, teamI
 function applyIndividualPatch(batch, matchups, muSides, adv) {
   if (!adv) return;
   const next = (matchups || []).find((m) => m.id === adv.matchupId);
-  if (next) persistMatch(batch, { ...next, status: next.status === "bye" ? "bye" : "scheduled" });
+  if (next) {
+    // Rewrites the whole next-matchup row read earlier in this request: it
+    // must still be that version (e.g. two semifinals finishing at once both
+    // advance into the same final). A race re-runs the command on fresh state.
+    batch.expectMatch(next);
+    persistMatch(batch, { ...next, status: next.status === "bye" ? "bye" : "scheduled" });
+  }
   if (Object.hasOwn(adv.patch, "pairAId") || Object.hasOwn(adv.patch, "teamAId")) {
     upsertMatchupSlot(batch, muSides, adv.matchupId, "A", adv.patch.pairAId, adv.patch.teamAId);
   }
@@ -543,6 +588,7 @@ async function finishMatchIfWon(admin, batch, match, scoreState, actorId) {
     if (patch) {
       const next = (all || []).find((m) => m.id === patch.matchId);
       if (next) {
+        batch.expectMatch(next);
         persistMatch(batch, { ...next });
         if (patch.patch.registrationAId) {
           const row = (allSides || []).find((x) => x.match_id === patch.matchId && x.slot === "A");
@@ -563,9 +609,6 @@ async function finishMatchIfWon(admin, batch, match, scoreState, actorId) {
             participant_id: patch.patch.registrationBId,
             team_id: row?.team_id ?? null,
           });
-        }
-        if (patch.patch.status) {
-          persistMatch(batch, { ...next, status: next.status === "bye" ? next.status : next.status });
         }
       }
       progressed = { next: patch };
@@ -619,6 +662,14 @@ async function finishMatchIfWon(admin, batch, match, scoreState, actorId) {
       },
       pairMatches,
     );
+    // Always version-check (and touch) the parent matchup, even when this win
+    // doesn't decide it: two pair matches finishing at the same moment would
+    // otherwise each see the other still in progress, neither would finalize
+    // the matchup, and it would never complete. Touching the parent makes the
+    // second request fail its check (STALE_WRITE) and re-run against the
+    // first one's committed result.
+    batch.expectMatch(parent);
+    if (!finalized) persistMatch(batch, { ...parent });
     if (finalized) {
       persistMatch(batch, {
         ...parent,
@@ -765,6 +816,7 @@ async function handleCreateDivision(admin, actor, payload, envelope) {
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
   const format = payload.format || "single_elim";
   const config = { ...(payload.config || { bestOf: 1, winBy: "none", isDoubles: true }) };
+  assertGameTimeConfig(config);
   if (format === "team_elimination") {
     assertTeamQualificationConfig(config);
     if (config.sameTeamPolicy == null) config.sameTeamPolicy = "avoid_semis";
@@ -796,6 +848,7 @@ async function handleUpdateDivision(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
   await requireOrganizerLicensed(admin, actor, member);
+  if (payload.config != null) assertGameTimeConfig(payload.config);
   const next = {
     ...division,
     name: payload.name != null ? String(payload.name).trim() : division.name,
@@ -923,6 +976,12 @@ async function handleCreateTeam(admin, actor, payload, envelope) {
   await requireOrganizerLicensed(admin, actor, member);
   const name = String(payload.name || "").trim();
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
+  if (payload.division_id) {
+    const division = await getDivision(admin, payload.division_id);
+    if (division.tournament_id !== tournament.id) {
+      throw httpError(400, "INVALID_COMMAND", "Division does not belong to this tournament");
+    }
+  }
   const team = {
     id: uuid(),
     tournament_id: tournament.id,
@@ -989,7 +1048,7 @@ async function handleAddTeamMember(admin, actor, payload, envelope) {
       result: { team_member: row },
     });
   } catch (err) {
-    if (/unique|duplicate/i.test(String(err.message))) {
+    if (isUniqueViolation(err)) {
       throw httpError(409, "DUPLICATE_MEMBER", "Player is already on this team");
     }
     throw err;
@@ -1127,6 +1186,15 @@ async function handleUpdateMatchParticipant(admin, actor, payload, envelope) {
 
   if (!MATCH_PARTICIPANT_EDITABLE_STATUSES.has(match.status)) {
     throw httpError(409, "MATCH_NOT_EDITABLE", "Players can only be changed before the match starts");
+  }
+  // A team playoff pair match must carry exactly the pairs its matchup slot
+  // holds (assertMatchPlayable), so repointing only this match would leave it
+  // permanently unplayable.
+  if (match.parent_match_id) {
+    const parent = await getMatch(admin, match.parent_match_id);
+    if (parent.stage_label && parent.stage_label !== "round_robin") {
+      throw httpError(409, "MATCH_LOCKED_BY_TEAM_MATCHUP", "Players in a team playoff match come from its bracket slot and can't be changed here");
+    }
   }
 
   const { data: mp } = await admin.from("match_participants").select("*").eq("match_id", match.id).eq("slot", slot).maybeSingle();
@@ -1300,6 +1368,10 @@ async function handleCreateCourt(admin, actor, payload, envelope) {
   });
 }
 
+function sameUuid(a, b) {
+  return typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
+}
+
 async function handleAddMember(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
@@ -1307,10 +1379,13 @@ async function handleAddMember(admin, actor, payload, envelope) {
   if (!["admin", "umpire", "viewer"].includes(payload.role)) {
     throw httpError(400, "INVALID_COMMAND", "role must be admin, umpire, or viewer");
   }
-  if (payload.user_id === actor.id && payload.role !== "organizer") {
-    // Organizer may not change their own role through this command.
-  }
   if (!isUuid(payload.user_id)) throw httpError(400, "INVALID_COMMAND", "user_id must be a UUID");
+  // No one may change their own role here, and the organizer's role can't be
+  // changed at all: add_member can't grant "organizer" back, so a demotion
+  // would be permanent.
+  // Postgres compares UUIDs case-insensitively, so these checks must too — an
+  // upper-cased id would otherwise slip past them and still match the row.
+  if (sameUuid(payload.user_id, actor.id)) throw httpError(403, "FORBIDDEN", "You can't change your own role");
   await requireProfile(admin, payload.user_id);
   const { data: existing } = await admin
     .from("tournament_members")
@@ -1318,6 +1393,9 @@ async function handleAddMember(admin, actor, payload, envelope) {
     .eq("tournament_id", tournament.id)
     .eq("user_id", payload.user_id)
     .maybeSingle();
+  if (existing?.role === "organizer" || sameUuid(payload.user_id, tournament.owner_id)) {
+    throw httpError(403, "FORBIDDEN", "The tournament organizer's role can't be changed");
+  }
   const row = {
     id: existing?.id || uuid(),
     tournament_id: tournament.id,
@@ -1339,6 +1417,9 @@ async function handleGenerateBracket(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
   await requireOrganizerLicensed(admin, actor, member);
+  if (division.format === "team_elimination") {
+    throw httpError(400, "INVALID_COMMAND", "Team elimination divisions use generate_team_elimination");
+  }
   const { data: existingMatches } = await admin.from("matches").select("id").eq("division_id", division.id).limit(1);
   if (existingMatches?.length) throw httpError(409, "BRACKET_EXISTS", "Division already has matches");
   const { data: participants, error } = await admin
@@ -1420,6 +1501,9 @@ async function handleGenerateTeamElimination(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
   await requireOrganizerLicensed(admin, actor, member);
+  if (division.format !== "team_elimination") {
+    throw httpError(400, "INVALID_COMMAND", "Division is not team elimination");
+  }
   const { data: existingMatches } = await admin.from("matches").select("id").eq("division_id", division.id).limit(1);
   if (existingMatches?.length) throw httpError(409, "BRACKET_EXISTS", "Division already has matches");
   const { data: teams } = await admin.from("teams").select("*").eq("division_id", division.id);
@@ -1598,7 +1682,7 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
     // and this write. The one-knockout-stage-per-division unique index
     // (migration 0017) rejected this whole batch atomically — no stage, no
     // matches were written — so report it like the sequential case.
-    if (String(err?.message || "").includes(KNOCKOUT_STAGE_UNIQUE_INDEX)) {
+    if (err?.constraint === KNOCKOUT_STAGE_UNIQUE_INDEX) {
       throw httpError(409, "PLAYOFFS_EXIST", "Knockout stage already generated");
     }
     throw err;
@@ -1633,6 +1717,7 @@ async function handleAssignCourt(admin, actor, payload, envelope) {
   });
   if (match.status === "scheduled") {
     assertTransitionMatch(match.status, "ready");
+    batch.expectMatch(match);
     persistMatch(batch, { ...match, status: "ready" });
   }
   return commit(admin, batch, {
@@ -1665,6 +1750,7 @@ async function handleAssignUmpire(admin, actor, payload, envelope) {
   if (match.status === "ready" || match.status === "scheduled") {
     assertTransitionMatch(match.status, "assigned");
     status = "assigned";
+    batch.expectMatch(match);
     persistMatch(batch, { ...match, status });
   }
   return commit(admin, batch, {
@@ -1693,20 +1779,33 @@ async function handleTransitionMatch(admin, actor, payload, envelope) {
     const ump = await matchUmpire(admin, match.id);
     requireScoreAccess(member, ump?.user_id, actor.id);
   }
+  // Starting and completing a match have their own commands, which set up the
+  // score, record the winner/result and advance the bracket. A bare status
+  // change would skip all of that.
+  if (payload.status === "completed" || payload.status === "in_progress") {
+    throw httpError(409, "ILLEGAL_TRANSITION", `Use ${payload.status === "completed" ? "complete_match" : "start_match"} to move a match to ${payload.status}`);
+  }
   try {
     assertTransitionMatch(match.status, payload.status);
   } catch (err) {
     throw httpError(409, err.code || "ILLEGAL_TRANSITION", err.message);
   }
   const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  const next = { ...match, status: payload.status };
+  // Leaving play (Hold / abandon) pauses the game timer: the time left is
+  // banked so start_match resumes from it. No timer → the row is untouched.
+  if (match.status === "in_progress" && normalizeTimer(match.timer)) {
+    next.timer = pauseTimer(match.timer, nowIso());
+  }
   const batch = createBatch();
-  persistMatch(batch, { ...match, status: payload.status });
+  batch.expectMatch(match);
+  persistMatch(batch, next);
   return commit(admin, batch, {
     ...envelope,
     actorId: actor.id,
     tournamentId: match.tournament_id,
     matchId: match.id,
-    result: { match: { ...match, status: payload.status } },
+    result: { match: next },
     detail: reason ? { ok: true, transition: { match_id: match.id, from: match.status, to: payload.status, reason } } : undefined,
   });
 }
@@ -1740,8 +1839,21 @@ async function handleStartMatch(admin, actor, payload, envelope) {
   // accepted but ignored: the target is always derived from the stage.
   const settings = await matchScoringSettings(admin, division, match);
   const score_state = scoreStateForMatchStart(match, settings);
-  const next = { ...match, status: "in_progress", started_at: nowIso(), score_state };
+  const started_at = nowIso();
+  const next = { ...match, status: "in_progress", started_at, score_state };
+  // The game timer starts here — the one real transition into in_progress —
+  // and nowhere else. A match timer (possibly paused by a Hold) wins over the
+  // division default. No timer, or a database without the column (migration
+  // 0019 not applied): the match is started exactly as before.
+  // The division default is only for the match's FIRST start (no started_at
+  // yet): a restart after Hold never gains a fresh timer mid-match.
+  if (Object.hasOwn(match, "timer")) {
+    const timer = normalizeTimer(match.timer)
+      || (!match.started_at ? timerFromDivisionConfig(division.config, { now: started_at, by: actor.id }) : null);
+    if (timer) next.timer = startTimer(timer, started_at);
+  }
   const batch = createBatch();
+  batch.expectMatch(match);
   persistMatch(batch, next);
   return commit(admin, batch, {
     ...envelope,
@@ -1803,14 +1915,25 @@ async function handleCoinToss(admin, actor, payload, envelope) {
   if (!payload.result && !payload.winner && !payload.serving_team) {
     throw httpError(400, "INVALID_COMMAND", "coin toss result is required");
   }
+  const seq = payload.seq ?? 1;
+  if (!Number.isSafeInteger(seq) || seq < 1) throw httpError(400, "INVALID_COMMAND", "seq must be a positive integer");
   const event = {
     id: payload.event_id,
-    seq: payload.seq ?? 1,
+    seq,
     type: "coin_toss",
     payload: toss,
   };
-  let state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
-  const applied = applyScoreEvent(state, event);
+  // Same mapping as score_event: a sequence conflict is a 409 the client can
+  // resolve, not a 500 it would retry forever.
+  let state;
+  let applied;
+  try {
+    state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
+    applied = applyScoreEvent(state, event);
+  } catch (err) {
+    if (err?.status) throw err;
+    throw httpError(409, err.code || "OUT_OF_ORDER", err.message);
+  }
   state = applied.state;
   if (!applied.applied) {
     const kept = { ...match, coin_toss: already || toss, serving_team: match.serving_team || toss.servingTeam, score_state: state };
@@ -1838,6 +1961,7 @@ async function handleCoinToss(admin, actor, payload, envelope) {
     ...scoreActor(actor),
     created_at: nowIso(),
   });
+  batch.expectMatch(match);
   persistMatch(batch, next);
   return commit(admin, batch, {
     ...envelope,
@@ -1845,7 +1969,19 @@ async function handleCoinToss(admin, actor, payload, envelope) {
     tournamentId: match.tournament_id,
     matchId: match.id,
     result: coinTossResult(next),
-  });
+  }).catch((err) => rethrowSeqConflict(admin, err, match.id, event.seq));
+}
+
+// Another event already holds this (match_id, seq) — e.g. two devices scored
+// the same point concurrently. Nothing from this request was written. Report
+// it exactly like a stale seq (the engine's OUT_OF_ORDER, with the server's
+// current lastSeq) so existing clients handle it the same way.
+async function rethrowSeqConflict(admin, err, matchId, seq) {
+  if (err?.code !== "SEQ_CONFLICT") throw err;
+  const { data } = await admin.from("matches").select("score_state").eq("id", matchId).maybeSingle();
+  const lastSeq = Number(data?.score_state?.lastSeq);
+  const shown = Number.isFinite(lastSeq) ? lastSeq : seq;
+  throw httpError(409, "OUT_OF_ORDER", `Events must be applied in seq order (lastSeq=${shown}, got ${seq})`);
 }
 
 async function handleScoreEvent(admin, actor, payload, envelope) {
@@ -1882,7 +2018,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
   }
 
   if (!isUuid(payload.event_id)) throw httpError(400, "INVALID_COMMAND", "event_id must be a UUID");
-  if (typeof payload.seq !== "number") throw httpError(400, "INVALID_COMMAND", "seq is required");
+  if (!Number.isSafeInteger(payload.seq) || payload.seq < 1) throw httpError(400, "INVALID_COMMAND", "seq must be a positive integer");
   const { data: dup } = await admin.from("score_events").select("id").eq("id", payload.event_id).maybeSingle();
   const cached = match.score_state && typeof match.score_state.lastSeq === "number" ? match.score_state : null;
   // A cached state built under different rules (e.g. before stage-based
@@ -1961,12 +2097,14 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     // persisted score line only. finishMatchIfWon is NOT re-run — it asserts
     // a genuine status transition into "completed" and would either throw or
     // redundantly re-advance the bracket for a match that already advanced it.
+    batch.expectMatch(match);
     persistMatch(batch, { ...match, score_state: state });
     const { data: existingResult } = await admin.from("match_results").select("*").eq("match_id", match.id).maybeSingle();
     if (existingResult) {
       batch.upsert("match_results", { ...existingResult, games: state.games || [], score_a: state.scoreA, score_b: state.scoreB });
     }
   } else {
+    batch.expectMatch(match);
     persistMatch(batch, { ...match, score_state: state });
     if (state.status === "completed") {
       const fin = await finishMatchIfWon(admin, batch, { ...match, score_state: state }, state, actor.kind === "station" ? actor.deviceId : actor.id);
@@ -1982,7 +2120,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     matchId: match.id,
     result: { match: completed || { ...match, score_state: state }, score_state: state, duplicate: false, progressed },
     detail,
-  });
+  }).catch((err) => rethrowSeqConflict(admin, err, match.id, payload.seq));
   if (!wasCompleted && state.status === "completed") {
     await reconcilePlayoffChildren(admin, match.division_id, division.format);
   }
@@ -2004,6 +2142,7 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
     throw httpError(409, "MATCH_NOT_WON", "Scoring has not produced a winner");
   }
   const batch = createBatch();
+  batch.expectMatch(match);
   const fin = await finishMatchIfWon(admin, batch, match, state, actor.kind === "station" ? actor.deviceId : actor.id);
   const result = await commit(admin, batch, {
     ...envelope,
@@ -2014,6 +2153,80 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
   });
   await reconcilePlayoffChildren(admin, match.division_id, division.format);
   return result;
+}
+
+// Game timer control (Operator). Organizer/admin only, enforced here — umpires
+// get FORBIDDEN, court stations never reach this (not in STATION_COMMANDS).
+// Only matches.timer changes: status, score, winner and progression are never
+// touched, and the countdown itself only starts in handleStartMatch.
+//   set    { duration_seconds }  before the match has ever started: configure
+//   clear                        before the match has ever started: remove
+//   adjust { delta_seconds }     once started (live, held, or resumed): add/remove time
+//   reset                        once started (live, held, or resumed): back to the full duration
+// "Ever started" is matches.started_at (set by the first start_match and kept
+// through Hold → Resume), so a resumed match in `ready` keeps its banked time.
+const TIMER_SETUP_STATUSES = new Set(["scheduled", "ready", "assigned", "postponed"]);
+
+async function handleSetMatchTimer(admin, actor, payload, envelope) {
+  requireUserActor(actor);
+  const match = await getMatch(admin, payload.match_id);
+  const member = await loadMember(admin, match.tournament_id, actor.id);
+  await requireOrganizerLicensed(admin, actor, member);
+  if (!Object.hasOwn(match, "timer")) {
+    throw httpError(409, "TIMER_UNAVAILABLE", "Game timer is not available on this server yet");
+  }
+  const action = payload.action;
+  const now = nowIso();
+  const meta = { now, by: actor.id };
+  const current = normalizeTimer(match.timer);
+  let timer;
+  const started = match.status === "in_progress" || (TIMER_SETUP_STATUSES.has(match.status) && Boolean(match.started_at));
+  if (action === "set" || action === "clear") {
+    if (started) {
+      throw httpError(409, "MATCH_ALREADY_STARTED", "The game has already started. Add or remove time, or reset the timer instead.");
+    }
+    if (!TIMER_SETUP_STATUSES.has(match.status)) {
+      throw httpError(409, "MATCH_NOT_ACTIVE", `Cannot change the game time of a ${match.status} match`);
+    }
+    if (action === "set") {
+      if (!isValidGameTimeSec(payload.duration_seconds)) {
+        throw httpError(400, "INVALID_GAME_TIME", `Game time must be a whole number of seconds from ${MIN_GAME_TIME_SEC} to ${MAX_GAME_TIME_SEC}`);
+      }
+      timer = configureTimer(payload.duration_seconds, meta);
+    } else {
+      timer = null;
+    }
+  } else if (action === "adjust" || action === "reset") {
+    if (!started) {
+      throw httpError(409, "MATCH_NOT_ACTIVE", match.status === "completed"
+        ? "This game is already completed"
+        : TIMER_SETUP_STATUSES.has(match.status)
+          ? "The game has not started yet. Set the game time instead."
+          : `Cannot change the timer of a ${match.status} match`);
+    }
+    if (!current) throw httpError(409, "NO_TIMER", "This match has no game timer");
+    if (action === "adjust") {
+      if (!isValidTimerAdjustSec(payload.delta_seconds)) {
+        throw httpError(400, "INVALID_COMMAND", `delta_seconds must be a non-zero whole number up to ±${MAX_ADJUST_SEC}`);
+      }
+      timer = adjustTimer(current, payload.delta_seconds, meta);
+    } else {
+      timer = resetTimer(current, meta);
+    }
+  } else {
+    throw httpError(400, "INVALID_COMMAND", "action must be set, clear, adjust or reset");
+  }
+  const next = { ...match, timer };
+  const batch = createBatch();
+  batch.expectMatch(match);
+  persistMatch(batch, next);
+  return commit(admin, batch, {
+    ...envelope,
+    actorId: actor.id,
+    tournamentId: match.tournament_id,
+    matchId: match.id,
+    result: { match: next },
+  });
 }
 
 async function handleOpenCourtPairing(admin, actor, payload, envelope) {
@@ -2153,7 +2366,75 @@ const HANDLERS = {
   coin_toss: handleCoinToss,
   score_event: handleScoreEvent,
   complete_match: handleCompleteMatch,
+  set_match_timer: handleSetMatchTimer,
 };
+
+// Deterministic JSON (object keys sorted, recursively) so the same request
+// always produces the same fingerprint regardless of key order.
+export function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().filter((k) => value[k] !== undefined).map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+export async function requestHash(type, payload) {
+  return sha256Hex(canonicalJson({ type, payload }));
+}
+
+// A stored receipt answers this request only if it is the SAME request from
+// the SAME actor. Receipts written before migration 0018 have no hash; for
+// those the command type must still match.
+function receiptMatches(receipt, actor, type, hash) {
+  const sameActor = actor.kind === "station"
+    ? receipt.actor_device_id === actor.deviceId
+    : receipt.actor_id === actor.id;
+  if (!sameActor) return false;
+  if (receipt.request_hash) return receipt.request_hash === hash;
+  return receipt.command_type === type;
+}
+
+function replay(receipt, actor, envelope, hash) {
+  if (!receiptMatches(receipt, actor, envelope.type, hash)) {
+    throw Object.assign(
+      httpError(409, "IDEMPOTENCY_KEY_REUSED", "This command id was already used for a different request."),
+      { commandId: envelope.command_id },
+    );
+  }
+  // The pairing QR token is returned once and never stored, so a replay
+  // can't show it again. Ask for a fresh pairing window instead of returning
+  // a result with no QR code.
+  if (envelope.type === "open_court_pairing") {
+    throw httpError(409, "PAIRING_REPLAY", "This pairing window was already opened. Open a new pairing window to show the QR code.");
+  }
+  return { ok: true, idempotent: true, result: receipt.result };
+}
+
+// A handler's read-then-write raced another command on the same match
+// (STALE_WRITE: nothing was written). Re-running it re-reads current state.
+const STALE_WRITE_ATTEMPTS = 3;
+
+// Commands whose every write is covered by the match version check, so a
+// client "I last saw this match version" precondition is fully enforced.
+// Anything else (e.g. assign_court: its court_assignments row has no version
+// check) refuses a precondition rather than silently ignoring it.
+export const PRECONDITION_COMMANDS = Object.freeze(["transition_match", "start_match", "coin_toss", "score_event", "complete_match"]);
+
+function validatePrecondition(type, payload) {
+  const pre = payload?.precondition;
+  if (pre === undefined) return undefined;
+  const bad = (message) => httpError(400, "INVALID_COMMAND", message);
+  if (!PRECONDITION_COMMANDS.includes(type)) throw bad(`precondition is not supported for ${type}`);
+  if (!pre || typeof pre !== "object" || Array.isArray(pre)) throw bad("precondition must be an object");
+  const keys = Object.keys(pre);
+  if (keys.length !== 1 || keys[0] !== "match_updated_at") throw bad("precondition supports only match_updated_at");
+  if (typeof pre.match_updated_at !== "string" || Number.isNaN(Date.parse(pre.match_updated_at))) {
+    throw bad("precondition.match_updated_at must be a timestamp");
+  }
+  if (!isUuid(payload.match_id)) throw bad("precondition requires match_id");
+  return pre;
+}
 
 export async function handleCommand({ admin, actor, body }) {
   if (!actor?.id) throw httpError(401, "UNAUTHENTICATED", "Missing actor");
@@ -2163,9 +2444,46 @@ export async function handleCommand({ admin, actor, body }) {
   } catch (err) {
     throw httpError(err.status || 403, err.code || "FORBIDDEN", err.message);
   }
+  const precondition = validatePrecondition(envelope.type, envelope.payload);
+  const hash = await requestHash(envelope.type, envelope.payload);
+  // Fast path for a sequential retry. Concurrent duplicates are resolved
+  // atomically by the database (the receipt claim in apply_official_writes).
   const prior = await existingReceipt(admin, envelope.command_id);
-  if (prior) return { ok: true, idempotent: true, result: prior.result };
+  if (prior) return replay(prior, actor, envelope, hash);
   const handler = HANDLERS[envelope.type];
-  const result = await handler(admin, actor, envelope.payload, envelope);
-  return { ok: true, idempotent: false, result };
+  const context = { ...envelope, request_hash: hash, precondition };
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const result = await handler(admin, actor, envelope.payload, context);
+      return { ok: true, idempotent: false, result };
+    } catch (err) {
+      if (err?.code === "COMMAND_ALREADY_APPLIED") {
+        // Another request with this command_id committed first; this one
+        // wrote nothing. Answer with that request's stored result.
+        const winner = await existingReceipt(admin, envelope.command_id);
+        if (winner) return replay(winner, actor, envelope, hash);
+        throw httpError(503, "RETRY_LATER", "The server is busy. Please retry.");
+      }
+      if (err?.code === "STALE_WRITE") {
+        if (attempt < STALE_WRITE_ATTEMPTS) continue;
+        throw httpError(503, "RETRY_LATER", "The server is busy. Please retry.");
+      }
+      throw err;
+    }
+  }
+}
+
+// The command API's error response. Errors raised deliberately by the API
+// (httpError: they carry a status) keep their code and message. Anything
+// else (a raw database/runtime error) is reported generically: no SQL text,
+// constraint names, tokens or stack traces ever reach the client.
+export function errorResponse(err, commandId) {
+  const known = Number.isFinite(Number(err?.status)) && Number(err.status) > 0;
+  const status = known ? Number(err.status) : 500;
+  const error = known
+    ? { code: err.code || "INTERNAL", message: err.message }
+    : { code: "INTERNAL", message: "Something went wrong on the server. Please retry." };
+  if (status === 409 && commandId) error.command_id = commandId;
+  if (err?.code === "STALE_STATE" && err.current) error.current_revision = err.current;
+  return { status, body: { ok: false, error } };
 }

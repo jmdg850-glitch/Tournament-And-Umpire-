@@ -694,6 +694,38 @@ body:has(.update-banner) .toast-stack {
 }
 .scoreboard .game { letter-spacing: 0.16em; font-size: 0.75rem; text-transform: uppercase; color: var(--tape); font-weight: 700; }
 
+/* Game timer (GameTimer) — scoreboard type, no animation. Expired switches
+   to the danger colour; "finished"/"paused" are muted. */
+.game-timer {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  line-height: 1;
+}
+.game-timer-label {
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 700;
+  opacity: 0.75;
+}
+.game-timer-clock {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 1.6rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+.game-timer[data-state="configured"] { flex-direction: row; gap: 6px; align-items: baseline; }
+.game-timer[data-state="configured"] .game-timer-clock { font-size: 1rem; }
+.game-timer[data-state="paused"],
+.game-timer[data-state="finished"] { opacity: 0.7; }
+.game-timer[data-state="expired"] { color: var(--danger); }
+.game-timer[data-state="expired"] .game-timer-label { opacity: 1; }
+.scoreboard .game-timer { margin: 6px 0; }
+.scoreboard .game-timer[data-state="running"] .game-timer-clock { font-size: clamp(1.6rem, 7vw, 2.4rem); }
+
 /* Branded boot/loading screen (SplashScreen) — see components.jsx for why
    this has no artificial minimum-display timer. Deliberately theme-
    independent (always dark), same "stadium" treatment as .live-window/

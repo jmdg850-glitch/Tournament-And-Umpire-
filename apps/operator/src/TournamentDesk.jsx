@@ -45,6 +45,9 @@ import { ResultsPanel } from "./screens/ResultsPanel.jsx";
 import { SettingsPanel } from "./screens/SettingsPanel.jsx";
 import { openLiveMatchWindow, useRealtimeChannel } from "./useRealtimeChannel.js";
 import { useDesktopUpdateContext } from "./UpdateBanner.jsx";
+import OfflineStatusBanner from "./OfflineStatusBanner.jsx";
+import { INITIAL_LOAD_INFO, LOAD_FAILURE_STATUS as FAILURE_STATUS, deskOutcome, mergeServerMatches } from "./offlineData.js";
+import { sessionGate } from "@tournament/client";
 import {
   DESK_TABS,
   TOURNAMENT_FLOW,
@@ -79,14 +82,18 @@ const NAV_SECTIONS = [
 
 const VALID_TABS = new Set(NAV_SECTIONS.flatMap((section) => section.ids));
 
-export default function TournamentDesk({ supabase, session, command, pendingSync, tournamentId, onBack, onSignOut }) {
+export default function TournamentDesk({ supabase, session, identityMode, repository, command, pendingSync, tournamentId, onBack, onSignOut }) {
   const toast = useToast();
   const [tab, setTab] = useState(() => {
     const parsed = parseDeskHash(typeof window === "undefined" ? "" : window.location.hash);
     return parsed?.tab && VALID_TABS.has(parsed.tab) ? parsed.tab : "overview";
   });
   const [data, setData] = useState(null);
+  // Where `data` came from: "server" (loaded this session, kept current by
+  // realtime) or "cache" (this computer's saved copy of the tournament).
+  const [loadInfo, setLoadInfo] = useState(INITIAL_LOAD_INFO);
   const [error, setError] = useState("");
+  const verified = identityMode !== "offline-unverified";
   const [busy, setBusy] = useState("");
   const [confirm, setConfirm] = useState(null);
   const attemptedPlayoffs = useRef(new Set());
@@ -107,36 +114,86 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
     return () => window.removeEventListener("hashchange", onHashChange);
   }, [tab]);
 
+  // This computer's saved copy first: renders instantly and works offline.
+  // A server load (below) always replaces it.
+  useEffect(() => {
+    let cancelled = false;
+    setData(null);
+    setLoadInfo(INITIAL_LOAD_INFO);
+    repository?.loadDesk(tournamentId).then((snap) => {
+      if (cancelled || !snap) return;
+      setData((prev) => prev ?? snap.data);
+      setLoadInfo((prev) => (prev.source === "server" ? prev : { ...prev, source: "cache", lastUpdatedAt: snap.savedAt }));
+    });
+    return () => { cancelled = true; };
+  }, [repository, tournamentId]);
+
+  // Loads can overlap (mount, realtime reconnect, after a command, focus);
+  // only the most recently started one may apply its result.
+  const loadSeqRef = useRef(0);
   const load = useCallback(async () => {
-    const { data: next, error: err } = await loadDeskData(supabase, tournamentId);
-    if (err) {
-      setError(err.message);
+    const seq = ++loadSeqRef.current;
+    // Without a verified sign-in, queries would run as an anonymous visitor
+    // and "succeed" with nothing — which must never replace saved data.
+    if (!verified) {
+      setLoadInfo((prev) => ({ ...prev, status: "offline" }));
+      return;
+    }
+    // An expired session makes supabase-js query anonymously (RLS → empty).
+    if (await sessionGate(supabase)) {
+      setLoadInfo((prev) => ({ ...prev, status: "offline" }));
+      return;
+    }
+    const outcome = deskOutcome(await loadDeskData(supabase, tournamentId));
+    if (seq !== loadSeqRef.current) return;
+    if (!outcome.ok) {
+      setLoadInfo((prev) => ({ ...prev, status: FAILURE_STATUS[outcome.kind] || "error", error: outcome.message }));
+      // Connectivity problems are shown by the status banner (saved data
+      // stays on screen); real refusals keep the existing error display.
+      if (outcome.kind !== "network" && outcome.kind !== "server") setError(outcome.message);
       return;
     }
     setError("");
-    setData(next);
-  }, [supabase, tournamentId]);
+    setData((prev) => (prev?.tournament?.id === outcome.rows?.tournament?.id
+      ? { ...outcome.rows, matches: mergeServerMatches(prev.matches, outcome.rows.matches) }
+      : outcome.rows));
+    setLoadInfo({ status: "online", source: "server", lastUpdatedAt: outcome.at, error: "" });
+  }, [supabase, tournamentId, verified]);
+
+  // Keep this computer's copy current: only data that came from the server
+  // this session (plus realtime rows the server broadcast) is ever saved —
+  // never a saved copy re-stamped as fresh.
+  useEffect(() => {
+    if (!data?.tournament || loadInfo.source !== "server" || !repository) return undefined;
+    const timer = setTimeout(() => { repository.saveDesk(tournamentId, data); }, 1500);
+    return () => clearTimeout(timer);
+  }, [data, loadInfo.source, repository, tournamentId]);
 
   const patchLiveTables = useCallback(async () => {
-    const queries = await Promise.all([
-      supabase.from("matches").select("*").eq("tournament_id", tournamentId).order("round"),
-      supabase.from("match_results").select("*"),
-      supabase.from("court_assignments").select("*"),
-    ]);
-    const err = firstQueryError(queries);
-    if (err) return;
-    const [matches, results, courtsA] = queries;
-    const matchIds = new Set((matches.data || []).map((m) => m.id));
+    if (!verified || (await sessionGate(supabase))) return;
+    const matches = await supabase.from("matches").select("*").eq("tournament_id", tournamentId).order("round");
+    if (matches.error) return;
+    // Scoped to this tournament's matches, like loadDeskData: unfiltered, the
+    // 1000-row response cap cut off rows once an account had enough data.
+    const ids = (matches.data || []).map((m) => m.id);
+    const empty = { data: [], error: null };
+    const [results, courtsA] = ids.length
+      ? await Promise.all([
+        supabase.from("match_results").select("*").in("match_id", ids),
+        supabase.from("court_assignments").select("*").in("match_id", ids),
+      ])
+      : [empty, empty];
+    if (firstQueryError([results, courtsA])) return;
     setData((prev) => {
       if (!prev) return prev;
       return {
         ...prev,
-        matches: matches.data || [],
-        results: (results.data || []).filter((r) => matchIds.has(r.match_id)),
-        courtAssignments: (courtsA.data || []).filter((r) => matchIds.has(r.match_id)),
+        matches: mergeServerMatches(prev.matches, matches.data),
+        results: results.data || [],
+        courtAssignments: courtsA.data || [],
       };
     });
-  }, [supabase, tournamentId]);
+  }, [supabase, tournamentId, verified]);
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
@@ -154,7 +211,7 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
   useRealtimeChannel({
     supabase,
     name: deskLiveChannelName(tournamentId),
-    enabled: Boolean(tournamentId),
+    enabled: Boolean(tournamentId) && verified,
     specs: [
       { event: "*", schema: "public", table: "matches", filter: `tournament_id=eq.${tournamentId}` },
       { event: "*", schema: "public", table: "match_results" },
@@ -172,7 +229,9 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
   });
 
   useEffect(() => {
-    if (!data || busy) return;
+    // Only ever decided from server-confirmed data: a saved copy may be stale,
+    // and a failed offline attempt would otherwise never be retried.
+    if (!data || busy || loadInfo.source !== "server" || loadInfo.status !== "online") return;
     for (const d of data.divisions) {
       if (d.format !== "team_elimination") continue;
       if (attemptedPlayoffs.current.has(d.id)) continue;
@@ -181,11 +240,15 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
       const rrParents = data.matches.filter((m) => m.division_id === d.id && !m.parent_match_id && m.stage_label === "round_robin");
       if (!rrParents.length || rrParents.some((m) => m.status !== "completed")) continue;
       attemptedPlayoffs.current.add(d.id);
-      run("Generate playoffs", "generate_team_playoffs", { division_id: d.id });
+      // Not confirmed (offline / no answer): try again after the next
+      // successful server load. A real refusal is not retried automatically.
+      run("Generate playoffs", "generate_team_playoffs", { division_id: d.id }, false, {
+        onError: (err) => { if (err?.code === "OFFLINE") attemptedPlayoffs.current.delete(d.id); },
+      });
     }
-  }, [data, busy]);
+  }, [data, busy, loadInfo.source, loadInfo.status]);
 
-  async function run(label, type, payload, needsConfirm) {
+  async function run(label, type, payload, needsConfirm, { onError } = {}) {
     if (needsConfirm) {
       setConfirm({ label, type, payload, danger: /cancel|remove|archive/i.test(label) });
       return;
@@ -203,6 +266,7 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
       return out;
     } catch (err) {
       setError(err.message);
+      onError?.(err);
     } finally {
       setBusy("");
     }
@@ -215,11 +279,24 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
     dialogOpen: Boolean(confirm),
   });
 
+  const bannerLoad = { rows: data, ...loadInfo };
   if (error && !data) {
     return (
       <div className="shell-main">
         <Alert>{error}</Alert>
         <Button style={{ marginTop: 12 }} onClick={load}>Retry</Button>
+      </div>
+    );
+  }
+  if (!data && loadInfo.status !== "loading") {
+    // Connectivity problem and nothing saved on this computer for this
+    // tournament: say so plainly instead of a raw network error.
+    return (
+      <div className="shell-main stack">
+        <OfflineStatusBanner load={bannerLoad} identityMode={identityMode} onRetry={load} />
+        <div className="row">
+          <Button variant="secondary" onClick={onBack}>Back to tournaments</Button>
+        </div>
       </div>
     );
   }
@@ -318,6 +395,7 @@ export default function TournamentDesk({ supabase, session, command, pendingSync
             </p>
           </PageHeader>
           <div className="tape" />
+          <OfflineStatusBanner load={bannerLoad} identityMode={identityMode} onRetry={load} />
           {error ? <Alert>{error}</Alert> : null}
           {busy ? <p className="muted" role="status">{busy}…</p> : null}
 

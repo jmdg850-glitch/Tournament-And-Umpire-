@@ -59,9 +59,18 @@ export function mergeConfirmedRecord(existing, incoming) {
   };
 }
 
+// Snapshots (offline tournament packages) only ever move FORWARD in time: a
+// slow, stale load finishing late can never overwrite a newer saved copy.
+export function mergeSnapshot(existing, incoming) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  return Number(incoming.savedAt || 0) >= Number(existing.savedAt || 0) ? incoming : existing;
+}
+
 export function createMemoryStore() {
   const rows = new Map();
   const matches = new Map();
+  const snapshots = new Map();
   return {
     durable: false,
     async put(entry) {
@@ -92,15 +101,29 @@ export function createMemoryStore() {
       rows.delete(command_id);
       if (record) matches.set(record.matchId, mergeConfirmedRecord(matches.get(record.matchId), record));
     },
+    async putSnapshot(snapshot) {
+      snapshots.set(snapshot.key, mergeSnapshot(snapshots.get(snapshot.key), snapshot));
+    },
+    async getSnapshot(key) {
+      return snapshots.get(key) || null;
+    },
+    async listSnapshots() {
+      return [...snapshots.values()];
+    },
+    async deleteSnapshot(key) {
+      snapshots.delete(key);
+    },
   };
 }
 
 // v2 adds the "matches" store (confirmed match context for offline resume).
-// The upgrade is additive: the v1 "commands" store and every entry in it are
-// kept as-is.
-const DB_VERSION = 2;
+// v3 adds the "snapshots" store (offline tournament packages, see
+// localRepository.js). Each upgrade is additive: earlier stores and every
+// entry in them are kept as-is.
+const DB_VERSION = 3;
 const STORE_NAME = "commands";
 const MATCH_STORE = "matches";
+const SNAPSHOT_STORE = "snapshots";
 
 export function createIndexedDBStore(dbName) {
   if (typeof indexedDB === "undefined") return null;
@@ -115,6 +138,9 @@ export function createIndexedDBStore(dbName) {
         }
         if (!db.objectStoreNames.contains(MATCH_STORE)) {
           db.createObjectStore(MATCH_STORE, { keyPath: "matchId" });
+        }
+        if (!db.objectStoreNames.contains(SNAPSHOT_STORE)) {
+          db.createObjectStore(SNAPSHOT_STORE, { keyPath: "key" });
         }
       };
       req.onsuccess = () => {
@@ -225,6 +251,32 @@ export function createIndexedDBStore(dbName) {
       await withStores([STORE_NAME, MATCH_STORE], "readwrite", (tx) => {
         tx.objectStore(STORE_NAME).delete(command_id);
         if (record) mergePut(tx.objectStore(MATCH_STORE), record);
+      });
+    },
+    async putSnapshot(snapshot) {
+      await withStores(SNAPSHOT_STORE, "readwrite", (tx) => {
+        const store = tx.objectStore(SNAPSHOT_STORE);
+        const req = store.get(snapshot.key);
+        req.onsuccess = () => {
+          store.put(mergeSnapshot(req.result || null, snapshot));
+        };
+      });
+    },
+    async getSnapshot(key) {
+      return withStores(SNAPSHOT_STORE, "readonly", (tx, holder) => {
+        const req = tx.objectStore(SNAPSHOT_STORE).get(key);
+        req.onsuccess = () => { holder.value = req.result || null; };
+      });
+    },
+    async listSnapshots() {
+      const rows = await withStores(SNAPSHOT_STORE, "readonly", (tx, holder) => {
+        getAllInto(tx.objectStore(SNAPSHOT_STORE), holder);
+      });
+      return rows || [];
+    },
+    async deleteSnapshot(key) {
+      await withStores(SNAPSHOT_STORE, "readwrite", (tx) => {
+        tx.objectStore(SNAPSHOT_STORE).delete(key);
       });
     },
   };

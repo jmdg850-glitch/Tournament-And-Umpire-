@@ -279,6 +279,33 @@ describe("team elimination: qualification -> semifinals -> final (real BEG LOW s
     expect([nameOf(champion), nameOf(runnerUp)].sort()).toEqual(["JEFFREY / REM", "KENNETH / JENNY"]);
   });
 
+  test("Phase F: every existing matches row rewritten while advancing semifinals is version-checked (incl. the next team matchup)", async () => {
+    const admin = begLow();
+    await send(admin, "generate_team_playoffs", { division_id: D });
+    const semis = parents(admin, "semifinal");
+    const semiWith = (key) => semis.find((m) => pairsIn(admin, m.id).includes(id(key)));
+    const [final] = parents(admin, "final");
+    const [bronze] = parents(admin, "bronze");
+    const unchecked = [];
+    const rewrittenIds = new Set();
+    const rpc = admin.rpc.bind(admin);
+    admin.rpc = async (fn, args) => {
+      const existing = new Set(admin.tables.matches.map((m) => m.id));
+      const checked = new Set((args.payload.expect || []).map((e) => e.id));
+      for (const row of args.payload.upserts?.matches || []) {
+        if (!existing.has(row.id)) continue; // a brand-new row: nothing to overwrite
+        rewrittenIds.add(row.id);
+        if (!checked.has(row.id)) unchecked.push(row.id);
+      }
+      return rpc(fn, args);
+    };
+    await playKnockout(admin, semiWith("KEN").id, id("KEN"));
+    await playKnockout(admin, semiWith("JEFF").id, id("JEFF"));
+    expect(rewrittenIds.has(final.id)).toBe(true); // applyIndividualPatch rewrote the final matchup…
+    expect(rewrittenIds.has(bronze.id)).toBe(true); // …and the bronze matchup
+    expect(unchecked).toEqual([]); // …always under a version check
+  });
+
   test("11. generating playoffs again is refused and creates nothing", async () => {
     const admin = begLow();
     await send(admin, "generate_team_playoffs", { division_id: D });
@@ -582,5 +609,139 @@ describe("concurrent Generate Playoffs (two organizer devices at once)", () => {
     const results = await both(admin);
     expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(2);
     expect(knockout(admin)).toEqual({ stages: 2, semifinals: 4, finals: 2, bronzes: 2 });
+  });
+});
+
+// ---- command safety regressions (project-wide bug fix pass) -----------------
+describe("command safety regressions", () => {
+  async function generated() {
+    const admin = begLow();
+    await send(admin, "generate_team_playoffs", { division_id: D });
+    return admin;
+  }
+  const semiChild = (admin) => childOf(admin, parents(admin, "semifinal")[0].id)[0];
+
+  test("transition_match cannot complete or start a match (complete_match / start_match must be used)", async () => {
+    const admin = await generated();
+    const child = semiChild(admin);
+    child.status = "in_progress";
+    let err = await sendErr(admin, "transition_match", { match_id: child.id, status: "completed" });
+    expect([err.status, err.code]).toEqual([409, "ILLEGAL_TRANSITION"]);
+    child.status = "ready";
+    err = await sendErr(admin, "transition_match", { match_id: child.id, status: "in_progress" });
+    expect([err.status, err.code]).toEqual([409, "ILLEGAL_TRANSITION"]);
+    child.status = "in_progress";
+    const ok = await send(admin, "transition_match", { match_id: child.id, status: "postponed" });
+    expect(ok.ok).toBe(true);
+  });
+
+  test("add_member cannot demote the organizer or change the caller's own role", async () => {
+    const admin = begLow();
+    const OTHER_ORG = "7a1d4a8e-4a0b-4b8e-9d7c-000000000002";
+    admin.tables.profiles = [{ id: OTHER_ORG }, { id: ORGANIZER.id }];
+    admin.tables.tournament_members.push({ id: "tm-2", tournament_id: T, user_id: OTHER_ORG, role: "organizer" });
+    let err = await sendErr(admin, "add_member", { tournament_id: T, user_id: OTHER_ORG, role: "viewer" });
+    expect([err.status, err.code]).toEqual([403, "FORBIDDEN"]);
+    expect(admin.tables.tournament_members.find((m) => m.user_id === OTHER_ORG).role).toBe("organizer");
+    // The caller changing their own role (as another organizer with a UUID id).
+    const self = { kind: "user", id: OTHER_ORG, email: ORGANIZER.email };
+    err = await handleCommand({ admin, actor: self, body: { command_id: crypto.randomUUID(), type: "add_member", payload: { tournament_id: T, user_id: OTHER_ORG, role: "umpire" } } })
+      .then(() => { throw new Error("unexpectedly succeeded"); }, (e) => e);
+    expect([err.status, err.code, err.message]).toEqual([403, "FORBIDDEN", "You can't change your own role"]);
+  });
+
+  test("add_member: upper-cased UUIDs can't bypass the self or owner protection; normal assignment still works", async () => {
+    const admin = begLow();
+    const ACTOR = "7a1d4a8e-4a0b-4b8e-9d7c-00000000000a";
+    const OWNER = "7a1d4a8e-4a0b-4b8e-9d7c-00000000000b";
+    const UMPIRE = "7a1d4a8e-4a0b-4b8e-9d7c-00000000000c";
+    admin.tables.tournaments[0].owner_id = OWNER;
+    admin.tables.profiles = [{ id: ACTOR }, { id: OWNER }, { id: UMPIRE }, { id: ACTOR.toUpperCase() }, { id: OWNER.toUpperCase() }];
+    admin.tables.tournament_members.push({ id: "tm-a", tournament_id: T, user_id: ACTOR, role: "admin" });
+    const as = { kind: "user", id: ACTOR, email: ORGANIZER.email };
+    const sendAs = (payload) => handleCommand({ admin, actor: as, body: { command_id: crypto.randomUUID(), type: "add_member", payload: { tournament_id: T, ...payload } } });
+    const errOf = (p) => p.then(() => { throw new Error("unexpectedly succeeded"); }, (e) => e);
+    // Own id, upper-cased: still "your own role".
+    let err = await errOf(sendAs({ user_id: ACTOR.toUpperCase(), role: "viewer" }));
+    expect([err.status, err.code, err.message]).toEqual([403, "FORBIDDEN", "You can't change your own role"]);
+    // The owner, upper-cased, with no organizer member row to catch it: still protected.
+    err = await errOf(sendAs({ user_id: OWNER.toUpperCase(), role: "viewer" }));
+    expect([err.status, err.code, err.message]).toEqual([403, "FORBIDDEN", "The tournament organizer's role can't be changed"]);
+    expect(admin.tables.tournament_members.find((m) => m.user_id.toLowerCase() === ACTOR).role).toBe("admin");
+    expect(admin.tables.tournament_members.some((m) => m.user_id.toLowerCase() === OWNER)).toBe(false);
+    // An ordinary assignment is unaffected.
+    const ok = await sendAs({ user_id: UMPIRE, role: "umpire" });
+    expect(ok.ok).toBe(true);
+    expect(admin.tables.tournament_members.find((m) => m.user_id === UMPIRE).role).toBe("umpire");
+  });
+
+  test("create_team refuses a division from another tournament", async () => {
+    const admin = begLow();
+    admin.tables.divisions.push({ id: "division-other", tournament_id: "tournament-2", name: "X", format: "single_elim", config: {} });
+    const err = await sendErr(admin, "create_team", { tournament_id: T, name: "Intruders", division_id: "division-other" });
+    expect([err.status, err.code]).toEqual([400, "INVALID_COMMAND"]);
+    expect(admin.tables.teams.some((t) => t.name === "Intruders")).toBe(false);
+  });
+
+  test("bracket generators refuse the wrong division format", async () => {
+    const admin = begLow({}, { withMatches: false });
+    let err = await sendErr(admin, "generate_bracket", { division_id: D });
+    expect([err.status, err.code]).toEqual([400, "INVALID_COMMAND"]);
+    admin.tables.divisions.push({ id: "division-single", tournament_id: T, name: "Singles", format: "single_elim", config: {} });
+    err = await sendErr(admin, "generate_team_elimination", { division_id: "division-single" });
+    expect([err.status, err.code]).toEqual([400, "INVALID_COMMAND"]);
+    expect(admin.tables.matches).toHaveLength(0);
+  });
+
+  test("coin toss with an already-used seq is a 409 conflict, not a 500", async () => {
+    const admin = await generated();
+    const child = semiChild(admin);
+    child.status = "in_progress";
+    admin.tables.score_events.push({ id: crypto.randomUUID(), match_id: child.id, seq: 1, type: "point", payload: { team: "A" } });
+    const err = await sendErr(admin, "coin_toss", { match_id: child.id, event_id: crypto.randomUUID(), seq: 1, result: "A" });
+    expect([err.status, err.code]).toEqual([409, "OUT_OF_ORDER"]);
+  });
+
+  test.each([1.5, 0, -1])("score_event seq %s is refused with 400", async (badSeq) => {
+    const admin = await generated();
+    const child = semiChild(admin);
+    child.status = "in_progress";
+    const err = await sendErr(admin, "score_event", { match_id: child.id, event_id: crypto.randomUUID(), seq: badSeq, type: "point", payload: { team: "A" } });
+    expect([err.status, err.code]).toEqual([400, "INVALID_COMMAND"]);
+  });
+
+  test("editing players of a team playoff pair match is refused (it would become unplayable)", async () => {
+    const admin = await generated();
+    const child = semiChild(admin);
+    const err = await sendErr(admin, "update_match_participant", { match_id: child.id, slot: "A", person_ids: [crypto.randomUUID(), crypto.randomUUID()] });
+    expect([err.status, err.code]).toEqual([409, "MATCH_LOCKED_BY_TEAM_MATCHUP"]);
+  });
+
+  test("a replayed open_court_pairing asks for a new pairing window instead of returning no QR token", async () => {
+    const admin = begLow();
+    const commandId = crypto.randomUUID();
+    admin.tables.command_receipts.push({ id: commandId, actor_id: ORGANIZER.id, command_type: "open_court_pairing", result: { grant_id: "g1" } });
+    const err = await handleCommand({ admin, actor: ORGANIZER, body: { command_id: commandId, type: "open_court_pairing", payload: { court_id: crypto.randomUUID() } } })
+      .then(() => { throw new Error("unexpectedly succeeded"); }, (e) => e);
+    expect([err.status, err.code]).toEqual([409, "PAIRING_REPLAY"]);
+  });
+
+  test("a round-robin pair win that doesn't decide the matchup still version-checks the parent matchup", async () => {
+    const admin = begLow();
+    const parent = admin.tables.matches.find((m) => m.id === "rr-1");
+    parent.status = "in_progress";
+    // Two pair matches still open: finishing one can't decide the matchup.
+    for (const mid of ["rr-pm-1", "rr-pm-2"]) {
+      const m = admin.tables.matches.find((x) => x.id === mid);
+      m.status = "in_progress"; m.winner = null; m.score_state = {};
+    }
+    let expected = [];
+    const rpc = admin.rpc.bind(admin);
+    admin.rpc = async (fn, args) => { expected = (args.payload.expect || []).map((e) => e.id); return rpc(fn, args); };
+    admin.tables.score_events.push({ id: crypto.randomUUID(), match_id: "rr-pm-1", seq: 1, type: "correction", payload: { scoreA: 11, scoreB: 5 } });
+    const res = await send(admin, "complete_match", { match_id: "rr-pm-1" });
+    expect(res.ok).toBe(true);
+    expect(expected).toContain("rr-1");
+    expect(admin.tables.matches.find((m) => m.id === "rr-1").status).toBe("in_progress");
   });
 });

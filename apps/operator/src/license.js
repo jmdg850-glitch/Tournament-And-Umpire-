@@ -23,6 +23,14 @@ export class LicenseCallError extends Error {
   }
 }
 
+// A license check that can't be made because the sign-in isn't verified yet
+// (offline identity: no token). Same code as an unreachable server, so the
+// gate applies exactly the existing offline allowance — never a denial, and
+// it never touches the saved allowance.
+export function offlineLicenseError() {
+  return new LicenseCallError("NETWORK", "Unable to verify license while offline. Please check your internet connection.", 0);
+}
+
 export async function callLicense({ commandUrl, publishableKey, accessToken, action, body = {}, fetchImpl = (...a) => fetch(...a) }) {
   let res;
   const headers = { "Content-Type": "application/json", apikey: publishableKey };
@@ -109,6 +117,20 @@ export function isLicenseDenial(err) {
   return Boolean(err) && err.status === 403 && (err.code === "LICENSE_INVALID" || err.code === "LICENSE_REQUIRED");
 }
 
+// A failed check that is NOT the server's answer about this license: no
+// connection, the license service itself failing or overloaded (5xx, 408,
+// 429), an access token that expired before it could refresh (401, e.g. right
+// after the laptop wakes), or this PC's device id not being readable. These
+// fall back to the offline allowance instead of locking an operator out
+// mid-event. A real refusal (403 LICENSE_*, or any other 4xx) still blocks.
+export function isUnreachable(error) {
+  if (!error) return false;
+  if (error.code === "NETWORK") return true;
+  const status = Number(error.status);
+  if (!(error instanceof LicenseCallError) || !Number.isFinite(status)) return true;
+  return status === 0 || status >= 500 || status === 408 || status === 429 || status === 401;
+}
+
 // One `check` result -> gate state. A server answer always wins and updates
 // the offline allowance; only an unreachable server may fall back to it.
 // `requestedAt` = when that check was sent (defaults to now).
@@ -117,7 +139,7 @@ export function gateStateFromCheck({ userId, view, error, now = Date.now(), requ
     if (view.status === "active") rememberActiveIfCurrent(userId, requestedAt, now, storage); else forgetActive(userId, storage, now);
     return { phase: view.status === "active" ? "active" : "blocked", view, error: "" };
   }
-  if (error?.code === "NETWORK" && offlineAllowed(userId, now, storage)) return { phase: "active", view: null, error: "" };
+  if (isUnreachable(error) && offlineAllowed(userId, now, storage)) return { phase: "active", view: null, error: "" };
   return { phase: "blocked", view: null, error: error?.message || "Unable to verify license." };
 }
 

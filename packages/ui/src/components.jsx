@@ -81,6 +81,62 @@ export function Scoreboard({ nameA, nameB, scoreA = 0, scoreB = 0, center, class
   );
 }
 
+// Re-renders the caller on a fixed tick while `active`, and returns a fresh
+// Date.now() on every render — so a countdown is recomputed from the clock
+// each time (never decremented), can't drift, and one interval exists per
+// caller. Also re-renders when the page becomes visible again (after sleep
+// or background), where interval ticks may have been throttled.
+export function useNow(active, intervalMs = 250) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) return undefined;
+    const bump = () => setTick((n) => (n + 1) % 1_000_000);
+    const id = window.setInterval(bump, intervalMs);
+    const onVisible = () => { if (document.visibilityState === "visible") bump(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [active, intervalMs]);
+  return Date.now();
+}
+
+// Game timer display. Presentational only: the caller passes the computed
+// view ({ state, remainingMs, durationSec } from the engine's timerView) and
+// the formatted clock. state "none" (or anything unknown) renders nothing.
+const GAME_TIMER_LABEL = {
+  running: "Time left",
+  paused: "Timer paused",
+  expired: "Time",
+  finished: "Time left at finish",
+};
+
+export function GameTimer({ view, clock, className = "" }) {
+  const state = view?.state;
+  if (state === "configured") {
+    const minutes = Math.round((view.durationSec || 0) / 60);
+    return (
+      <div className={`game-timer ${className}`.trim()} data-state="configured">
+        <span className="game-timer-label">Game time</span>{" "}
+        <span className="game-timer-clock">{minutes} min</span>
+      </div>
+    );
+  }
+  if (!GAME_TIMER_LABEL[state]) return null;
+  return (
+    <div
+      className={`game-timer ${className}`.trim()}
+      data-state={state}
+      role="timer"
+      aria-label={state === "expired" ? "Game time expired" : `${GAME_TIMER_LABEL[state]} ${clock}`}
+    >
+      <span className="game-timer-label">{GAME_TIMER_LABEL[state]}</span>{" "}
+      <span className="game-timer-clock">{state === "expired" ? "00:00" : clock}</span>
+    </div>
+  );
+}
+
 export function Input({ label, id, hint, error, ...props }) {
   const autoId = useId();
   const inputId = id || autoId;
@@ -343,19 +399,24 @@ export function Skeleton({ lines = 3 }) {
 export function Modal({ title, children, onClose, labelledBy }) {
   const titleId = useId();
   const ref = useRef(null);
+  // Callers pass a new inline onClose on every render; keeping it in a ref
+  // lets the focus effect run once per open. Re-running it on each keystroke
+  // pulled focus back to the first field.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     const prev = document.activeElement;
     const node = ref.current?.querySelector("button, input, select, textarea, [tabindex]:not([tabindex='-1'])");
     node?.focus();
     function onKey(e) {
-      if (e.key === "Escape") onClose?.();
+      if (e.key === "Escape") onCloseRef.current?.();
     }
     document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("keydown", onKey);
       prev?.focus?.();
     };
-  }, [onClose]);
+  }, []);
   return (
     <div className="modal-scrim" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
       <div

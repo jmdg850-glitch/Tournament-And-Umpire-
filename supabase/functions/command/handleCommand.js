@@ -286,6 +286,20 @@ function applyCorrection(st, scoreA, scoreB) {
   return settleScore(st, scoreA, scoreB, st.server, st.servingTeam, hist, 0);
 }
 function undoPoint(st) {
+  const lastGame = st.games?.length ? st.games[st.games.length - 1] : null;
+  if (st.status === "completed" && (st.bestOf || 1) > 1 && lastGame && st.history.length) {
+    const prev = st.history[st.history.length - 1];
+    return {
+      ...st,
+      ...prev,
+      history: st.history.slice(0, -1),
+      games: st.games.slice(0, -1),
+      gamesWonA: st.gamesWonA - (lastGame.winner === "A" ? 1 : 0),
+      gamesWonB: st.gamesWonB - (lastGame.winner === "B" ? 1 : 0),
+      status: "in_progress",
+      winner: null
+    };
+  }
   if (st.history.length) {
     const prev = st.history[st.history.length - 1];
     return { ...st, ...prev, history: st.history.slice(0, -1), status: "in_progress", winner: null };
@@ -333,7 +347,7 @@ function applyScoreEvent(state, event) {
     return { state, applied: false, duplicate: true };
   }
   const lastSeq = state.lastSeq ?? 0;
-  if (typeof event.seq !== "number" || event.seq <= lastSeq) {
+  if (!Number.isSafeInteger(event.seq) || event.seq <= lastSeq) {
     const err = new Error(`Events must be applied in seq order (lastSeq=${lastSeq}, got ${event.seq})`);
     err.code = "OUT_OF_ORDER";
     throw err;
@@ -388,6 +402,108 @@ function reduceScoreEvents(settings, events) {
   return state;
 }
 
+// packages/engine/src/gameTimer.js
+var TIMER_VERSION = 1;
+var MIN_GAME_TIME_SEC = 60;
+var MAX_GAME_TIME_SEC = 3 * 60 * 60;
+var MAX_ADJUST_SEC = 60 * 60;
+var MAX_REMAINING_MS = MAX_GAME_TIME_SEC * 1e3;
+function isValidGameTimeSec(value) {
+  return Number.isInteger(value) && value >= MIN_GAME_TIME_SEC && value <= MAX_GAME_TIME_SEC;
+}
+function isValidTimerAdjustSec(value) {
+  return Number.isInteger(value) && value !== 0 && Math.abs(value) <= MAX_ADJUST_SEC;
+}
+function toMs(now) {
+  if (typeof now === "number") return Number.isFinite(now) ? now : NaN;
+  return typeof now === "string" ? Date.parse(now) : NaN;
+}
+function toIso(now) {
+  const ms = toMs(now);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+function normalizeTimer(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (raw.v !== TIMER_VERSION) return null;
+  if (!isValidGameTimeSec(raw.durationSec)) return null;
+  const remainingMs = Number(raw.remainingMs);
+  if (!Number.isFinite(remainingMs) || remainingMs < 0) return null;
+  let runningSince = null;
+  if (raw.runningSince != null) {
+    if (typeof raw.runningSince !== "string" || !Number.isFinite(Date.parse(raw.runningSince))) return null;
+    runningSince = raw.runningSince;
+  }
+  return {
+    v: TIMER_VERSION,
+    durationSec: raw.durationSec,
+    remainingMs: Math.min(Math.round(remainingMs), MAX_REMAINING_MS),
+    runningSince,
+    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : null,
+    updatedBy: typeof raw.updatedBy === "string" ? raw.updatedBy : null
+  };
+}
+function timerRemainingMs(timer, now) {
+  const t = normalizeTimer(timer);
+  if (!t) return 0;
+  if (!t.runningSince) return t.remainingMs;
+  const nowMs = toMs(now);
+  const since = Date.parse(t.runningSince);
+  const elapsed = Number.isFinite(nowMs) ? Math.max(0, nowMs - since) : 0;
+  return Math.max(0, t.remainingMs - elapsed);
+}
+function stamp(timer, now, by) {
+  return { ...timer, updatedAt: toIso(now), updatedBy: by ?? timer.updatedBy ?? null };
+}
+function configureTimer(durationSec, { now, by } = {}) {
+  if (!isValidGameTimeSec(durationSec)) return null;
+  return stamp({
+    v: TIMER_VERSION,
+    durationSec,
+    remainingMs: durationSec * 1e3,
+    runningSince: null,
+    updatedAt: null,
+    updatedBy: null
+  }, now, by);
+}
+function timerFromDivisionConfig(config, meta) {
+  const sec = config?.gameTimeSeconds;
+  return isValidGameTimeSec(sec) ? configureTimer(sec, meta) : null;
+}
+function startTimer(timer, now) {
+  const t = normalizeTimer(timer);
+  if (!t) return null;
+  if (t.runningSince) return t;
+  return { ...t, runningSince: toIso(now) };
+}
+function pauseTimer(timer, now) {
+  const t = normalizeTimer(timer);
+  if (!t) return null;
+  if (!t.runningSince) return t;
+  return { ...t, remainingMs: timerRemainingMs(t, now), runningSince: null };
+}
+function adjustTimer(timer, deltaSec, { now, by } = {}) {
+  const t = normalizeTimer(timer);
+  if (!t || !isValidTimerAdjustSec(deltaSec)) return null;
+  const remaining = timerRemainingMs(t, now) + deltaSec * 1e3;
+  return stamp({
+    ...t,
+    remainingMs: Math.min(Math.max(0, remaining), MAX_REMAINING_MS),
+    runningSince: t.runningSince ? toIso(now) : null
+  }, now, by);
+}
+function resetTimer(timer, { now, by } = {}) {
+  const t = normalizeTimer(timer);
+  if (!t) return null;
+  return stamp({
+    ...t,
+    remainingMs: t.durationSec * 1e3,
+    runningSince: t.runningSince ? toIso(now) : null
+  }, now, by);
+}
+
+// packages/engine/src/ids.js
+var defaultId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
 // packages/engine/src/bracket.js
 function seedOrder(size) {
   let order = [1];
@@ -397,7 +513,6 @@ function seedOrder(size) {
   }
   return order;
 }
-var defaultId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 function generateBracket(registrations, { makeId, bronzeMatch } = {}) {
   const genId = makeId || defaultId;
   const n = registrations.length;
@@ -450,8 +565,8 @@ function generateBracket(registrations, { makeId, bronzeMatch } = {}) {
     }
   }
   const bracketMatches = rounds.flat();
-  if (bronzeMatch && totalRounds >= 2) {
-    const semis = rounds[totalRounds - 2];
+  const semis = totalRounds >= 2 ? rounds[totalRounds - 2] : [];
+  if (bronzeMatch && totalRounds >= 2 && !semis.some((m) => m.status === "bye")) {
     const bronze = {
       id: genId(),
       round: totalRounds,
@@ -514,7 +629,6 @@ function generateRoundRobinSchedule(registrations) {
 }
 
 // packages/engine/src/teamVsTeam.js
-var defaultId2 = () => `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 function rankTeams(teams) {
   return [...teams].sort((a, b) => {
     const minA = Math.min(...a.pairs.map((p) => p.seed ?? Infinity));
@@ -539,7 +653,7 @@ function groupRegistrationsByTeam(registrations, teamGroups) {
   return { ok: true, teams };
 }
 function buildPairMatchesForMatchup(matchup, teams, makeId) {
-  const genId = makeId || defaultId2;
+  const genId = makeId || defaultId;
   const teamA = teams.find((t) => t.teamId === matchup.teamAId);
   const teamB = teams.find((t) => t.teamId === matchup.teamBId);
   if (!teamA || !teamB) return [];
@@ -609,9 +723,17 @@ function finalizeCrossTeamMatchup(matchup, allPairMatches) {
 }
 
 // packages/engine/src/teamRoundRobin.js
-var defaultId3 = () => `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+function stableTiebreak2(idA, idB) {
+  const hash = (s) => {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = h * 31 + s.charCodeAt(i) | 0;
+    return h;
+  };
+  const parity = hash([idA, idB].sort().join("|")) % 2 === 0 ? -1 : 1;
+  return idA < idB ? parity : -parity;
+}
 function generateTeamRoundRobinMatchups(teams, { makeId } = {}) {
-  const genId = makeId || defaultId3;
+  const genId = makeId || defaultId;
   const pairsPerMatchup = teams[0].pairs.length;
   const ranked = rankTeams(teams);
   const { rounds } = generateRoundRobinSchedule(ranked.map((t) => ({ id: t.teamId })));
@@ -659,15 +781,6 @@ function isTeamRoundRobinComplete(teamMatchups) {
   const rows = (teamMatchups || []).filter((m) => m.stage === "round_robin");
   return rows.length > 0 && rows.every((m) => m.status === "completed");
 }
-function stablePairTiebreak(idA, idB) {
-  const hash = (s) => {
-    let h = 0;
-    for (let i = 0; i < s.length; i++) h = h * 31 + s.charCodeAt(i) | 0;
-    return h;
-  };
-  const parity = hash([idA, idB].sort().join("|")) % 2 === 0 ? -1 : 1;
-  return idA < idB ? parity : -parity;
-}
 function rankIndividualPairsForSemifinals(teams, teamMatchups, pairMatches) {
   const roundRobinMatchupIds = new Set((teamMatchups || []).filter((m) => m.stage === "round_robin").map((m) => m.id));
   const completed = (pairMatches || []).filter((m) => m.status === "completed" && roundRobinMatchupIds.has(m.teamMatchupId));
@@ -711,7 +824,7 @@ function rankIndividualPairsForSemifinals(teams, teamMatchups, pairMatches) {
     if (x.losses !== y.losses) return x.losses - y.losses;
     if (y.pointDiff !== x.pointDiff) return y.pointDiff - x.pointDiff;
     if (y.pointsFor !== x.pointsFor) return y.pointsFor - x.pointsFor;
-    return stablePairTiebreak(x.registrationId, y.registrationId);
+    return stableTiebreak2(x.registrationId, y.registrationId);
   });
   return sorted.map((r, i) => ({
     ...r,
@@ -724,7 +837,6 @@ function pairsOfficiallyTied(x, y) {
 }
 
 // packages/engine/src/teamPlayoffs.js
-var defaultId4 = () => `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 function nextPow2(n) {
   let s = 1;
   while (s < n) s *= 2;
@@ -903,7 +1015,7 @@ function buildChildMatch(genId, matchup) {
   };
 }
 function generateQualifierBracketShell(qualifiers, { makeId, startRound = 1, sameTeamPolicy = "allow_anywhere" } = {}) {
-  const genId = makeId || defaultId4;
+  const genId = makeId || defaultId;
   const M = qualifiers.length;
   if (M < 2) return { teamMatchups: [], pairMatches: [], conflicts: [] };
   if (M === 2) {
@@ -976,22 +1088,35 @@ function generateQualifierBracketShell(qualifiers, { makeId, startRound = 1, sam
   }
   const semis = rounds[knockoutRounds - 1];
   const final = buildFinalShell(genId(), startRound + knockoutRounds);
-  const bronze = buildBronzeShell(genId(), startRound + knockoutRounds);
   semis[0].nextMatchupId = final.id;
   semis[0].nextMatchupSlot = "A";
-  semis[0].loserNextMatchupId = bronze.id;
-  semis[0].loserNextMatchupSlot = "A";
   semis[1].nextMatchupId = final.id;
   semis[1].nextMatchupSlot = "B";
-  semis[1].loserNextMatchupId = bronze.id;
-  semis[1].loserNextMatchupSlot = "B";
+  for (const semi of semis) {
+    if (semi.status !== "bye") continue;
+    const pairId = semi.winnerTeamId === semi.teamAId ? semi.pairAId : semi.pairBId;
+    if (semi.nextMatchupSlot === "A") {
+      final.teamAId = semi.winnerTeamId;
+      final.pairAId = pairId;
+    } else {
+      final.teamBId = semi.winnerTeamId;
+      final.pairBId = pairId;
+    }
+  }
+  const bronze = semis.some((m) => m.status === "bye") ? null : buildBronzeShell(genId(), startRound + knockoutRounds);
+  if (bronze) {
+    semis[0].loserNextMatchupId = bronze.id;
+    semis[0].loserNextMatchupSlot = "A";
+    semis[1].loserNextMatchupId = bronze.id;
+    semis[1].loserNextMatchupSlot = "B";
+  }
   const knockoutShells = rounds.flat();
   const pairMatches = [];
   for (const m of knockoutShells) {
     if (m.status === "bye") continue;
     if (m.pairAId && m.pairBId) pairMatches.push(buildChildMatch(genId, m));
   }
-  return { teamMatchups: [...knockoutShells, final, bronze], pairMatches, conflicts };
+  return { teamMatchups: [...knockoutShells, final, ...bronze ? [bronze] : []], pairMatches, conflicts };
 }
 
 // packages/engine/src/registration.js
@@ -1097,7 +1222,8 @@ var COMMAND_TYPES = Object.freeze([
   "start_match",
   "coin_toss",
   "score_event",
-  "complete_match"
+  "complete_match",
+  "set_match_timer"
 ]);
 var TOURNAMENT_STATUSES2 = Object.freeze([
   "draft",
@@ -1173,6 +1299,8 @@ function httpError(status, code, message) {
 function createBatch() {
   const upserts = {};
   const deletes = {};
+  const expect = [];
+  const precondition = [];
   return {
     upsert(table, row) {
       if (!row?.id) throw httpError(500, "INTERNAL", `upsert ${table} requires id`);
@@ -1181,19 +1309,58 @@ function createBatch() {
     delete(table, id) {
       (deletes[table] ||= []).push(id);
     },
+    // The `matches` row this batch rewrites must still be the version the
+    // handler read (checked under a row lock in apply_official_writes,
+    // migration 0018). A mismatch means another command changed it in
+    // between: STALE_WRITE, and the command is re-run on fresh state.
+    expectMatch(match) {
+      if (match?.id && match.updated_at) expect.push({ table: "matches", id: match.id, updated_at: match.updated_at });
+    },
+    // A client-supplied "I last saw this version" check: STALE_STATE (409).
+    preconditionMatch(id, updatedAt) {
+      if (id && updatedAt) precondition.push({ table: "matches", id, updated_at: updatedAt });
+    },
     payload() {
       const body = { upserts };
       if (Object.keys(deletes).length) body.deletes = deletes;
+      if (expect.length) body.expect = expect;
+      if (precondition.length) body.precondition = precondition;
       return body;
     }
   };
 }
+var SEQ_UNIQUE_CONSTRAINT = "score_events_match_id_seq_key";
+function violatedConstraint(error) {
+  const m = /unique constraint "([^"]+)"/i.exec(String(error?.message || ""));
+  return m ? m[1] : null;
+}
+function writeError(error) {
+  const dbCode = String(error?.code || "");
+  const constraint = violatedConstraint(error);
+  const make = (status, code, message) => Object.assign(httpError(status, code, message), { dbCode, constraint, current: error?.details || null });
+  if (dbCode === "TC001") return make(409, "COMMAND_ALREADY_APPLIED", "This command was already applied.");
+  if (dbCode === "TC412") return make(409, "STALE_WRITE", "The data changed while this command was running.");
+  if (dbCode === "TC409") return make(409, "STALE_STATE", "This was changed on another device since you last loaded it. Reload and try again.");
+  if (dbCode === "23505" || !dbCode && constraint) {
+    if (constraint === SEQ_UNIQUE_CONSTRAINT) return make(409, "SEQ_CONFLICT", "Another score was recorded at the same point. Reload the match.");
+    return make(409, "CONFLICT", "This conflicts with a change that was just made. Reload and try again.");
+  }
+  if (dbCode === "23503") return make(409, "CONFLICT", "Something this change refers to was changed or removed. Reload and try again.");
+  if (["23502", "23514", "22P02", "22023", "22003", "22007", "22008"].includes(dbCode)) {
+    return make(400, "INVALID_COMMAND", "The request contained an invalid value.");
+  }
+  if (["40001", "40P01", "55P03", "57014", "53300", "08000", "08003", "08006"].includes(dbCode)) {
+    return make(503, "RETRY_LATER", "The server is busy. Please retry.");
+  }
+  return make(500, "WRITE_FAILED", "The change could not be saved. Please retry.");
+}
+function isUniqueViolation(err) {
+  return err?.dbCode === "23505" || err?.status === 409 && Boolean(err?.constraint);
+}
 async function applyBatch(admin, batch) {
   const payload = batch.payload();
   const { data, error } = await admin.rpc("apply_official_writes", { payload });
-  if (error) {
-    throw httpError(500, "WRITE_FAILED", error.message);
-  }
+  if (error) throw writeError(error);
   return data;
 }
 function nowIso() {
@@ -1461,6 +1628,12 @@ var KNOCKOUT_STAGE_UNIQUE_INDEX = "stages_one_team_knockout_per_division_uidx";
 function isValidQualifierCount(value) {
   return typeof value === "number" && Number.isInteger(value) && value >= 1;
 }
+function assertGameTimeConfig(config) {
+  if (!config || !Object.hasOwn(config, "gameTimeSeconds") || config.gameTimeSeconds === null) return;
+  if (!isValidGameTimeSec(config.gameTimeSeconds)) {
+    throw httpError(400, "INVALID_GAME_TIME", `Game time must be a whole number of seconds from ${MIN_GAME_TIME_SEC} to ${MAX_GAME_TIME_SEC}`);
+  }
+}
 function assertTeamQualificationConfig(config) {
   if (Object.hasOwn(config, "qualifierMode") && config.qualifierMode !== TEAM_QUALIFIER_MODE) {
     throw httpError(
@@ -1505,12 +1678,17 @@ async function matchScoringSettings(admin, division, match) {
   }
   return { ...scoringSettings(division.config), winTo: matchScoringTarget(match, related), winBy: SCORING_WIN_BY };
 }
-async function commit(admin, batch, { command_id, type, actorId, actorDeviceId, tournamentId, matchId, result, detail }) {
+async function commit(admin, batch, { command_id, type, request_hash, precondition, actorId, actorDeviceId, tournamentId, matchId, result, detail }) {
+  if (precondition) {
+    if (!matchId) throw httpError(500, "INTERNAL", "precondition could not be applied");
+    batch.preconditionMatch(matchId, precondition.match_updated_at);
+  }
   batch.upsert("command_receipts", {
     id: command_id,
     actor_id: actorDeviceId ? null : actorId,
     actor_device_id: actorDeviceId || null,
     command_type: type,
+    ...request_hash ? { request_hash } : {},
     result,
     created_at: nowIso()
   });
@@ -1610,21 +1788,25 @@ async function existingReceipt(admin, command_id) {
   if (error) throw error;
   return data;
 }
+function lookupError(error, what) {
+  if (error?.code === "22P02") return httpError(400, "INVALID_COMMAND", `${what} must be a UUID`);
+  return error;
+}
 async function getTournament(admin, id) {
   const { data, error } = await admin.from("tournaments").select("*").eq("id", id).maybeSingle();
-  if (error) throw error;
+  if (error) throw lookupError(error, "tournament_id");
   if (!data) throw httpError(404, "NOT_FOUND", "Tournament not found");
   return data;
 }
 async function getDivision(admin, id) {
   const { data, error } = await admin.from("divisions").select("*").eq("id", id).maybeSingle();
-  if (error) throw error;
+  if (error) throw lookupError(error, "division_id");
   if (!data) throw httpError(404, "NOT_FOUND", "Division not found");
   return data;
 }
 async function getMatch(admin, id) {
   const { data, error } = await admin.from("matches").select("*").eq("id", id).maybeSingle();
-  if (error) throw error;
+  if (error) throw lookupError(error, "match_id");
   if (!data) throw httpError(404, "NOT_FOUND", "Match not found");
   return data;
 }
@@ -1754,7 +1936,10 @@ function upsertMatchupSlot(batch, muSides, matchupId, slot, participantId, teamI
 function applyIndividualPatch(batch, matchups, muSides, adv) {
   if (!adv) return;
   const next = (matchups || []).find((m) => m.id === adv.matchupId);
-  if (next) persistMatch(batch, { ...next, status: next.status === "bye" ? "bye" : "scheduled" });
+  if (next) {
+    batch.expectMatch(next);
+    persistMatch(batch, { ...next, status: next.status === "bye" ? "bye" : "scheduled" });
+  }
   if (Object.hasOwn(adv.patch, "pairAId") || Object.hasOwn(adv.patch, "teamAId")) {
     upsertMatchupSlot(batch, muSides, adv.matchupId, "A", adv.patch.pairAId, adv.patch.teamAId);
   }
@@ -1889,6 +2074,7 @@ async function finishMatchIfWon(admin, batch, match, scoreState, actorId) {
     if (patch) {
       const next = (all || []).find((m) => m.id === patch.matchId);
       if (next) {
+        batch.expectMatch(next);
         persistMatch(batch, { ...next });
         if (patch.patch.registrationAId) {
           const row = (allSides || []).find((x) => x.match_id === patch.matchId && x.slot === "A");
@@ -1909,9 +2095,6 @@ async function finishMatchIfWon(admin, batch, match, scoreState, actorId) {
             participant_id: patch.patch.registrationBId,
             team_id: row?.team_id ?? null
           });
-        }
-        if (patch.patch.status) {
-          persistMatch(batch, { ...next, status: next.status === "bye" ? next.status : next.status });
         }
       }
       progressed = { next: patch };
@@ -1962,6 +2145,8 @@ async function finishMatchIfWon(admin, batch, match, scoreState, actorId) {
       },
       pairMatches
     );
+    batch.expectMatch(parent);
+    if (!finalized) persistMatch(batch, { ...parent });
     if (finalized) {
       persistMatch(batch, {
         ...parent,
@@ -2087,6 +2272,7 @@ async function handleCreateDivision(admin, actor, payload, envelope) {
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
   const format = payload.format || "single_elim";
   const config = { ...payload.config || { bestOf: 1, winBy: "none", isDoubles: true } };
+  assertGameTimeConfig(config);
   if (format === "team_elimination") {
     assertTeamQualificationConfig(config);
     if (config.sameTeamPolicy == null) config.sameTeamPolicy = "avoid_semis";
@@ -2117,6 +2303,7 @@ async function handleUpdateDivision(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
   await requireOrganizerLicensed(admin, actor, member);
+  if (payload.config != null) assertGameTimeConfig(payload.config);
   const next = {
     ...division,
     name: payload.name != null ? String(payload.name).trim() : division.name,
@@ -2220,6 +2407,12 @@ async function handleCreateTeam(admin, actor, payload, envelope) {
   await requireOrganizerLicensed(admin, actor, member);
   const name = String(payload.name || "").trim();
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
+  if (payload.division_id) {
+    const division = await getDivision(admin, payload.division_id);
+    if (division.tournament_id !== tournament.id) {
+      throw httpError(400, "INVALID_COMMAND", "Division does not belong to this tournament");
+    }
+  }
   const team = {
     id: uuid(),
     tournament_id: tournament.id,
@@ -2280,7 +2473,7 @@ async function handleAddTeamMember(admin, actor, payload, envelope) {
       result: { team_member: row }
     });
   } catch (err) {
-    if (/unique|duplicate/i.test(String(err.message))) {
+    if (isUniqueViolation(err)) {
       throw httpError(409, "DUPLICATE_MEMBER", "Player is already on this team");
     }
     throw err;
@@ -2403,6 +2596,12 @@ async function handleUpdateMatchParticipant(admin, actor, payload, envelope) {
   if (slot !== "A" && slot !== "B") throw httpError(400, "INVALID_COMMAND", "slot must be A or B");
   if (!MATCH_PARTICIPANT_EDITABLE_STATUSES.has(match.status)) {
     throw httpError(409, "MATCH_NOT_EDITABLE", "Players can only be changed before the match starts");
+  }
+  if (match.parent_match_id) {
+    const parent = await getMatch(admin, match.parent_match_id);
+    if (parent.stage_label && parent.stage_label !== "round_robin") {
+      throw httpError(409, "MATCH_LOCKED_BY_TEAM_MATCHUP", "Players in a team playoff match come from its bracket slot and can't be changed here");
+    }
   }
   const { data: mp } = await admin.from("match_participants").select("*").eq("match_id", match.id).eq("slot", slot).maybeSingle();
   if (!mp || !mp.participant_id) throw httpError(404, "NOT_FOUND", "No player pairing is assigned to this side yet");
@@ -2542,6 +2741,9 @@ async function handleCreateCourt(admin, actor, payload, envelope) {
     result: { court }
   });
 }
+function sameUuid(a, b) {
+  return typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
+}
 async function handleAddMember(admin, actor, payload, envelope) {
   const tournament = await getTournament(admin, payload.tournament_id);
   const member = await loadMember(admin, tournament.id, actor.id);
@@ -2549,11 +2751,13 @@ async function handleAddMember(admin, actor, payload, envelope) {
   if (!["admin", "umpire", "viewer"].includes(payload.role)) {
     throw httpError(400, "INVALID_COMMAND", "role must be admin, umpire, or viewer");
   }
-  if (payload.user_id === actor.id && payload.role !== "organizer") {
-  }
   if (!isUuid2(payload.user_id)) throw httpError(400, "INVALID_COMMAND", "user_id must be a UUID");
+  if (sameUuid(payload.user_id, actor.id)) throw httpError(403, "FORBIDDEN", "You can't change your own role");
   await requireProfile(admin, payload.user_id);
   const { data: existing } = await admin.from("tournament_members").select("*").eq("tournament_id", tournament.id).eq("user_id", payload.user_id).maybeSingle();
+  if (existing?.role === "organizer" || sameUuid(payload.user_id, tournament.owner_id)) {
+    throw httpError(403, "FORBIDDEN", "The tournament organizer's role can't be changed");
+  }
   const row = {
     id: existing?.id || uuid(),
     tournament_id: tournament.id,
@@ -2574,6 +2778,9 @@ async function handleGenerateBracket(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
   await requireOrganizerLicensed(admin, actor, member);
+  if (division.format === "team_elimination") {
+    throw httpError(400, "INVALID_COMMAND", "Team elimination divisions use generate_team_elimination");
+  }
   const { data: existingMatches } = await admin.from("matches").select("id").eq("division_id", division.id).limit(1);
   if (existingMatches?.length) throw httpError(409, "BRACKET_EXISTS", "Division already has matches");
   const { data: participants, error } = await admin.from("participants").select("*").eq("division_id", division.id).order("seed", { ascending: true, nullsFirst: false });
@@ -2650,6 +2857,9 @@ async function handleGenerateTeamElimination(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
   await requireOrganizerLicensed(admin, actor, member);
+  if (division.format !== "team_elimination") {
+    throw httpError(400, "INVALID_COMMAND", "Division is not team elimination");
+  }
   const { data: existingMatches } = await admin.from("matches").select("id").eq("division_id", division.id).limit(1);
   if (existingMatches?.length) throw httpError(409, "BRACKET_EXISTS", "Division already has matches");
   const { data: teams } = await admin.from("teams").select("*").eq("division_id", division.id);
@@ -2810,7 +3020,7 @@ async function handleGenerateTeamPlayoffs(admin, actor, payload, envelope) {
       }
     });
   } catch (err) {
-    if (String(err?.message || "").includes(KNOCKOUT_STAGE_UNIQUE_INDEX)) {
+    if (err?.constraint === KNOCKOUT_STAGE_UNIQUE_INDEX) {
       throw httpError(409, "PLAYOFFS_EXIST", "Knockout stage already generated");
     }
     throw err;
@@ -2844,6 +3054,7 @@ async function handleAssignCourt(admin, actor, payload, envelope) {
   });
   if (match.status === "scheduled") {
     assertTransitionMatch(match.status, "ready");
+    batch.expectMatch(match);
     persistMatch(batch, { ...match, status: "ready" });
   }
   return commit(admin, batch, {
@@ -2875,6 +3086,7 @@ async function handleAssignUmpire(admin, actor, payload, envelope) {
   if (match.status === "ready" || match.status === "scheduled") {
     assertTransitionMatch(match.status, "assigned");
     status = "assigned";
+    batch.expectMatch(match);
     persistMatch(batch, { ...match, status });
   }
   return commit(admin, batch, {
@@ -2898,20 +3110,28 @@ async function handleTransitionMatch(admin, actor, payload, envelope) {
     const ump = await matchUmpire(admin, match.id);
     requireScoreAccess(member, ump?.user_id, actor.id);
   }
+  if (payload.status === "completed" || payload.status === "in_progress") {
+    throw httpError(409, "ILLEGAL_TRANSITION", `Use ${payload.status === "completed" ? "complete_match" : "start_match"} to move a match to ${payload.status}`);
+  }
   try {
     assertTransitionMatch(match.status, payload.status);
   } catch (err) {
     throw httpError(409, err.code || "ILLEGAL_TRANSITION", err.message);
   }
   const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  const next = { ...match, status: payload.status };
+  if (match.status === "in_progress" && normalizeTimer(match.timer)) {
+    next.timer = pauseTimer(match.timer, nowIso());
+  }
   const batch = createBatch();
-  persistMatch(batch, { ...match, status: payload.status });
+  batch.expectMatch(match);
+  persistMatch(batch, next);
   return commit(admin, batch, {
     ...envelope,
     actorId: actor.id,
     tournamentId: match.tournament_id,
     matchId: match.id,
-    result: { match: { ...match, status: payload.status } },
+    result: { match: next },
     detail: reason ? { ok: true, transition: { match_id: match.id, from: match.status, to: payload.status, reason } } : void 0
   });
 }
@@ -2935,8 +3155,14 @@ async function handleStartMatch(admin, actor, payload, envelope) {
   await assertMatchPlayable(admin, match, division);
   const settings = await matchScoringSettings(admin, division, match);
   const score_state = scoreStateForMatchStart(match, settings);
-  const next = { ...match, status: "in_progress", started_at: nowIso(), score_state };
+  const started_at = nowIso();
+  const next = { ...match, status: "in_progress", started_at, score_state };
+  if (Object.hasOwn(match, "timer")) {
+    const timer = normalizeTimer(match.timer) || (!match.started_at ? timerFromDivisionConfig(division.config, { now: started_at, by: actor.id }) : null);
+    if (timer) next.timer = startTimer(timer, started_at);
+  }
   const batch = createBatch();
+  batch.expectMatch(match);
   persistMatch(batch, next);
   return commit(admin, batch, {
     ...envelope,
@@ -2996,14 +3222,23 @@ async function handleCoinToss(admin, actor, payload, envelope) {
   if (!payload.result && !payload.winner && !payload.serving_team) {
     throw httpError(400, "INVALID_COMMAND", "coin toss result is required");
   }
+  const seq = payload.seq ?? 1;
+  if (!Number.isSafeInteger(seq) || seq < 1) throw httpError(400, "INVALID_COMMAND", "seq must be a positive integer");
   const event = {
     id: payload.event_id,
-    seq: payload.seq ?? 1,
+    seq,
     type: "coin_toss",
     payload: toss
   };
-  let state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
-  const applied = applyScoreEvent(state, event);
+  let state;
+  let applied;
+  try {
+    state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
+    applied = applyScoreEvent(state, event);
+  } catch (err) {
+    if (err?.status) throw err;
+    throw httpError(409, err.code || "OUT_OF_ORDER", err.message);
+  }
   state = applied.state;
   if (!applied.applied) {
     const kept = { ...match, coin_toss: already || toss, serving_team: match.serving_team || toss.servingTeam, score_state: state };
@@ -3031,6 +3266,7 @@ async function handleCoinToss(admin, actor, payload, envelope) {
     ...scoreActor(actor),
     created_at: nowIso()
   });
+  batch.expectMatch(match);
   persistMatch(batch, next);
   return commit(admin, batch, {
     ...envelope,
@@ -3038,7 +3274,14 @@ async function handleCoinToss(admin, actor, payload, envelope) {
     tournamentId: match.tournament_id,
     matchId: match.id,
     result: coinTossResult(next)
-  });
+  }).catch((err) => rethrowSeqConflict(admin, err, match.id, event.seq));
+}
+async function rethrowSeqConflict(admin, err, matchId, seq) {
+  if (err?.code !== "SEQ_CONFLICT") throw err;
+  const { data } = await admin.from("matches").select("score_state").eq("id", matchId).maybeSingle();
+  const lastSeq = Number(data?.score_state?.lastSeq);
+  const shown = Number.isFinite(lastSeq) ? lastSeq : seq;
+  throw httpError(409, "OUT_OF_ORDER", `Events must be applied in seq order (lastSeq=${shown}, got ${seq})`);
 }
 async function handleScoreEvent(admin, actor, payload, envelope) {
   const match = await getMatch(admin, payload.match_id);
@@ -3069,7 +3312,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     throw httpError(409, "ILLEGAL_TRANSITION", "Match is not in progress");
   }
   if (!isUuid2(payload.event_id)) throw httpError(400, "INVALID_COMMAND", "event_id must be a UUID");
-  if (typeof payload.seq !== "number") throw httpError(400, "INVALID_COMMAND", "seq is required");
+  if (!Number.isSafeInteger(payload.seq) || payload.seq < 1) throw httpError(400, "INVALID_COMMAND", "seq must be a positive integer");
   const { data: dup } = await admin.from("score_events").select("id").eq("id", payload.event_id).maybeSingle();
   const cached = match.score_state && typeof match.score_state.lastSeq === "number" ? match.score_state : null;
   const canFastForward = Boolean(cached) && payload.seq === cached.lastSeq + 1 && cached.winTo === settings.winTo && cached.winBy === settings.winBy;
@@ -3132,12 +3375,14 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     };
   }
   if (wasCompleted) {
+    batch.expectMatch(match);
     persistMatch(batch, { ...match, score_state: state });
     const { data: existingResult } = await admin.from("match_results").select("*").eq("match_id", match.id).maybeSingle();
     if (existingResult) {
       batch.upsert("match_results", { ...existingResult, games: state.games || [], score_a: state.scoreA, score_b: state.scoreB });
     }
   } else {
+    batch.expectMatch(match);
     persistMatch(batch, { ...match, score_state: state });
     if (state.status === "completed") {
       const fin = await finishMatchIfWon(admin, batch, { ...match, score_state: state }, state, actor.kind === "station" ? actor.deviceId : actor.id);
@@ -3152,7 +3397,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     matchId: match.id,
     result: { match: completed || { ...match, score_state: state }, score_state: state, duplicate: false, progressed },
     detail
-  });
+  }).catch((err) => rethrowSeqConflict(admin, err, match.id, payload.seq));
   if (!wasCompleted && state.status === "completed") {
     await reconcilePlayoffChildren(admin, match.division_id, division.format);
   }
@@ -3173,6 +3418,7 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
     throw httpError(409, "MATCH_NOT_WON", "Scoring has not produced a winner");
   }
   const batch = createBatch();
+  batch.expectMatch(match);
   const fin = await finishMatchIfWon(admin, batch, match, state, actor.kind === "station" ? actor.deviceId : actor.id);
   const result = await commit(admin, batch, {
     ...envelope,
@@ -3183,6 +3429,64 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
   });
   await reconcilePlayoffChildren(admin, match.division_id, division.format);
   return result;
+}
+var TIMER_SETUP_STATUSES = /* @__PURE__ */ new Set(["scheduled", "ready", "assigned", "postponed"]);
+async function handleSetMatchTimer(admin, actor, payload, envelope) {
+  requireUserActor(actor);
+  const match = await getMatch(admin, payload.match_id);
+  const member = await loadMember(admin, match.tournament_id, actor.id);
+  await requireOrganizerLicensed(admin, actor, member);
+  if (!Object.hasOwn(match, "timer")) {
+    throw httpError(409, "TIMER_UNAVAILABLE", "Game timer is not available on this server yet");
+  }
+  const action = payload.action;
+  const now = nowIso();
+  const meta = { now, by: actor.id };
+  const current = normalizeTimer(match.timer);
+  let timer;
+  const started = match.status === "in_progress" || TIMER_SETUP_STATUSES.has(match.status) && Boolean(match.started_at);
+  if (action === "set" || action === "clear") {
+    if (started) {
+      throw httpError(409, "MATCH_ALREADY_STARTED", "The game has already started. Add or remove time, or reset the timer instead.");
+    }
+    if (!TIMER_SETUP_STATUSES.has(match.status)) {
+      throw httpError(409, "MATCH_NOT_ACTIVE", `Cannot change the game time of a ${match.status} match`);
+    }
+    if (action === "set") {
+      if (!isValidGameTimeSec(payload.duration_seconds)) {
+        throw httpError(400, "INVALID_GAME_TIME", `Game time must be a whole number of seconds from ${MIN_GAME_TIME_SEC} to ${MAX_GAME_TIME_SEC}`);
+      }
+      timer = configureTimer(payload.duration_seconds, meta);
+    } else {
+      timer = null;
+    }
+  } else if (action === "adjust" || action === "reset") {
+    if (!started) {
+      throw httpError(409, "MATCH_NOT_ACTIVE", match.status === "completed" ? "This game is already completed" : TIMER_SETUP_STATUSES.has(match.status) ? "The game has not started yet. Set the game time instead." : `Cannot change the timer of a ${match.status} match`);
+    }
+    if (!current) throw httpError(409, "NO_TIMER", "This match has no game timer");
+    if (action === "adjust") {
+      if (!isValidTimerAdjustSec(payload.delta_seconds)) {
+        throw httpError(400, "INVALID_COMMAND", `delta_seconds must be a non-zero whole number up to \xB1${MAX_ADJUST_SEC}`);
+      }
+      timer = adjustTimer(current, payload.delta_seconds, meta);
+    } else {
+      timer = resetTimer(current, meta);
+    }
+  } else {
+    throw httpError(400, "INVALID_COMMAND", "action must be set, clear, adjust or reset");
+  }
+  const next = { ...match, timer };
+  const batch = createBatch();
+  batch.expectMatch(match);
+  persistMatch(batch, next);
+  return commit(admin, batch, {
+    ...envelope,
+    actorId: actor.id,
+    tournamentId: match.tournament_id,
+    matchId: match.id,
+    result: { match: next }
+  });
 }
 async function handleOpenCourtPairing(admin, actor, payload, envelope) {
   requireUserActor(actor);
@@ -3306,8 +3610,53 @@ var HANDLERS = {
   start_match: handleStartMatch,
   coin_toss: handleCoinToss,
   score_event: handleScoreEvent,
-  complete_match: handleCompleteMatch
+  complete_match: handleCompleteMatch,
+  set_match_timer: handleSetMatchTimer
 };
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().filter((k) => value[k] !== void 0).map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+async function requestHash(type, payload) {
+  return sha256Hex(canonicalJson({ type, payload }));
+}
+function receiptMatches(receipt, actor, type, hash) {
+  const sameActor = actor.kind === "station" ? receipt.actor_device_id === actor.deviceId : receipt.actor_id === actor.id;
+  if (!sameActor) return false;
+  if (receipt.request_hash) return receipt.request_hash === hash;
+  return receipt.command_type === type;
+}
+function replay(receipt, actor, envelope, hash) {
+  if (!receiptMatches(receipt, actor, envelope.type, hash)) {
+    throw Object.assign(
+      httpError(409, "IDEMPOTENCY_KEY_REUSED", "This command id was already used for a different request."),
+      { commandId: envelope.command_id }
+    );
+  }
+  if (envelope.type === "open_court_pairing") {
+    throw httpError(409, "PAIRING_REPLAY", "This pairing window was already opened. Open a new pairing window to show the QR code.");
+  }
+  return { ok: true, idempotent: true, result: receipt.result };
+}
+var STALE_WRITE_ATTEMPTS = 3;
+var PRECONDITION_COMMANDS = Object.freeze(["transition_match", "start_match", "coin_toss", "score_event", "complete_match"]);
+function validatePrecondition(type, payload) {
+  const pre = payload?.precondition;
+  if (pre === void 0) return void 0;
+  const bad = (message) => httpError(400, "INVALID_COMMAND", message);
+  if (!PRECONDITION_COMMANDS.includes(type)) throw bad(`precondition is not supported for ${type}`);
+  if (!pre || typeof pre !== "object" || Array.isArray(pre)) throw bad("precondition must be an object");
+  const keys = Object.keys(pre);
+  if (keys.length !== 1 || keys[0] !== "match_updated_at") throw bad("precondition supports only match_updated_at");
+  if (typeof pre.match_updated_at !== "string" || Number.isNaN(Date.parse(pre.match_updated_at))) {
+    throw bad("precondition.match_updated_at must be a timestamp");
+  }
+  if (!isUuid2(payload.match_id)) throw bad("precondition requires match_id");
+  return pre;
+}
 async function handleCommand({ admin, actor, body }) {
   if (!actor?.id) throw httpError(401, "UNAUTHENTICATED", "Missing actor");
   const envelope = parseCommandEnvelope(body);
@@ -3316,17 +3665,47 @@ async function handleCommand({ admin, actor, body }) {
   } catch (err) {
     throw httpError(err.status || 403, err.code || "FORBIDDEN", err.message);
   }
+  const precondition = validatePrecondition(envelope.type, envelope.payload);
+  const hash = await requestHash(envelope.type, envelope.payload);
   const prior = await existingReceipt(admin, envelope.command_id);
-  if (prior) return { ok: true, idempotent: true, result: prior.result };
+  if (prior) return replay(prior, actor, envelope, hash);
   const handler = HANDLERS[envelope.type];
-  const result = await handler(admin, actor, envelope.payload, envelope);
-  return { ok: true, idempotent: false, result };
+  const context = { ...envelope, request_hash: hash, precondition };
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const result = await handler(admin, actor, envelope.payload, context);
+      return { ok: true, idempotent: false, result };
+    } catch (err) {
+      if (err?.code === "COMMAND_ALREADY_APPLIED") {
+        const winner = await existingReceipt(admin, envelope.command_id);
+        if (winner) return replay(winner, actor, envelope, hash);
+        throw httpError(503, "RETRY_LATER", "The server is busy. Please retry.");
+      }
+      if (err?.code === "STALE_WRITE") {
+        if (attempt < STALE_WRITE_ATTEMPTS) continue;
+        throw httpError(503, "RETRY_LATER", "The server is busy. Please retry.");
+      }
+      throw err;
+    }
+  }
+}
+function errorResponse(err, commandId) {
+  const known = Number.isFinite(Number(err?.status)) && Number(err.status) > 0;
+  const status = known ? Number(err.status) : 500;
+  const error = known ? { code: err.code || "INTERNAL", message: err.message } : { code: "INTERNAL", message: "Something went wrong on the server. Please retry." };
+  if (status === 409 && commandId) error.command_id = commandId;
+  if (err?.code === "STALE_STATE" && err.current) error.current_revision = err.current;
+  return { status, body: { ok: false, error } };
 }
 export {
+  PRECONDITION_COMMANDS,
   STATION_COMMANDS,
   STATION_FORBIDDEN_COMMANDS,
   STATION_SCORE_EVENT_TYPES,
   assertStationMayIssue,
+  canonicalJson,
+  errorResponse,
   handleCommand,
+  requestHash,
   resolveActor
 };

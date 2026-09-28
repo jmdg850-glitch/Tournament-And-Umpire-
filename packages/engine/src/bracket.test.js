@@ -167,3 +167,13 @@ describe("computeSemifinalFillPatches — standings-driven Semifinal auto-fill",
     expect(computeSemifinalFillPatches(standings, filled)).toEqual([]);
   });
 });
+
+describe("generateBracket — 3 entrants with bronze (regression)", () => {
+  test("no bronze match is created, because the bye semifinal has no loser", () => {
+    const matches = generateBracket(regs(3), { makeId: idGen(), bronzeMatch: true });
+    expect(matches.some((m) => m.bracketSide === "bronze")).toBe(false);
+    expect(matches.every((m) => !m.loserNextMatchId)).toBe(true);
+    const final = matches.find((m) => m.round === 2);
+    expect([final.registrationAId, final.registrationBId].filter(Boolean).length).toBe(1);
+  });
+});

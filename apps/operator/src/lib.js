@@ -87,6 +87,21 @@ export function firstQueryError(results) {
 // history on TournamentDesk.jsx's load() for why unfiltered dependent-table
 // queries are unsafe (PostgREST's default response cap silently truncated
 // them once a project had enough tournaments).
+// Reads every row of a query, a page at a time. The hosted API returns at
+// most 1000 rows per request, so an unfiltered count ("players", "matches
+// today") silently stopped at 1000. `makeQuery` must build a fresh, stably
+// ordered query each call. Returns { data, error, status } like one query.
+export async function selectAllPages(makeQuery, pageSize = 1000) {
+  const rows = [];
+  for (let from = 0; ; from += pageSize) {
+    const res = await makeQuery().range(from, from + pageSize - 1);
+    if (res?.error) return { data: null, error: res.error, status: res.status ?? 0 };
+    const page = res?.data || [];
+    rows.push(...page);
+    if (page.length < pageSize) return { data: rows, error: null, status: res?.status ?? 200 };
+  }
+}
+
 export async function loadDeskData(supabase, tournamentId) {
   const primary = await Promise.all([
     supabase.from("tournaments").select("*").eq("id", tournamentId).maybeSingle(),
@@ -100,8 +115,10 @@ export async function loadDeskData(supabase, tournamentId) {
     supabase.from("court_devices").select("*").eq("tournament_id", tournamentId),
     supabase.from("profiles").select("id, display_name"),
   ]);
-  const primaryErr = firstQueryError(primary);
-  if (primaryErr) return { data: null, error: primaryErr };
+  // `status` (0 = no answer from the server) lets callers tell "offline"
+  // apart from a real server/permission error.
+  const primaryFailed = primary.find((r) => r?.error);
+  if (primaryFailed) return { data: null, error: primaryFailed.error, status: primaryFailed.status ?? 0 };
   const [t, divisions, persons, teams, participants, courts, members, matches, courtDevices, profiles] = primary;
   const matchIds = (matches.data || []).map((m) => m.id);
   const teamIds = (teams.data || []).map((x) => x.id);
@@ -118,8 +135,8 @@ export async function loadDeskData(supabase, tournamentId) {
     participantIds.length ? supabase.from("participant_members").select("*").in("participant_id", participantIds) : empty,
     divisionIds.length ? supabase.from("stages").select("*").in("division_id", divisionIds) : empty,
   ]);
-  const dependentErr = firstQueryError(dependent);
-  if (dependentErr) return { data: null, error: dependentErr };
+  const dependentFailed = dependent.find((r) => r?.error);
+  if (dependentFailed) return { data: null, error: dependentFailed.error, status: dependentFailed.status ?? 0 };
   const [teamMembers, results, courtsA, umpiresA, matchParticipants, participantMembers, stages] = dependent;
 
   return {

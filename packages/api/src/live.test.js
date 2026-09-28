@@ -510,12 +510,19 @@ describe.skipIf(!live)("live team elimination path", () => {
 
   test("qualification, playoffs, bronze/final, persistence, race, authz, idempotency", async () => {
     const createId = crypto.randomUUID();
-    let r = await expectOk(organizer.token, "create_tournament", { name: `TE ${Date.now()}` }, createId);
+    const createPayload = { name: `TE ${Date.now()}` };
+    let r = await expectOk(organizer.token, "create_tournament", createPayload, createId);
     tournamentId = r.body.result.tournament.id;
-    const dupCreate = await send(organizer.token, "create_tournament", { name: "ignored" }, createId);
+    // An identical retry replays the stored result…
+    const dupCreate = await send(organizer.token, "create_tournament", createPayload, createId);
     expect(dupCreate.body.ok).toBe(true);
     expect(dupCreate.body.idempotent).toBe(true);
     expect(dupCreate.body.result.tournament.id).toBe(tournamentId);
+    // …but the same command_id with a different request is refused (migration
+    // 0018 / request_hash), never answered with the first request's result.
+    const reused = await send(organizer.token, "create_tournament", { name: "different" }, createId);
+    expect(reused.status).toBe(409);
+    expect(reused.body.error.code).toBe("IDEMPOTENCY_KEY_REUSED");
 
     await expectOk(organizer.token, "transition_tournament", { tournament_id: tournamentId, status: "registration" });
 

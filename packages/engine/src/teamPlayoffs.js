@@ -3,7 +3,7 @@
 import { seedOrder } from "./bracket.js";
 import { pairsOfficiallyTied } from "./teamRoundRobin.js";
 
-const defaultId = () => `${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
+import { defaultId } from "./ids.js";
 
 function nextPow2(n){ let s = 1; while (s < n) s *= 2; return s; }
 
@@ -208,11 +208,21 @@ export function generateQualifierBracketShell(qualifiers, { makeId, startRound =
 
   const semis = rounds[knockoutRounds - 1];
   const final = buildFinalShell(genId(), startRound + knockoutRounds);
-  const bronze = buildBronzeShell(genId(), startRound + knockoutRounds);
   semis[0].nextMatchupId = final.id; semis[0].nextMatchupSlot = "A";
-  semis[0].loserNextMatchupId = bronze.id; semis[0].loserNextMatchupSlot = "A";
   semis[1].nextMatchupId = final.id; semis[1].nextMatchupSlot = "B";
-  semis[1].loserNextMatchupId = bronze.id; semis[1].loserNextMatchupSlot = "B";
+  // A bye semifinal (3 qualifiers) sends its team straight to the final, and
+  // has no loser — so there is no one to play a bronze match.
+  for (const semi of semis){
+    if (semi.status !== "bye") continue;
+    const pairId = semi.winnerTeamId === semi.teamAId ? semi.pairAId : semi.pairBId;
+    if (semi.nextMatchupSlot === "A"){ final.teamAId = semi.winnerTeamId; final.pairAId = pairId; }
+    else { final.teamBId = semi.winnerTeamId; final.pairBId = pairId; }
+  }
+  const bronze = semis.some(m => m.status === "bye") ? null : buildBronzeShell(genId(), startRound + knockoutRounds);
+  if (bronze){
+    semis[0].loserNextMatchupId = bronze.id; semis[0].loserNextMatchupSlot = "A";
+    semis[1].loserNextMatchupId = bronze.id; semis[1].loserNextMatchupSlot = "B";
+  }
 
   const knockoutShells = rounds.flat();
 
@@ -222,7 +232,7 @@ export function generateQualifierBracketShell(qualifiers, { makeId, startRound =
     if (m.pairAId && m.pairBId) pairMatches.push(buildChildMatch(genId, m));
   }
 
-  return { teamMatchups: [...knockoutShells, final, bronze], pairMatches, conflicts };
+  return { teamMatchups: [...knockoutShells, final, ...(bronze ? [bronze] : [])], pairMatches, conflicts };
 }
 
 export function hasKnockoutStageStarted(teamMatchups, matches){

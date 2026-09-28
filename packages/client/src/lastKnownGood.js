@@ -7,6 +7,8 @@
 // status: 0 }`. Treating that like any other error is what blanked the
 // umpire dashboard when Wi-Fi was turned off.
 
+import { safeStorage } from "./safeStorage.js";
+
 // Classify a failed load. Accepts either a postgrest result
 // (`{ error, status }`) or a thrown error (`sendCommand`'s err.status, or a
 // plain TypeError). Returns null when there is no failure.
@@ -63,6 +65,48 @@ export function applyLoadOutcome(prev, outcome) {
   };
 }
 
+// One user-facing connection/freshness state for a screen, derived from its
+// load state (applyLoadOutcome) and the signed-in identity mode
+// (offlineIdentity.js). Never exposes a raw "Failed to fetch".
+//   kind: "online" | "refreshing" | "offline-cached" | "offline-empty" |
+//         "offline-unverified" | "server" | "auth" | "forbidden" | "error"
+export function deriveConnectionState({ load, identityMode } = {}) {
+  const state = load || INITIAL_LOAD_STATE;
+  const hasData = Array.isArray(state.rows) ? true : state.rows != null;
+  const savedAt = state.lastUpdatedAt ?? null;
+  if (identityMode === "offline-unverified") {
+    return {
+      kind: "offline-unverified",
+      tone: "warn",
+      label: hasData
+        ? "Offline — sign-in not verified. Showing data saved on this device; changes need an internet connection."
+        : "Offline — sign-in not verified, and nothing is saved on this device for this screen yet.",
+      savedAt,
+      hasData,
+    };
+  }
+  switch (state.status) {
+    case "online":
+      return { kind: "online", tone: "ok", label: "Up to date", savedAt, hasData };
+    case "loading":
+      return hasData && state.source === "cache"
+        ? { kind: "refreshing", tone: "info", label: "Showing saved data — refreshing…", savedAt, hasData }
+        : { kind: "refreshing", tone: "info", label: "Loading…", savedAt, hasData };
+    case "offline":
+      return hasData
+        ? { kind: "offline-cached", tone: "warn", label: "Offline — working from saved tournament data.", savedAt, hasData }
+        : { kind: "offline-empty", tone: "warn", label: "Offline — this isn't saved on this device yet. Open it once while online to use it offline.", savedAt, hasData };
+    case "server":
+      return { kind: "server", tone: "warn", label: hasData ? "Server unavailable — showing saved data. Retrying automatically." : "Server unavailable — retrying automatically.", savedAt, hasData };
+    case "auth":
+      return { kind: "auth", tone: "danger", label: "Your sign-in needs to be refreshed. Sign in again (internet required).", savedAt, hasData };
+    case "forbidden":
+      return { kind: "forbidden", tone: "danger", label: "You don't have access to this.", savedAt, hasData };
+    default:
+      return { kind: "error", tone: "danger", label: state.error || "Something went wrong.", savedAt, hasData };
+  }
+}
+
 // Seed the reducer state from a cached snapshot (cold start, possibly offline).
 export function stateFromCache(cached) {
   if (!cached || !Array.isArray(cached.rows)) return INITIAL_LOAD_STATE;
@@ -95,10 +139,3 @@ export function createDashboardCache(key, storage = safeStorage()) {
   };
 }
 
-function safeStorage() {
-  try {
-    return typeof localStorage === "undefined" ? null : localStorage;
-  } catch {
-    return null;
-  }
-}

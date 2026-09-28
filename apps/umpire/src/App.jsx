@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, classifySendError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, createSyncEngine, createMatchLane, createUserAuthProvider, reconstructMatchView, laneOf, ownerKey, classifyQueryFailure, applyLoadOutcome, stateFromCache, createDashboardCache } from "@tournament/client";
-import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, stageScoringTarget, validateFinalScore } from "@tournament/engine";
+import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, classifySendError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, createSyncEngine, createMatchLane, createUserAuthProvider, reconstructMatchView, laneOf, ownerKey, classifyQueryFailure, applyLoadOutcome, stateFromCache, createDashboardCache, probeIdentity, rememberVerified, forgetVerified, sessionGate, startIdentity } from "@tournament/client";
+import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, stageScoringTarget, validateFinalScore, timerView, formatClock } from "@tournament/engine";
 import { clearStation, parsePairingInput, readStation, writeStation, stationDeviceId, stationTokenExpiresSoon } from "./stationSession.js";
+import { markLocalCompletion, timerDisplayMatch } from "./timerDisplay.js";
 import PairingScanner from "./PairingScanner.jsx";
 import CoinTossPanel from "./CoinTossPanel.jsx";
 import {
@@ -12,12 +13,14 @@ import {
   ClickableCard,
   ConfirmDialog,
   EmptyState,
+  GameTimer,
   Input,
   LoadingState,
   Modal,
   Scoreboard,
   SplashScreen,
   StatusBadge,
+  useNow,
 } from "@tournament/ui";
 import { ArrowLeft, LogOut, PauseCircle, QrCode, RefreshCw } from "lucide-react";
 import { version as APP_VERSION } from "../package.json";
@@ -45,6 +48,7 @@ const OUTBOX_DB = "tournament-umpire-outbox";
 const SYNC_LOCK = "tournament-umpire-outbox-sync";
 const COMMAND_TIMEOUT_MS = 15000;
 const DONE_STATUSES = ["completed", "bye", "cancelled", "abandoned"];
+const NO_OFFLINE_STORAGE_MESSAGE = "This device can't store scores offline (browser storage is unavailable). Keep the internet connection on while scoring.";
 
 function offlineError(message = "You're offline.") {
   return new Error(message); // no .status → isNetworkError()
@@ -110,7 +114,7 @@ function applyEntryToMatch(match, entry) {
     if (!r.applied && !r.duplicate) {
       throw new Error(p.type === "correction" ? "That score is not valid for this match." : "That action can't be applied to the current score.");
     }
-    return r.match;
+    return markLocalCompletion(match, r.match, entry);
   }
   if (entry.type === "coin_toss") {
     let next = { ...match, coin_toss: p, serving_team: p.serving_team };
@@ -196,7 +200,13 @@ function useUmpireSync({ cfg, supabase, store, owner, setStation }) {
           action: "refresh",
           timeoutMs: COMMAND_TIMEOUT_MS,
         });
-        const next = { ...readStation(), ...body.result };
+        // The court may have been unpaired (or re-paired) while the refresh
+        // was in flight: never write a token back over that.
+        const current = readStation();
+        if (!current || stationDeviceId(current) !== stationDeviceId(st)) {
+          return { needsAuth: true, message: "This court is no longer paired on this device. Scores saved here are kept but can't be sent from a different pairing." };
+        }
+        const next = { ...current, ...body.result };
         writeStation(next);
         setStationRef.current?.(next);
         return { token: next.access_token };
@@ -259,6 +269,11 @@ export default function App() {
   const supabase = useMemo(() => createBrowserClient(cfg.url, cfg.publishableKey), [cfg]);
   const store = useMemo(() => defaultStore(OUTBOX_DB), []);
   const [session, setSession] = useState(undefined);
+  // Offline identity (packages/client offlineIdentity.js, same rules as the
+  // Operator): a signed-in umpire whose token expired while the server is
+  // unreachable keeps access to THEIR OWN saved matches and pending scores.
+  // No token is created; nothing is sent until a real refresh succeeds.
+  const [offlineIdentity, setOfflineIdentity] = useState(null);
   const [station, setStation] = useState(() => (typeof window === "undefined" ? null : readStation()));
   const [error, setError] = useState("");
   const [matchId, setMatchId] = useState(null);
@@ -268,19 +283,84 @@ export default function App() {
   useEffect(() => {
     applyAuthCallback(supabase);
     if (isRecoveryAuthUrl()) setRecovering(true);
-    supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
+    let cancelled = false;
+    // startIdentity reports the saved offline identity after a short grace
+    // period instead of waiting ~25 s for supabase-js to give up retrying.
+    let liveSession = false;
+    const stopIdentity = startIdentity(supabase, ({ session: s, offlineIdentity: id, settled }) => {
+      if (cancelled || (!settled && liveSession)) return;
+      setSession(s ?? null);
+      setOfflineIdentity(id ?? null);
+    });
     const { data: sub } = supabase.auth.onAuthStateChange((event, next) => {
-      setSession(next);
+      // INITIAL_SESSION (null) fires before the probe above finishes; only a
+      // real session or an explicit sign-out may change identity from here.
+      if (next) {
+        liveSession = true;
+        setSession(next);
+        setOfflineIdentity(null);
+      } else if (event === "SIGNED_OUT") {
+        setSession(null);
+        setOfflineIdentity(null);
+      }
       if (event === "PASSWORD_RECOVERY") setRecovering(true);
       if (event === "SIGNED_OUT") setRecovering(false);
     });
-    return () => sub.subscription.unsubscribe();
+    return () => {
+      cancelled = true;
+      stopIdentity();
+      sub.subscription.unsubscribe();
+    };
   }, [supabase]);
+
+  // Every server-verified session refreshes this device's offline window.
+  useEffect(() => {
+    if (session?.user?.id) rememberVerified(session.user.id);
+  }, [session]);
+
+  // While offline-unverified, keep trying to verify: on reconnect and every
+  // 30 s. A server refusal ends offline mode (sign-in screen).
+  useEffect(() => {
+    if (!offlineIdentity || session) return undefined;
+    let stopped = false;
+    async function recheck() {
+      const probed = await probeIdentity(supabase);
+      if (stopped) return;
+      if (probed.mode === "verified") {
+        setSession(probed.session);
+        setOfflineIdentity(null);
+      } else if (probed.mode === "signed-out") {
+        setOfflineIdentity(null);
+      }
+    }
+    const timer = setInterval(recheck, 30000);
+    window.addEventListener("online", recheck);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      window.removeEventListener("online", recheck);
+    };
+  }, [offlineIdentity, session, supabase]);
+
+  // Who the match list is for: a verified session, or (offline only) a
+  // display-only account for the offline identity — never a token.
+  const account = useMemo(() => {
+    if (session?.user) return session;
+    if (offlineIdentity?.userId) return { user: { id: offlineIdentity.userId, email: offlineIdentity.email }, offline: true };
+    return null;
+  }, [session, offlineIdentity]);
 
   const owner = station?.access_token
     ? ownerKey("station", stationDeviceId(station))
-    : session?.user?.id ? ownerKey("user", session.user.id) : null;
+    : account?.user?.id ? ownerKey("user", account.user.id) : null;
   const sync = useUmpireSync({ cfg, supabase, store, owner, setStation });
+
+  // Offline identity → verified again (same owner): send pending work now
+  // instead of waiting out the retry backoff.
+  const verifiedUserId = session?.user?.id ?? null;
+  useEffect(() => {
+    if (verifiedUserId) sync.engine?.kick({ resetBackoff: true });
+  }, [verifiedUserId, sync.engine]);
 
   // Signing out / unpairing never deletes saved work: queued actions stay on
   // this device, tied to the identity that recorded them, and are never sent
@@ -292,7 +372,16 @@ export default function App() {
     };
   }
   const unpair = () => { clearStation(); setStation(null); setMatchId(null); };
-  const signOut = () => { setMatchId(null); supabase.auth.signOut({ scope: "local" }); };
+  // Offline, supabase-js can't always clear its stored session; forgetting the
+  // verification stamp guarantees an explicit sign-out is never resumed as an
+  // offline identity.
+  const signOut = () => {
+    const uid = account?.user?.id;
+    if (uid) forgetVerified(uid);
+    setOfflineIdentity(null);
+    setMatchId(null);
+    supabase.auth.signOut({ scope: "local" });
+  };
 
   const leaveDialog = leaveRequest ? (
     <ConfirmDialog
@@ -337,8 +426,8 @@ export default function App() {
       </>
     );
   }
-  if (!session) return <Auth cfg={cfg} supabase={supabase} store={store} error={error} setError={setError} onPaired={setStation} />;
-  if (recovering) {
+  if (!account) return <Auth cfg={cfg} supabase={supabase} store={store} error={error} setError={setError} onPaired={setStation} />;
+  if (recovering && session) {
     return (
       <RecoveryScreen
         supabase={supabase}
@@ -362,7 +451,7 @@ export default function App() {
       ) : (
         <MyMatches
           supabase={supabase}
-          session={session}
+          session={account}
           sync={sync}
           onOpen={setMatchId}
           onSignOut={guardedLeave("user", signOut)}
@@ -381,7 +470,7 @@ function SyncNotices({ sync, who }) {
   return (
     <>
       {s.durable === false && (
-        <Alert>This device can't store scores offline (browser storage is unavailable). Keep the internet connection on while scoring.</Alert>
+        <Alert>{NO_OFFLINE_STORAGE_MESSAGE}</Alert>
       )}
       {s.needsAuth && unsyncedCount(s) > 0 && <Alert tone="warn">{s.needsAuth}</Alert>}
       {s.pending > 0 && (
@@ -739,7 +828,7 @@ function groupMatches(rows) {
   const live = rows.filter((m) => m.status === "in_progress");
   const ready = rows.filter((m) => ["ready", "assigned"].includes(m.status));
   const upcoming = rows.filter((m) => m.status === "scheduled");
-  const done = rows.filter((m) => ["completed", "bye", "cancelled", "abandoned"].includes(m.status));
+  const done = rows.filter((m) => DONE_STATUSES.includes(m.status));
   const other = rows.filter((m) => ![...live, ...ready, ...upcoming, ...done].some((x) => x.id === m.id));
   return { live, ready, upcoming, done, other };
 }
@@ -761,6 +850,13 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
     const fail = (res) => {
       setList((prev) => applyLoadOutcome(prev, { ok: false, kind: classifyQueryFailure(res), message: res.error?.message || res.message }));
     };
+    // Without a real session supabase-js queries anonymously and RLS returns
+    // no assignments — which would wipe the saved list. Keep it instead.
+    const gate = await sessionGate(supabase);
+    if (gate) {
+      setList((prev) => applyLoadOutcome(prev, gate));
+      return;
+    }
     const assigned = await supabase
       .from("umpire_assignments")
       .select("*")
@@ -774,15 +870,25 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
       setList((prev) => applyLoadOutcome(prev, { ok: true, ...snapshot }));
       return;
     }
-    const [matches, courtsA, sides, courts, participants] = await Promise.all([
+    const [matches, courtsA, sides] = await Promise.all([
       supabase.from("matches").select("*").in("id", ids),
       supabase.from("court_assignments").select("*").in("match_id", ids),
       supabase.from("match_participants").select("*").in("match_id", ids),
-      supabase.from("courts").select("*"),
-      supabase.from("participants").select("*"),
     ]);
     const firstFailure = [matches, courtsA, sides].find((x) => x.error);
     if (firstFailure) return fail(firstFailure);
+    // Only the courts and players these matches use. Unfiltered, the
+    // 1000-row response cap dropped names once an account had enough data —
+    // and that incomplete list was then saved for offline use.
+    const courtIds = [...new Set((courtsA.data || []).map((a) => a.court_id).filter(Boolean))];
+    const participantIds = [...new Set((sides.data || []).map((x) => x.participant_id).filter(Boolean))];
+    const none = { data: [], error: null };
+    const [courts, participants] = await Promise.all([
+      courtIds.length ? supabase.from("courts").select("*").in("id", courtIds) : none,
+      participantIds.length ? supabase.from("participants").select("*").in("id", participantIds) : none,
+    ]);
+    const detailFailure = [courts, participants].find((x) => x.error);
+    if (detailFailure) return fail(detailFailure);
     const courtByMatch = Object.fromEntries((courtsA.data || []).map((a) => [a.match_id, a.court_id]));
     const courtById = Object.fromEntries((courts.data || []).map((c) => [c.id, c]));
     const courtFor = (matchId) => courtById[courtByMatch[matchId]] || null;
@@ -795,7 +901,8 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
     seedMatchContexts(store, owner, matches.data, sides.data, participants.data, courtFor).catch(() => {});
   }, [supabase, session.user.id, cache, store, owner]);
 
-  useEffect(() => { load(); }, [load]);
+  // Also reloads when an offline identity becomes a verified sign-in.
+  useEffect(() => { load(); }, [load, session.offline]);
   useEffect(() => {
     function onVis() {
       if (document.visibilityState === "visible") load();
@@ -893,6 +1000,27 @@ function stageTitle(label) {
 // authoritative. Before start this device only sees the one match, so the
 // target is shown only when the stage is known from the match itself;
 // otherwise (e.g. an unlabeled single-elimination round) the server decides.
+// Game timer on the scoreboard. Its own component so only it re-renders on
+// each tick — the scoring controls never do. Remaining time is recomputed
+// from the match's persisted timer on every render (timerView), so reopening,
+// rerendering or reloading the match never restarts or drifts it, and it
+// keeps counting offline from the saved match. `onExpire` fires once when a
+// running countdown reaches 00:00 (the match itself is left untouched).
+// A game won on this device but not yet synced freezes at that winning point
+// (timerDisplay.js); the server's completed match replaces it after sync.
+function MatchGameTimer({ match, onExpire }) {
+  const shown = timerDisplayMatch(match);
+  const running = timerView(shown, Date.now()).state === "running";
+  const now = useNow(running);
+  const view = timerView(shown, now);
+  const prevState = useRef(view.state);
+  useEffect(() => {
+    if (prevState.current === "running" && view.state === "expired") onExpire?.();
+    prevState.current = view.state;
+  }, [view.state, onExpire]);
+  return <GameTimer view={view} clock={formatClock(view.remainingMs)} />;
+}
+
 function knownScoringTarget(match) {
   const started = Number(match?.score_state?.winTo);
   if (Number.isInteger(started) && started > 0) return started;
@@ -1178,8 +1306,13 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
     [store, matchId, owner, cfg.commandUrl, cfg.publishableKey],
   );
 
+  // Overlapping re-reads (every sync status change triggers one): only the
+  // latest may apply, or an older read could briefly un-show a point.
+  const refreshSeq = useRef(0);
   const refreshLocal = useCallback(async () => {
+    const seq = ++refreshSeq.current;
     const [rec, all] = await Promise.all([store.getMatch(matchId), store.list()]);
+    if (seq !== refreshSeq.current) return;
     setBase(rec && rec.owner === owner ? rec : null);
     setEntries(all.filter((e) => e.owner === owner && e.payload?.match_id === matchId));
     setHydrated(true);
@@ -1239,6 +1372,13 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
           court: result.court || null,
         });
       } else {
+        // Without a real session (offline identity, or an expired token that
+        // couldn't refresh) supabase-js queries anonymously and RLS answers
+        // "not found" — never let that replace the match saved on this device.
+        if (await sessionGate(supabase)) {
+          if (!baseRef.current) setLoadError("You're offline and this match isn't saved on this device yet. Reconnect to load it.");
+          return;
+        }
         const [m, s, ca] = await Promise.all([
           supabase.from("matches").select("*").eq("id", matchId).maybeSingle(),
           supabase.from("match_participants").select("*").eq("match_id", matchId),
@@ -1442,18 +1582,17 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
     );
   }
 
-  const nameFor = (slot) => {
-    const side = sides.find((x) => x.slot === slot);
-    const part = participants.find((p) => p.id === side?.participant_id);
-    return part?.display_name || (side?.team_id ? `Team ${slot}` : `Side ${slot}`);
-  };
+  const nameFor = (slot) => participantNameFor(sides, participants, match.id, slot);
   const score = match.score_state || {};
   const lastSeq = Number(score.lastSeq || 0);
   const nameA = nameFor("A");
   const nameB = nameFor("B");
-  const winnerName = match.winner === "A" ? nameA : match.winner === "B" ? nameB : null;
-  const gamesA = score.gamesWonA ?? score.gamesA ?? (match.winner === "A" ? 1 : 0);
-  const gamesB = score.gamesWonB ?? score.gamesB ?? (match.winner === "B" ? 1 : 0);
+  // Before completion syncs, only the score knows the winner (the server sets
+  // match.winner when the match is completed).
+  const winnerSlot = match.winner ?? score.winner ?? null;
+  const winnerName = winnerSlot === "A" ? nameA : winnerSlot === "B" ? nameB : null;
+  const gamesA = score.gamesWonA ?? score.gamesA ?? (winnerSlot === "A" ? 1 : 0);
+  const gamesB = score.gamesWonB ?? score.gamesB ?? (winnerSlot === "B" ? 1 : 0);
   const canStart = (match.status === "assigned" || match.status === "ready") && isCoinTossCommitted(match);
   const scoring = match.status === "in_progress";
   const readyToComplete = match.status === "in_progress" && score.status === "completed";
@@ -1468,7 +1607,11 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const serverScore = base?.match?.score_state || {};
   const pendingHere = view ? view.pending.length : 0;
   const offlineNow = Boolean(syncStatus?.offline) || (typeof navigator !== "undefined" && navigator.onLine === false);
-  const canReapply = Boolean(localResult) && (localResult.bestOf || 1) <= 1
+  // A paired court station may only score points and undo: the server refuses
+  // corrections from a station, and a refused correction would block this
+  // match's sync queue. So corrections are offered to signed-in umpires only.
+  const canCorrect = !station;
+  const canReapply = canCorrect && Boolean(localResult) && (localResult.bestOf || 1) <= 1
     && ["in_progress", "completed"].includes(base?.match?.status);
   const actionsLocked = laneBusy || inConflict;
 
@@ -1510,6 +1653,8 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
           center={(
             <>
               <div className="game">Game {score.gameNumber || 1}</div>
+              {/* On expiry, one re-read picks up any time the organizer added. */}
+              <MatchGameTimer match={match} onExpire={load} />
               <StatusBadge status={match.status} />
               {laneBusy ? <div className="ump-sync"><span className="ump-sync-dot" aria-hidden="true" /> Saving…</div> : null}
               {inConflict ? (
@@ -1551,7 +1696,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
       <div className="ump-actions">
         {error && <Alert>{error}</Alert>}
         {store.durable === false && (
-          <Alert>This device can't store scores offline (browser storage is unavailable). Keep the internet connection on while scoring.</Alert>
+          <Alert>{NO_OFFLINE_STORAGE_MESSAGE}</Alert>
         )}
         {syncStatus?.needsAuth && pendingHere > 0 && <Alert tone="warn">{syncStatus.needsAuth}</Alert>}
         {inConflict && (
@@ -1597,6 +1742,12 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
               ) : (
                 <p className="muted" style={{ margin: 0 }}>
                   The target is set automatically by stage (qualification: race to 11 · semifinal/final: race to 15) and shown once the match starts. No deuce.
+                </p>
+              )}
+              {timerView(match, Date.now()).state === "configured" && (
+                <p style={{ margin: 0 }}>
+                  <strong>Game time: {Math.round(timerView(match, Date.now()).durationSec / 60)} minutes</strong>
+                  <span className="muted"> — the countdown starts when the match starts.</span>
                 </p>
               )}
               <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
@@ -1647,10 +1798,10 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
         {scoring && !readyToComplete && (
           <>
             <div className="pads">
-              <Button className="point a" disabled={actionsLocked} aria-label={`Point ${nameA}`} onClick={() => sendScore("point", { team: "A" })}>
+              <Button className="point a" disabled={busy || actionsLocked} aria-label={`Point ${nameA}`} onClick={() => sendScore("point", { team: "A" })}>
                 Point {nameA}
               </Button>
-              <Button className="point b" disabled={actionsLocked} aria-label={`Point ${nameB}`} onClick={() => sendScore("point", { team: "B" })}>
+              <Button className="point b" disabled={busy || actionsLocked} aria-label={`Point ${nameB}`} onClick={() => sendScore("point", { team: "B" })}>
                 Point {nameB}
               </Button>
             </div>
@@ -1658,9 +1809,11 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
               <Button variant="secondary" disabled={busy || actionsLocked} onClick={() => setConfirmUndo(true)}>
                 Undo last point
               </Button>
-              <Button variant="ghost" className="compact" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
-                Edit score
-              </Button>
+              {canCorrect && (
+                <Button variant="ghost" className="compact" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
+                  Edit score
+                </Button>
+              )}
             </div>
           </>
         )}
@@ -1675,9 +1828,11 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
             <h2>Winner {winnerName}</h2>
             <p>Final score {gamesA} – {gamesB}</p>
             <p className="muted">{score.scoreA ?? 0}–{score.scoreB ?? 0} in the last game</p>
-            <Button variant="ghost" className="compact" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
-              Edit score
-            </Button>
+            {canCorrect && (
+              <Button variant="ghost" className="compact" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
+                Edit score
+              </Button>
+            )}
           </Card>
         )}
       </div>

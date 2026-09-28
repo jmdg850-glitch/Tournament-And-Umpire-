@@ -1,10 +1,12 @@
 import { createClient } from "@supabase/supabase-js";
 
-export { isNetworkError, classifySendError, createMemoryStore, createIndexedDBStore, defaultStore, sendCommandDurable, drainQueue, queueSize, enqueueCommand, ownerKey } from "./offlineQueue.js";
+export { isNetworkError, classifySendError, createMemoryStore, createIndexedDBStore, defaultStore, sendCommandDurable, drainQueue, queueSize, enqueueCommand, ownerKey, mergeSnapshot } from "./offlineQueue.js";
 export { readMatchSnapshot, writeMatchSnapshot, clearMatchSnapshot } from "./matchSnapshot.js";
 export { createMatchLane, reconstructMatchView, laneOf, sortLaneEntries } from "./matchLane.js";
 export { createSyncEngine, createStorageLease, DEFAULT_BACKOFF_MS } from "./syncEngine.js";
-export { classifyQueryFailure, applyLoadOutcome, stateFromCache, createDashboardCache, INITIAL_LOAD_STATE } from "./lastKnownGood.js";
+export { classifyQueryFailure, applyLoadOutcome, stateFromCache, createDashboardCache, deriveConnectionState, INITIAL_LOAD_STATE } from "./lastKnownGood.js";
+export { createTournamentRepository, sanitizeDeskData, snapshotKey, SNAPSHOT_SCHEMA } from "./localRepository.js";
+export { probeIdentity, resolveIdentity, readStoredIdentity, rememberVerified, readLastVerified, forgetVerified, classifyRefreshError, sessionGate, startIdentity, OFFLINE_IDENTITY_MAX_AGE_MS } from "./offlineIdentity.js";
 
 // fetch with an optional hard deadline. A timeout rejects with an error that
 // has NO `.status` (so isNetworkError() treats it as "never answered"), plus
@@ -20,13 +22,17 @@ async function fetchWithTimeout(url, init, timeoutMs) {
   } catch (e) {
     clearTimeout(timer);
     if (controller.signal.aborted) {
-      const err = new Error(`No response from the server within ${Math.round(timeoutMs / 1000)}s`);
-      err.code = "TIMEOUT";
-      err.timeout = true;
-      throw err;
+      throw timeoutError(timeoutMs);
     }
     throw e;
   }
+}
+
+function timeoutError(timeoutMs) {
+  const err = new Error(`No response from the server within ${Math.round(timeoutMs / 1000)}s`);
+  err.code = "TIMEOUT";
+  err.timeout = true;
+  return err;
 }
 
 async function readJson(res, clear, timeoutMs) {
@@ -34,10 +40,7 @@ async function readJson(res, clear, timeoutMs) {
     return await res.json();
   } catch (e) {
     if (e?.name === "AbortError") {
-      const err = new Error(`No response from the server within ${Math.round(timeoutMs / 1000)}s`);
-      err.code = "TIMEOUT";
-      err.timeout = true;
-      throw err;
+      throw timeoutError(timeoutMs);
     }
     return { ok: false, error: { code: "BAD_RESPONSE", message: res.statusText } };
   } finally {

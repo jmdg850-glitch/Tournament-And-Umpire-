@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Alert, Badge, EmptyState, LoadingState, StatusBadge } from "@tournament/ui";
 import { ClipboardList } from "lucide-react";
 import { applyDeskRealtime, divisionDisplayChannelName, removeById, upsertById } from "@tournament/engine";
 import { useRealtimeChannel } from "./useRealtimeChannel.js";
-import { courtFor, loadDeskData, resultFor, scoreLine, sideOf, stageTitle, umpireFor } from "./lib.js";
+import { useSavedDeskData } from "./useSavedDeskData.js";
+import OfflineStatusBanner from "./OfflineStatusBanner.jsx";
+import { courtFor, resultFor, scoreLine, sideOf, stageTitle, umpireFor } from "./lib.js";
 
 // A read-only, division-scoped match display — see useRealtimeChannel.js's
 // openMatchDisplayWindow. Every division can have its own one of these open at
@@ -13,36 +15,20 @@ import { courtFor, loadDeskData, resultFor, scoreLine, sideOf, stageTitle, umpir
 // packages/engine/src/liveSync.js), so two open windows for two different
 // divisions can never repoint into each other — see liveSync.test.js's
 // "two divisions never resolve to the same route or channel" coverage.
-export default function MatchDisplayWindow({ supabase, session, tournamentId, divisionId }) {
-  const [division, setDivision] = useState(null);
-  const [data, setData] = useState(null);
-  const [error, setError] = useState("");
-
-  const load = useCallback(async () => {
-    const { data: next, error: err } = await loadDeskData(supabase, tournamentId);
-    if (err) {
-      setError(err.message);
-      return;
-    }
-    const found = (next.divisions || []).find((d) => d.id === divisionId);
-    if (!found) {
-      // Handles both "never existed for this tournament" and "was deleted
-      // since this window was opened" identically — a clear message instead
-      // of a stale or crashed display (see Feature B: a deleted division
-      // must not keep appearing, even in an already-open display window).
-      setError("This division is no longer available in this tournament.");
-      setDivision(null);
-      return;
-    }
-    setError("");
-    setDivision(found);
-    setData(next);
-  }, [supabase, tournamentId, divisionId]);
+export default function MatchDisplayWindow({ supabase, session, repository, tournamentId, divisionId }) {
+  // Falls back to this computer's saved copy of the tournament when offline.
+  const { data, setData, error: loadError, load, verified, identityMode, bannerLoad, settled } = useSavedDeskData({ supabase, session, repository, tournamentId });
+  const division = (data?.divisions || []).find((d) => d.id === divisionId) || null;
+  // Handles both "never existed for this tournament" and "was deleted since
+  // this window was opened" identically — a clear message instead of a stale
+  // or crashed display (see Feature B: a deleted division must not keep
+  // appearing, even in an already-open display window).
+  const error = loadError || (data && !division ? "This division is no longer available in this tournament." : "");
 
   useRealtimeChannel({
     supabase,
     name: divisionDisplayChannelName(divisionId),
-    enabled: Boolean(session && divisionId),
+    enabled: Boolean(session && divisionId) && verified,
     specs: [
       { event: "*", schema: "public", table: "matches", filter: `division_id=eq.${divisionId}` },
       { event: "*", schema: "public", table: "court_assignments" },
@@ -103,7 +89,7 @@ export default function MatchDisplayWindow({ supabase, session, tournamentId, di
   if (!division || !data) {
     return (
       <div className="live-window">
-        <LoadingState label="Loading matches" />
+        {settled ? <OfflineStatusBanner load={bannerLoad} identityMode={identityMode} onRetry={load} /> : <LoadingState label="Loading matches" />}
       </div>
     );
   }
@@ -123,6 +109,7 @@ export default function MatchDisplayWindow({ supabase, session, tournamentId, di
         <h1>{division.name}</h1>
         {live.length > 0 ? <Badge tone="live">{live.length} live</Badge> : null}
       </header>
+      <OfflineStatusBanner load={bannerLoad} identityMode={identityMode} onRetry={load} />
       {error ? <Alert>{error}</Alert> : null}
 
       {matches.length === 0 ? (

@@ -1,6 +1,8 @@
 // Single-elimination bracket generation + advancement — pure, no DB.
 // Playable shells use status "scheduled". Bye shells keep status "bye".
 
+import { defaultId } from "./ids.js";
+
 export function seedOrder(size){
   let order = [1];
   while (order.length < size){
@@ -9,8 +11,6 @@ export function seedOrder(size){
   }
   return order;
 }
-
-const defaultId = () => `${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
 
 export function generateBracket(registrations, { makeId, bronzeMatch } = {}){
   const genId = makeId || defaultId;
@@ -62,8 +62,9 @@ export function generateBracket(registrations, { makeId, bronzeMatch } = {}){
 
   const bracketMatches = rounds.flat();
 
-  if (bronzeMatch && totalRounds >= 2){
-    const semis = rounds[totalRounds - 2];
+  // A bye semifinal (3 entrants) has no loser, so a bronze match could never be filled.
+  const semis = totalRounds >= 2 ? rounds[totalRounds - 2] : [];
+  if (bronzeMatch && totalRounds >= 2 && !semis.some((m) => m.status === "bye")){
     const bronze = {
       id: genId(), round: totalRounds, bracketPosition: 1,
       registrationAId: null, registrationBId: null,
