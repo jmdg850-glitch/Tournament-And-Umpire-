@@ -135,8 +135,9 @@ export function MatchTimerClock({ match, className }) {
 
 // Same rules as the server (set_match_timer): the game time is set before the
 // match has ever started (no started_at); once started — live, held, or
-// resumed after a Hold — it can only be adjusted or reset, so a resumed
-// match keeps its remaining time.
+// resumed after a Hold — a timer can only be adjusted or reset, so a resumed
+// match keeps its remaining time. A started match with NO timer can still be
+// given one (the Operator taking over when there is no umpire).
 const TIMER_SETUP_STATUSES = new Set(["scheduled", "ready", "assigned", "postponed"]);
 function matchHasStarted(match) {
   return match?.status === "in_progress" || (TIMER_SETUP_STATUSES.has(match?.status) && Boolean(match?.started_at));
@@ -157,6 +158,7 @@ function GameTimerModal({ match, data, command, onClose, onSaved }) {
   const hasTimer = view.state !== "none";
   const started = matchHasStarted(match);
   const setup = !started && TIMER_SETUP_STATUSES.has(match.status);
+  const takeOver = started && !hasTimer && canControlGameTimer(match);
   const live = started && hasTimer;
   const [minutes, setMinutes] = useState(hasTimer ? String(Math.round(view.durationSec / 60)) : "10");
   const [busy, setBusy] = useState(false);
@@ -193,18 +195,22 @@ function GameTimerModal({ match, data, command, onClose, onSaved }) {
       <div className="stack">
         <p className="muted" style={{ margin: 0 }}>{a.name} vs {b.name}</p>
         <MatchTimerClock match={match} />
-        {setup && (
+        {(setup || takeOver) && (
           <>
             <Input
               label="Game time (minutes)"
               inputMode="numeric"
               value={minutes}
               onChange={(e) => setMinutes(e.target.value.replace(/[^0-9]/g, "").slice(0, 3))}
-              hint="The countdown starts when the match is started, not now."
+              hint={!takeOver
+                ? "The countdown starts when the match is started, not now."
+                : match.status === "in_progress"
+                  ? "The match is live: the countdown starts now."
+                  : "The countdown starts when the match is started again."}
               disabled={busy}
             />
             <div className="row">
-              {hasTimer && (
+              {setup && hasTimer && (
                 <Button variant="secondary" disabled={busy} onClick={async () => { if (await send({ action: "clear" })) onClose(); }}>
                   Remove timer
                 </Button>
@@ -219,9 +225,6 @@ function GameTimerModal({ match, data, command, onClose, onSaved }) {
             <Button variant="secondary" disabled={busy} onClick={() => send({ action: "adjust", delta_seconds: -60 })}>−1 min</Button>
             <Button variant="secondary" disabled={busy} onClick={() => send({ action: "reset" })}>Reset to {Math.round(view.durationSec / 60)} min</Button>
           </div>
-        )}
-        {started && !hasTimer && (
-          <p className="muted" style={{ margin: 0 }}>This match has no game timer. A game time can only be set before the match starts.</p>
         )}
         {error && <Alert>{error}</Alert>}
         <div className="row">

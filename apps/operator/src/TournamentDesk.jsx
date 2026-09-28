@@ -413,6 +413,8 @@ export default function TournamentDesk({ supabase, session, identityMode, reposi
                 onOpenLive={() => setTab("matches")}
                 onOpenLiveWindow={(matchId) => openLiveMatchWindow(t.id, matchId)}
                 onGoto={setTab}
+                command={command}
+                load={load}
               />
             )}
             {tab === "brackets" && <BracketsPanel data={data} command={command} load={load} />}
@@ -429,7 +431,7 @@ export default function TournamentDesk({ supabase, session, identityMode, reposi
   );
 }
 
-function OverviewPanel({ data, t, nextStatus, busy, run, live, upcoming, completed, onOpenLive, onOpenLiveWindow, onGoto }) {
+function OverviewPanel({ data, t, nextStatus, busy, run, live, upcoming, completed, onOpenLive, onOpenLiveWindow, onGoto, command, load }) {
   const assignedUmpires = new Set(data.umpireAssignments.map((a) => a.user_id)).size;
   const usedCourts = new Set(
     data.courtAssignments
@@ -505,7 +507,7 @@ function OverviewPanel({ data, t, nextStatus, busy, run, live, upcoming, complet
             <h2 style={{ margin: 0 }}>Live now</h2>
             <Button variant="tape" onClick={onOpenLive}><Radio size={15} aria-hidden="true" /> Open live board</Button>
           </div>
-          <LiveTiles data={data} matches={live} onOpenLiveWindow={onOpenLiveWindow} />
+          <LiveTiles data={data} matches={live} onOpenLiveWindow={onOpenLiveWindow} command={command} load={load} />
         </div>
       ) : (
         <p className="muted">No matches in progress right now.</p>

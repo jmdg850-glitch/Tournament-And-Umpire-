@@ -2159,7 +2159,11 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
 // get FORBIDDEN, court stations never reach this (not in STATION_COMMANDS).
 // Only matches.timer changes: status, score, winner and progression are never
 // touched, and the countdown itself only starts in handleStartMatch.
-//   set    { duration_seconds }  before the match has ever started: configure
+//   set    { duration_seconds }  before the match has ever started: configure.
+//                                Once started, only if the match has NO timer
+//                                (Operator taking over): a live match counts
+//                                from now; a held/resumed one stays paused
+//                                until start_match.
 //   clear                        before the match has ever started: remove
 //   adjust { delta_seconds }     once started (live, held, or resumed): add/remove time
 //   reset                        once started (live, held, or resumed): back to the full duration
@@ -2182,10 +2186,12 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
   let timer;
   const started = match.status === "in_progress" || (TIMER_SETUP_STATUSES.has(match.status) && Boolean(match.started_at));
   if (action === "set" || action === "clear") {
-    if (started) {
+    // A started match may only be given a timer it doesn't have yet; one that
+    // already has a timer is adjusted or reset, never replaced or removed.
+    if (started && (action === "clear" || current)) {
       throw httpError(409, "MATCH_ALREADY_STARTED", "The game has already started. Add or remove time, or reset the timer instead.");
     }
-    if (!TIMER_SETUP_STATUSES.has(match.status)) {
+    if (!started && !TIMER_SETUP_STATUSES.has(match.status)) {
       throw httpError(409, "MATCH_NOT_ACTIVE", `Cannot change the game time of a ${match.status} match`);
     }
     if (action === "set") {
@@ -2193,6 +2199,7 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
         throw httpError(400, "INVALID_GAME_TIME", `Game time must be a whole number of seconds from ${MIN_GAME_TIME_SEC} to ${MAX_GAME_TIME_SEC}`);
       }
       timer = configureTimer(payload.duration_seconds, meta);
+      if (match.status === "in_progress") timer = startTimer(timer, now);
     } else {
       timer = null;
     }

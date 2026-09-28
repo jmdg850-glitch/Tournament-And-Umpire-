@@ -246,7 +246,7 @@ describe("start_match starts the timer — exactly once, and only there", () => 
     expect(remaining(admin)).toBe(540000);
   });
 
-  test("set after the game started is refused", async () => {
+  test("set after the game started is refused when the match already has a timer", async () => {
     const admin = fixture();
     await setTimer(admin, ORGANIZER, 600);
     await send(admin, UMPIRE, "start_match", { match_id: M });
@@ -391,6 +391,66 @@ describe("resumed match (Hold → Resume → ready) keeps its banked time", () =
     await send(admin, UMPIRE, "start_match", { match_id: M });
     expect(row(admin).status).toBe("in_progress");
     expect(row(admin).timer).toBeNull();
+  });
+});
+
+describe("Operator takes over a started match that has no timer", () => {
+  async function liveNoTimer() {
+    const admin = fixture(); // no timer, no division default
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    expect(row(admin).timer).toBeNull();
+    return admin;
+  }
+
+  test("set on a live match starts counting from now; score and status untouched", async () => {
+    const admin = await liveNoTimer();
+    advance(300); // the match has been live for 5 minutes
+    const before = { status: row(admin).status, score_state: row(admin).score_state, started_at: row(admin).started_at };
+    await setTimer(admin, ORGANIZER, 600);
+    expect(row(admin).timer).toMatchObject({ durationSec: 600, remainingMs: 600000, runningSince: new Date(Date.now()).toISOString() });
+    expect(row(admin)).toMatchObject(before);
+    advance(90);
+    expect(timerView(row(admin), Date.now())).toMatchObject({ state: "running", remainingMs: 510000 });
+  });
+
+  test("once set, +1 / −1 / reset work and a second set or clear is refused", async () => {
+    const admin = await liveNoTimer();
+    await setTimer(admin, ORGANIZER, 600);
+    advance(120);
+    await send(admin, ORGANIZER, "set_match_timer", { match_id: M, action: "adjust", delta_seconds: 60 });
+    expect(remaining(admin)).toBe(540000);
+    await send(admin, ORGANIZER, "set_match_timer", { match_id: M, action: "adjust", delta_seconds: -60 });
+    expect(remaining(admin)).toBe(480000);
+    await send(admin, ORGANIZER, "set_match_timer", { match_id: M, action: "reset" });
+    expect(remaining(admin)).toBe(600000);
+    expect(row(admin).timer.runningSince).toBeTruthy(); // reset keeps it running
+    const again = await fail(setTimer(admin, ORGANIZER, 900));
+    expect(again).toMatchObject({ status: 409, code: "MATCH_ALREADY_STARTED" });
+    const clear = await fail(send(admin, ORGANIZER, "set_match_timer", { match_id: M, action: "clear" }));
+    expect(clear).toMatchObject({ status: 409, code: "MATCH_ALREADY_STARTED" });
+    expect(row(admin).timer.durationSec).toBe(600);
+  });
+
+  test("set on a held match stays paused; the restart counts from the full duration", async () => {
+    const admin = await liveNoTimer();
+    await send(admin, UMPIRE, "transition_match", { match_id: M, status: "postponed" });
+    await setTimer(admin, ORGANIZER, 600);
+    expect(row(admin).timer).toMatchObject({ remainingMs: 600000, runningSince: null });
+    advance(900);
+    await send(admin, ORGANIZER, "transition_match", { match_id: M, status: "ready" });
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    advance(30);
+    expect(remaining(admin)).toBe(570000);
+  });
+
+  test("the umpire still cannot set it, and a completed match stays refused", async () => {
+    const admin = await liveNoTimer();
+    const err = await fail(setTimer(admin, UMPIRE, 600));
+    expect(err.status).toBe(403);
+    expect(row(admin).timer).toBeNull();
+    const done = fixture({ status: "completed" });
+    const err2 = await fail(setTimer(done, ORGANIZER, 600));
+    expect(err2).toMatchObject({ status: 409, code: "MATCH_NOT_ACTIVE" });
   });
 });
 

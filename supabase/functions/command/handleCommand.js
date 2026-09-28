@@ -3446,10 +3446,10 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
   let timer;
   const started = match.status === "in_progress" || TIMER_SETUP_STATUSES.has(match.status) && Boolean(match.started_at);
   if (action === "set" || action === "clear") {
-    if (started) {
+    if (started && (action === "clear" || current)) {
       throw httpError(409, "MATCH_ALREADY_STARTED", "The game has already started. Add or remove time, or reset the timer instead.");
     }
-    if (!TIMER_SETUP_STATUSES.has(match.status)) {
+    if (!started && !TIMER_SETUP_STATUSES.has(match.status)) {
       throw httpError(409, "MATCH_NOT_ACTIVE", `Cannot change the game time of a ${match.status} match`);
     }
     if (action === "set") {
@@ -3457,6 +3457,7 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
         throw httpError(400, "INVALID_GAME_TIME", `Game time must be a whole number of seconds from ${MIN_GAME_TIME_SEC} to ${MAX_GAME_TIME_SEC}`);
       }
       timer = configureTimer(payload.duration_seconds, meta);
+      if (match.status === "in_progress") timer = startTimer(timer, now);
     } else {
       timer = null;
     }
