@@ -8,7 +8,9 @@
 // auto-included — see isReleasableSourcePath() below. No --allow= is needed
 // for ordinary Tournament development. --allow= remains available for
 // genuine exceptions (a path outside those roots that really belongs in this
-// release).
+// release). Commits already on local main but not yet on origin/main are
+// released too — a clean working tree is not "nothing to release" (see
+// scripts/lib/releaseGate.mjs); they are pushed, never rewritten.
 //
 //   npm run release -- --preflight-only        run every preflight check, change nothing
 //   npm run release -- --allow=<path-or-dir/>  explicitly allow one more dirty path
@@ -43,6 +45,7 @@ import {
   verifyAndroidApk,
 } from "./lib/buildVerify.mjs";
 import { assertRepoRoot } from "./lib/repoGuard.mjs";
+import { decideReleaseStart } from "./lib/releaseGate.mjs";
 import { checkDependencies } from "./check-dependencies.mjs";
 
 let root;
@@ -489,11 +492,27 @@ function check(name, fn) {
 logStep("Preflight (read-only)");
 
 // Working-tree gate first: cheapest check, and the one most likely to fail.
+// A clean tree still has work to release when main has commits origin/main
+// lacks; only then is origin consulted (read-only).
 const initialEntries = readWorkingTree();
-if (initialEntries.length === 0) {
-  releaseUnlock();
-  console.log("No changes in the working tree — release skipped. (Commit the source changes to ship first if they are not committed yet, or pass them via --allow=.)");
-  process.exit(0);
+{
+  let remoteSha = "";
+  let unpushed = null;
+  if (initialEntries.length === 0) {
+    const remote = tryCapture("git", ["ls-remote", "origin", "refs/heads/main"], { cwd: root });
+    remoteSha = remote.ok ? remote.output.trim().split(/\s+/)[0] || "" : "";
+    if (remoteSha) {
+      const ahead = tryCapture("git", ["log", "--format=%h %s", `${remoteSha}..HEAD`], { cwd: root });
+      unpushed = ahead.ok ? ahead.output.split(/\r?\n/).filter(Boolean) : null;
+    }
+  }
+  const gate = decideReleaseStart({ dirtyCount: initialEntries.length, remoteSha, unpushed });
+  if (!gate.proceed) {
+    releaseUnlock();
+    console.log(gate.message);
+    process.exit(0);
+  }
+  if (gate.message) console.log(gate.message);
 }
 
 check("Git branch is main", () => {
@@ -699,7 +718,10 @@ check("origin/main has nothing this checkout lacks", () => {
   if (remoteSha === state.baseSha) return "origin/main == HEAD";
   const anc = tryCapture("git", ["merge-base", "--is-ancestor", remoteSha, "HEAD"], { cwd: root });
   if (!anc.ok) throw new Error(`origin/main (${remoteSha.slice(0, 7)}) is not an ancestor of local HEAD (${state.baseSha.slice(0, 7)}) — fetch and reconcile before releasing.`);
-  return `origin/main ${remoteSha.slice(0, 7)} is an ancestor of HEAD`;
+  // Informational: existing commits the release push will publish as they are.
+  const ahead = tryCapture("git", ["log", "--format=%h %s", `${remoteSha}..HEAD`], { cwd: root });
+  ctx.unpushedCommits = ahead.ok ? ahead.output.split(/\r?\n/).filter(Boolean) : [];
+  return `origin/main ${remoteSha.slice(0, 7)} is an ancestor of HEAD (${ctx.unpushedCommits.length} commit(s) ahead)`;
 });
 
 check("Release tag and GitHub release do not already exist", () => assertReleaseTargetFree(state.tag, ctx.originSlug, ctx.releaseSlug));
@@ -717,7 +739,8 @@ Preflight PASSED. Plan:
   Operator ${ctx.currentOperator} -> ${ctx.nextOperator}   Umpire ${ctx.currentUmpire} -> ${ctx.nextUmpire} (versionCode ${ctx.currentVersionCode} -> ${ctx.nextVersionCode})
   License Admin ${ctx.currentLicenseAdmin} -> ${ctx.nextLicenseAdmin} (versionCode ${ctx.currentLicenseAdminVersionCode} -> ${ctx.nextLicenseAdminVersionCode}) — independent of Operator/Umpire's versions
   Tag / release: ${state.tag} on ${ctx.releaseSlug}
-  Will stage exactly: ${[...VERSION_FILES, ...initialEntries.map((e) => e.path)].join(", ")}`);
+  Will stage exactly: ${[...VERSION_FILES, ...initialEntries.map((e) => e.path)].join(", ")}${ctx.unpushedCommits?.length ? `
+  Also pushes ${ctx.unpushedCommits.length} existing commit(s) not yet on origin/main (unchanged): ${ctx.unpushedCommits.join(" | ")}` : ""}`);
 
 if (flags.preflightOnly) {
   releaseUnlock();
