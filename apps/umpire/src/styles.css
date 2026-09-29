@@ -1,11 +1,20 @@
 /* Sport-focused orange/coral accent — this app stays a dark, stadium-style
-   scoring surface (already correct per earlier redesign passes); only the
-   accent color shifts, from the operator's gold to a warmer coral. */
+   scoring surface; only the accent shifts from the operator's gold to a
+   warmer coral. Spacing/type come from the shared --space-* / --text-*
+   scales (packages/ui/src/styles.css); nothing here redefines them. */
 :root {
   --tape: #ff6b3d;
   --tape-ink: #1a0e08;
   --gold-accent: #ff9466;
   --focus: #ff6b3d;
+  --ump-gutter: 14px;
+  --ump-pad-h: clamp(96px, 20dvh, 150px);
+}
+
+html, body, #root {
+  height: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .ump-shell {
@@ -19,181 +28,264 @@
   padding-left: env(safe-area-inset-left);
   padding-right: env(safe-area-inset-right);
 }
-.ump-desk {
-  display: flex;
-  flex-direction: column;
-  min-height: 100%;
+.ump-shell .btn.secondary { color: var(--text); border-color: var(--border); }
+.ump-shell .btn.ghost { color: var(--muted); }
+.ump-shell .muted { color: var(--muted); }
+
+/* Touch screens never "hover": the shared lift/shadow on hover sticks after a
+   tap and makes buttons look pressed-and-floating. Press feedback only. */
+@media (hover: none) {
+  .ump-shell .btn:hover:not(:disabled),
+  .ump-shell .card-clickable:hover {
+    transform: none;
+    box-shadow: none;
+    filter: none;
+  }
 }
+
+.ump-ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ump-meta { color: var(--muted); font-size: var(--text-sm); }
+.ump-note { color: var(--muted); font-size: var(--text-sm); margin: 0; }
+.ump-center { flex: 1; display: grid; place-items: center; padding: var(--space-6) var(--ump-gutter); }
+.ump-spin { animation: spin 0.8s linear infinite; }
+
+/* ---- Top bar (lists + match) ---------------------------------------- */
 .ump-top {
-  padding: 12px 14px;
+  padding: 10px var(--ump-gutter);
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   border-bottom: 2px solid var(--tape);
   flex-shrink: 0;
+  min-width: 0;
 }
-.ump-top-actions { flex-shrink: 0; }
+.ump-top-title { min-width: 0; }
+.ump-top-title .kicker { margin-bottom: 2px; }
+.ump-top h1 { font-size: var(--text-lg); }
+.ump-top-actions { display: flex; gap: var(--space-2); flex-shrink: 0; align-items: center; }
+.ump-icon-btn { min-width: var(--touch); padding: 0; }
 .ump-hold-btn {
   color: var(--warn);
   border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
 }
-.ump-list { padding: 14px; display: grid; gap: 10px; }
-.ump-context-bar {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 2px 14px 0;
-  flex-shrink: 0;
-  color: var(--muted-court);
-  font-size: var(--text-sm);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  font-weight: 700;
-}
-.ump-context-sep { opacity: 0.5; }
-/* .ump-card layers onto the shared .panel.card-clickable (background/border/padding/live-tint
-   already come from packages/ui) — this just tunes touch-target sizing for a match-list card. */
-.ump-card { min-height: 72px; min-width: 0; padding: 14px; }
-.ump-card[data-live="true"] {
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--live) 40%, transparent);
-}
-.ump-name {
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-.ump-score { padding: 8px 0 12px; flex: 0 0 auto; }
-.ump-court-label {
-  text-align: center;
-  padding: 8px 12px 0;
-  letter-spacing: 0.18em;
-  font-size: var(--text-sm);
-  font-weight: 700;
-}
-.ump-serve {
-  text-align: center;
-  color: var(--gold-accent);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  font-size: var(--text-md);
-  overflow-wrap: anywhere;
-  padding: 4px 12px 0;
-}
-.ump-serve-num {
-  color: var(--muted-court);
-  font-weight: 500;
-  letter-spacing: 0.06em;
-}
-.ump-sync {
-  margin-top: 8px;
+.ump-shell .btn.ump-hold-btn { color: var(--warn); }
+
+/* ---- Match header: back · status chip · actions ------------------------ */
+.ump-desk { display: flex; flex-direction: column; min-height: 100%; }
+.ump-desk-top .ump-back { flex-shrink: 0; }
+.ump-chip {
+  flex: 0 1 auto;
+  min-width: 0;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--tape) 16%, transparent);
-  font-size: 0.68rem;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  font-size: var(--text-xs);
   font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-right: auto;
+}
+.ump-chip-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
+.ump-chip[data-tone="ok"] { color: var(--success); border-color: color-mix(in srgb, var(--success) 35%, var(--border)); }
+.ump-chip[data-tone="busy"] { color: var(--info); border-color: color-mix(in srgb, var(--info) 35%, var(--border)); }
+.ump-chip[data-tone="busy"] .ump-chip-dot { animation: ump-pulse 1s ease-in-out infinite; }
+.ump-chip[data-tone="warn"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.ump-chip[data-tone="error"] { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+@keyframes ump-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+.ump-context-bar {
+  padding: 8px var(--ump-gutter) 0;
+  text-align: center;
+  color: var(--muted-court);
+  font-size: var(--text-xs);
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--tape);
+  font-weight: 700;
+  overflow-wrap: anywhere;
 }
-.ump-sync-dot {
-  width: 6px;
-  height: 6px;
+
+/* ---- Scoreboard ------------------------------------------------------- */
+.ump-score { padding: 8px var(--ump-gutter) 4px; flex: 0 0 auto; }
+.ump-score .scoreboard { border-radius: var(--radius-lg); border: 1px solid var(--border); border-bottom: 2px solid var(--tape); }
+/* Each side carries its pad colour, so the umpire maps name → button
+   without reading. */
+.ump-score .scoreboard > div:first-child,
+.ump-score .scoreboard > div:last-child { border-top: 4px solid var(--team-a); padding-top: 8px; border-radius: 2px; min-width: 0; }
+.ump-score .scoreboard > div:last-child { border-top-color: var(--team-b); }
+.ump-score .scoreboard .who { font-size: var(--text-sm); color: #c3cad6; -webkit-line-clamp: 2; line-clamp: 2; }
+/* Serving side: a ball marker before its name and full-strength name. */
+.ump-score .scoreboard.serving-a > div:first-child .who,
+.ump-score .scoreboard.serving-b > div:last-child .who { color: #fff; }
+.ump-score .scoreboard.serving-a > div:first-child .who::before,
+.ump-score .scoreboard.serving-b > div:last-child .who::before {
+  content: "";
+  display: inline-block;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
-  background: var(--tape);
-  animation: ump-sync-pulse 1s ease-in-out infinite;
+  background: var(--gold-accent);
+  margin-right: 6px;
+  vertical-align: 1px;
 }
-.ump-sync-offline {
-  background: color-mix(in srgb, var(--warn) 20%, transparent);
-  color: var(--warn);
+/* The score is what the umpire checks after every rally — let it own the
+   free height a phone has between the header and the pads. */
+.ump-score .scoreboard .pts { font-size: clamp(3.5rem, 24vw, 8rem); }
+.ump-score .scoreboard > div:nth-child(2) { display: grid; justify-items: center; gap: 6px; }
+.ump-games { color: #eef1f4; }
+.ump-serve {
+  margin: 10px 0 0;
+  color: var(--gold-accent);
+  font-size: var(--text-md);
+  text-align: center;
+  overflow-wrap: anywhere;
 }
-.ump-sync-offline .ump-sync-dot {
-  background: var(--warn);
+.ump-serve strong { font-weight: 800; }
+.ump-serve-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--gold-accent); margin-right: 6px; vertical-align: 1px; }
+.ump-serve-num { color: var(--muted-court); font-weight: 600; }
+.ump-pending-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
+  color: var(--muted);
+  font-size: var(--text-sm);
 }
-@keyframes ump-sync-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
-}
+
+/* ---- Actions ---------------------------------------------------------- */
 .ump-actions {
-  padding: 0 14px 16px;
+  padding: 12px var(--ump-gutter) 16px;
   display: grid;
-  gap: 10px;
+  gap: 12px;
   margin-top: auto;
   min-width: 0;
 }
+.ump-primary { width: 100%; }
+
+.pads { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; min-width: 0; }
+.btn.point {
+  min-height: var(--ump-pad-h);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 8px;
+  min-width: 0;
+  color: #fff;
+  box-shadow: none;
+  border-radius: var(--radius-lg);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: filter 80ms linear, transform 80ms linear;
+}
+.btn.point.a { background: var(--team-a); }
+.btn.point.b { background: var(--team-b); }
+.btn.point:active:not(:disabled) { filter: brightness(0.82); transform: scale(0.98); }
+.btn.point:hover:not(:disabled) { transform: none; box-shadow: none; }
+/* While the tap is being written the lane refuses a second write anyway; the
+   pad stays at full strength so scoring never flickers. */
+.btn.point[data-saving="true"] { cursor: progress; }
+.point-kicker {
+  font-size: var(--text-xs);
+  letter-spacing: 0.18em;
+  opacity: 0.8;
+}
+.point-name {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: clamp(1.15rem, 4.6vw, 1.6rem);
+  letter-spacing: 0.04em;
+  line-height: 1.05;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 100%;
+}
+
+.ump-secondary-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: 4px;
+}
+.ump-undo { flex: 0 1 auto; min-width: 150px; }
+
+.ump-toss-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.ump-toss-summary .section-label { margin: 0; }
+
 .ump-toss, .ump-complete {
   background: var(--surface);
   color: var(--text);
   border-color: var(--border);
 }
-.ump-complete { text-align: center; }
-.ump-complete h2 { font-size: clamp(1.4rem, 6vw, 2rem); margin: 8px 0; }
+.ump-complete { text-align: center; box-shadow: none; }
+.ump-complete .kicker { color: var(--gold-accent); }
+.ump-complete-label { font-size: var(--text-xs); letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+.ump-complete h2 { font-size: clamp(1.5rem, 7vw, 2.2rem); margin: 4px 0 8px; overflow-wrap: anywhere; }
+.ump-final { margin: 0 0 14px; font-size: var(--text-md); font-variant-numeric: tabular-nums; }
+.ump-complete-actions { display: grid; gap: 8px; }
 .ump-toss h2 { font-size: 1.2rem; }
+
+.ump-modal-lead { margin: 0; font-size: var(--text-md); font-weight: 700; overflow-wrap: anywhere; }
+.ump-modal-text { margin: 0; }
+.ump-modal-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--space-2); margin-top: 4px; }
+.ump-modal-actions .btn { flex: 1 1 140px; }
+
+.ump-alert-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
+.ump-alert-row > span { flex: 1 1 200px; }
+.ump-alert-detail { margin-top: 8px; }
+
+/* ---- Lists ------------------------------------------------------------ */
+.ump-list { padding: var(--ump-gutter); display: grid; gap: 10px; }
+.ump-group { display: grid; gap: 8px; }
 .section-label {
   font-size: var(--text-xs);
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--muted-court);
   font-weight: 700;
-  margin: 8px 2px;
+  margin: 10px 2px 0;
 }
-
-.pads { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; min-width: 0; }
-.btn.point {
-  min-height: clamp(72px, 16dvh, 108px);
-  font-size: clamp(1rem, 3.6vw, 1.25rem);
-  font-family: "Barlow Condensed", sans-serif;
-  letter-spacing: 0.06em;
+.ump-count { color: var(--muted); letter-spacing: 0; margin-left: 4px; }
+/* .ump-card layers onto the shared .panel.card-clickable (background/border/
+   padding/live tint come from packages/ui) — touch sizing and a flatter look. */
+.ump-card { min-height: 72px; min-width: 0; padding: 12px 14px; box-shadow: none; display: grid; gap: 6px; }
+.ump-card[data-live="true"] { box-shadow: 0 0 0 1px color-mix(in srgb, var(--live) 40%, transparent); }
+.ump-card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-3); min-width: 0; }
+.ump-card-badge { flex: none; }
+.ump-name {
+  display: grid;
+  gap: 2px;
+  font-weight: 700;
+  font-size: var(--text-md);
+  line-height: 1.3;
   min-width: 0;
   overflow-wrap: anywhere;
-  color: #fff;
-  text-transform: uppercase;
+  word-break: break-word;
 }
-.btn.point.a { background: var(--team-a); }
-.btn.point.b { background: var(--team-b); }
+.ump-vs { color: var(--muted); font-weight: 500; font-size: var(--text-sm); margin-right: 6px; }
+.ump-footer { text-align: center; color: var(--muted); font-size: var(--text-xs); padding: var(--space-5) 0 var(--space-2); }
 
-@media (max-width: 480px) {
-  .ump-top { flex-wrap: wrap; }
-  .pads { gap: 8px; }
-  .btn.point { min-height: 64px; }
-}
-
-/* Height/orientation constraint, not a width breakpoint — the documented
-   mobile/tablet/narrow-desktop scale (packages/ui/src/styles.css) doesn't apply here. */
-@media (orientation: landscape) and (max-height: 520px) {
-  .ump-desk {
-    display: grid;
-    grid-template-columns: minmax(0, 1.15fr) minmax(200px, 0.85fr);
-    grid-template-rows: auto minmax(0, 1fr);
-  }
-  .ump-desk .ump-top { grid-column: 1 / -1; }
-  .ump-desk .ump-score { padding-top: 0; }
-  .ump-desk .ump-actions {
-    margin-top: 0;
-    overflow: auto;
-    padding-top: 8px;
-  }
-  .scoreboard { padding: 8px 10px; }
-  .scoreboard .pts { font-size: clamp(2rem, 10vh, 3.4rem); }
-  .btn.point { min-height: clamp(52px, 22dvh, 72px); }
-}
-
-.ump-shell .btn.secondary {
-  color: var(--text);
-  border-color: var(--border);
-}
-.ump-shell .btn.ghost { color: var(--muted); }
-.ump-shell .muted { color: var(--muted); }
-
-html, body, #root {
-  height: 100%;
-  max-width: 100%;
-  overflow-x: hidden;
-}
-
+/* ---- Sign-in / pairing ------------------------------------------------ */
 .ump-auth {
   display: flex;
   flex-direction: column;
@@ -203,11 +295,77 @@ html, body, #root {
   overflow-y: auto;
   min-height: 100dvh;
   min-height: 100svh;
+  background: var(--shell-bg);
   padding: max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
 }
+.ump-auth .auth-panel { width: min(420px, 100%); box-shadow: none; }
+.ump-auth .tape { margin-bottom: 16px; }
+.ump-auth-lead { margin: 12px 0; }
+.ump-auth-form { margin-top: 4px; }
+.ump-segment {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 3px;
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+.ump-segment button {
+  min-height: 42px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  font-weight: 700;
+  font-size: var(--text-sm);
+}
+.ump-segment button[aria-pressed="true"] { background: var(--elevated); color: var(--text); box-shadow: inset 0 -2px 0 var(--tape); }
+.ump-or {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.ump-or::before, .ump-or::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.ump-link { justify-self: center; }
 
-.ump-auth .auth-panel {
-  width: min(420px, 100%);
+/* ---- Small phones ----------------------------------------------------- */
+@media (max-width: 400px) {
+  :root { --ump-gutter: 12px; }
+  .ump-hide-xs { display: none; }
+  .ump-back, .ump-top-actions .btn.secondary:not(.ump-hold-btn) { min-width: var(--touch); padding: 0 12px; }
+  .pads { gap: 8px; }
+}
+@media (max-width: 480px) {
+  .ump-secondary-row .ump-undo { flex: 1 1 auto; }
+}
+
+/* Height/orientation constraint, not a width breakpoint: a phone held
+   sideways puts the scoreboard left and the controls right. */
+@media (orientation: landscape) and (max-height: 520px) {
+  .ump-desk {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(220px, 0.85fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+  .ump-desk .ump-top { grid-column: 1 / -1; padding-block: 6px; }
+  .ump-desk .ump-context-bar { grid-column: 1; padding-top: 4px; }
+  .ump-desk .ump-score { grid-column: 1; padding-top: 4px; }
+  .ump-desk .ump-actions {
+    grid-column: 2;
+    grid-row: 2 / 4;
+    margin-top: 0;
+    overflow: auto;
+    padding-top: 8px;
+    align-content: start;
+  }
+  .scoreboard { padding: 8px 10px; }
+  .ump-score .scoreboard .pts { font-size: clamp(2.4rem, 22vh, 5rem); }
+  :root { --ump-pad-h: clamp(64px, 40dvh, 170px); }
 }
 
 .ump-scanner-video {
@@ -355,4 +513,19 @@ html, body, #root {
   .coin.spin-tails {
     animation: none;
   }
+}
+
+/* ---- Edit score modal ------------------------------------------------- */
+.ump-edit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); align-items: end; }
+.ump-edit-side { display: grid; gap: 6px; min-width: 0; }
+.ump-edit-side label { min-width: 0; overflow-wrap: anywhere; }
+.ump-edit-side input { font-size: var(--text-lg); text-align: center; font-variant-numeric: tabular-nums; }
+.ump-stepper { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.ump-status-note {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  color: var(--muted);
+  text-align: center;
 }

@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, classifySendError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, createSyncEngine, createMatchLane, createUserAuthProvider, reconstructMatchView, laneOf, ownerKey, classifyQueryFailure, applyLoadOutcome, stateFromCache, createDashboardCache, probeIdentity, rememberVerified, forgetVerified, sessionGate, startIdentity } from "@tournament/client";
-import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, stageScoringTarget, validateFinalScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
+import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, readCoinToss, stageScoringTarget, validateFinalScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
 import { clearStation, parsePairingInput, readStation, writeStation, stationDeviceId, stationTokenExpiresSoon } from "./stationSession.js";
 import { canUmpireSetGameTime, markLocalCompletion, timerDisplayMatch } from "./timerDisplay.js";
+import { friendlyError, syncChipState } from "./umpireText.js";
+import { hasUndoablePoint, matchPointPreview } from "./scoringGuards.js";
 import PairingScanner from "./PairingScanner.jsx";
 import CoinTossPanel from "./CoinTossPanel.jsx";
 import {
@@ -22,7 +24,7 @@ import {
   StatusBadge,
   useNow,
 } from "@tournament/ui";
-import { ArrowLeft, LogOut, PauseCircle, QrCode, RefreshCw } from "lucide-react";
+import { ArrowLeft, LogOut, PauseCircle, Pencil, QrCode, RefreshCw, Undo2 } from "lucide-react";
 import { version as APP_VERSION } from "../package.json";
 
 function isStationInactiveError(err) {
@@ -264,6 +266,45 @@ function unsyncedCount(status) {
   return (status?.pending || 0) + (status?.conflicts || 0);
 }
 
+// "Definitely offline" hint from the device (no network interface), updated
+// the moment it changes. Only ever used to say "offline" sooner — a false
+// value is never taken as proof the server is reachable, and it never
+// changes what is loaded, queued or synced.
+function useDeviceOffline() {
+  const read = () => typeof navigator !== "undefined" && navigator.onLine === false;
+  const [offline, setOffline] = useState(read);
+  useEffect(() => {
+    const update = () => setOffline(read());
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
+  }, []);
+  return offline;
+}
+
+// Runs a list reload and reports it as in progress, so a manual Refresh/Retry
+// always shows feedback (supabase-js can take several seconds to give up
+// while offline). Overlapping taps are ignored while one is running.
+function useManualRefresh(load) {
+  const [refreshing, setRefreshing] = useState(false);
+  const running = useRef(false);
+  const refresh = useCallback(async () => {
+    if (running.current) return;
+    running.current = true;
+    setRefreshing(true);
+    try {
+      await load();
+    } finally {
+      running.current = false;
+      setRefreshing(false);
+    }
+  }, [load]);
+  return [refreshing, refresh];
+}
+
 export default function App() {
   const cfg = useMemo(() => envConfig(), []);
   const supabase = useMemo(() => createBrowserClient(cfg.url, cfg.publishableKey), [cfg]);
@@ -387,7 +428,7 @@ export default function App() {
     <ConfirmDialog
       title={leaveRequest.kind === "station" ? "Unpair with unsynced scores?" : "Sign out with unsynced scores?"}
       body={leaveRequest.kind === "station"
-        ? `${leaveRequest.count} saved action${leaveRequest.count === 1 ? " has" : "s have"} not reached the server yet. They stay saved on this device, but after unpairing they can no longer be sent as this court. Stay paired until they show SYNCED if you can.`
+        ? `${leaveRequest.count} saved action${leaveRequest.count === 1 ? " has" : "s have"} not reached the server yet. They stay saved on this device, but after unpairing they can no longer be sent as this court. If you can, stay paired until the status shows Synced.`
         : `${leaveRequest.count} saved action${leaveRequest.count === 1 ? " has" : "s have"} not reached the server yet. They stay saved on this device and are sent only when this same account signs in here again. No other account can send them.`}
       confirmLabel={leaveRequest.kind === "station" ? "Unpair anyway (keep saved scores)" : "Sign out (keep saved scores)"}
       danger
@@ -474,12 +515,14 @@ function SyncNotices({ sync, who }) {
       )}
       {s.needsAuth && unsyncedCount(s) > 0 && <Alert tone="warn">{s.needsAuth}</Alert>}
       {s.pending > 0 && (
-        <div className="row" style={{ justifyContent: "space-between" }}>
-          <span className="ump-sync ump-sync-offline">
-            <span className="ump-sync-dot" aria-hidden="true" /> {s.pending} action{s.pending === 1 ? "" : "s"} saved on this device — {s.syncing ? "syncing…" : s.offline ? "offline, will sync when connected" : "not yet synced"}
-          </span>
-          <Button variant="secondary" onClick={() => sync.engine?.kick({ resetBackoff: true })}>Sync now</Button>
-        </div>
+        <Alert tone="warn">
+          <div className="ump-alert-row">
+            <span>
+              {s.pending} action{s.pending === 1 ? "" : "s"} saved on this device — {s.syncing ? "syncing now…" : s.offline ? "offline, will sync when connected." : "not sent yet."}
+            </span>
+            <Button variant="secondary" className="compact" onClick={() => sync.engine?.kick({ resetBackoff: true })}>Sync now</Button>
+          </div>
+        </Alert>
       )}
       {s.conflicts > 0 && (
         <Alert>{s.conflicts} saved action{s.conflicts === 1 ? " needs" : "s need"} attention — open the match marked "Needs attention" below.</Alert>
@@ -487,13 +530,13 @@ function SyncNotices({ sync, who }) {
       {s.unclaimed > 0 && (
         <Alert tone="warn">
           {s.unclaimed} action{s.unclaimed === 1 ? " was" : "s were"} saved on this device by an earlier version of this app. They are only sent after you confirm they are yours.
-          <div className="row" style={{ marginTop: 8 }}>
+          <div className="row ump-alert-detail">
             <Button variant="secondary" onClick={() => setConfirmClaim(true)}>Review and send</Button>
           </div>
         </Alert>
       )}
       {s.otherOwner > 0 && (
-        <p className="muted" style={{ color: "var(--muted-court)" }}>
+        <p className="muted ump-note">
           {s.otherOwner} saved action{s.otherOwner === 1 ? " belongs" : "s belong"} to another account or court pairing on this device and will not be sent from here.
         </p>
       )}
@@ -569,35 +612,43 @@ async function seedMatchContexts(store, owner, matches, sides, participants, cou
 
 // Non-destructive status for a list. Network trouble says "offline —
 // showing saved data"; auth/permission/app errors say what they are.
-function ListStatusBanner({ state, onRetry, noun }) {
-  const { status, error, lastUpdatedAt, rows } = state;
+// The raw failure text (state.error) stays in state for debugging but is not
+// shown: the umpire gets what happened and what to do, not a backend string.
+function ListStatusBanner({ state, onRetry, noun, deviceOffline = false }) {
+  const { lastUpdatedAt, rows } = state;
+  // The device already knows it has no network: say so now instead of
+  // waiting for the load's own retries to fail. Real load errors still win.
+  const status = deviceOffline && (state.status === "loading" || state.status === "online") ? "offline" : state.status;
   const hasData = Array.isArray(rows);
-  const when = lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString() : null;
-  const saved = hasData ? ` Showing saved data${when ? ` (last updated ${when})` : ""}.` : "";
+  const when = lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+  const saved = hasData ? ` Showing the list saved${when ? ` at ${when}` : ""}.` : "";
+  const stale = hasData ? " The list below may be out of date." : "";
   let tone = "warn";
   let text = null;
   if (status === "offline") {
     text = hasData
-      ? `Offline — showing saved data${when ? ` (last updated ${when})` : ""}. Matches saved on this device can still be opened and scored; everything syncs when you're back online.`
+      ? `Offline.${saved} Saved matches can still be opened and scored — everything syncs when you're back online.`
       : `Offline — ${noun} can't be loaded right now. Matches saved on this device are listed below.`;
   } else if (status === "server") {
-    text = `The server isn't responding right now (${error}).${saved} It will refresh automatically.`;
+    text = `The server isn't responding.${saved} It will refresh automatically.`;
   } else if (status === "auth") {
     tone = "error";
-    text = `Your sign-in needs to be renewed (${error}).${hasData ? " The list below may be out of date." : ""}`;
+    text = `Your sign-in has expired. Sign out and sign in again.${stale}`;
   } else if (status === "forbidden") {
     tone = "error";
-    text = `The server refused access (${error}).${hasData ? " The list below may be out of date." : ""}`;
+    text = `You don't have access to ${noun} any more. Check with the organizer.${stale}`;
   } else if (status === "error") {
     tone = "error";
-    text = `Couldn't load ${noun} (${error}).${hasData ? " The list below may be out of date." : ""}`;
+    text = `Couldn't load ${noun}.${stale}`;
   }
   if (!text) return null;
   return (
-    <>
-      <Alert tone={tone}>{text}</Alert>
-      <Button onClick={onRetry}>Retry</Button>
-    </>
+    <Alert tone={tone}>
+      <div className="ump-alert-row">
+        <span>{text}</span>
+        <Button variant="secondary" className="compact" onClick={onRetry}>Retry</Button>
+      </div>
+    </Alert>
   );
 }
 
@@ -629,17 +680,19 @@ function SavedMatches({ sync, onOpen, showAll }) {
         const st = r.match?.score_state || {};
         const nameFor = (slot) => participantNameFor(r.sides || [], r.participants || [], r.matchId, slot);
         return (
-          <ClickableCard key={r.matchId} className="ump-card" live={r.match?.status === "in_progress"} onClick={() => onOpen(r.matchId)}>
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <strong>{r.court?.name || "No court"}</strong>
-              {lane.conflicts > 0 ? <Badge tone="warn">Needs attention</Badge> : lane.pending > 0 ? <Badge tone="warn">{lane.pending} not synced</Badge> : <StatusBadge status={r.match?.status} />}
-            </div>
-            <div className="ump-name">{nameFor("A")} vs {nameFor("B")}</div>
-            <div className="muted" style={{ color: "var(--muted-court)" }}>
-              Server score {st.scoreA ?? 0}–{st.scoreB ?? 0}
-              {r.savedAt ? ` · saved ${new Date(r.savedAt).toLocaleTimeString()}` : ""}
-            </div>
-          </ClickableCard>
+          <MatchCard
+            key={r.matchId}
+            live={r.match?.status === "in_progress"}
+            onOpen={() => onOpen(r.matchId)}
+            nameA={nameFor("A")}
+            nameB={nameFor("B")}
+            badge={lane.conflicts > 0 ? <Badge tone="danger">Needs attention</Badge> : lane.pending > 0 ? <Badge tone="warn">{lane.pending} not synced</Badge> : <StatusBadge status={r.match?.status} />}
+            meta={[
+              r.court?.name || "No court",
+              `Confirmed ${st.scoreA ?? 0}–${st.scoreB ?? 0}`,
+              r.savedAt ? `saved ${new Date(r.savedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : null,
+            ]}
+          />
         );
       })}
     </section>
@@ -693,40 +746,52 @@ function Auth({ cfg, supabase, store, error, setError, onPaired }) {
       if (mode === "reset") {
         const { error: err } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: authRedirectUrl() });
         if (err) throw err;
-        setInfo("Reset email sent if the account exists.");
+        setInfo("If that email has an umpire account, a reset link is on its way.");
       } else {
         const { error: err } = await supabase.auth.signInWithPassword({ email, password });
         if (err) throw err;
       }
     } catch (err) {
-      setError(err.message);
+      setError(friendlyError(err, mode === "pair" ? "pair" : mode === "reset" ? "reset" : "signin"));
     } finally {
       setBusy(false);
     }
   }
 
+  const pairMode = mode === "pair";
+  function switchMode(next) {
+    setMode(next);
+    setError("");
+    setInfo("");
+  }
+
   return (
-    <div className="auth-wrap ump-auth" style={{ background: "var(--court-2)" }}>
+    <div className="auth-wrap ump-auth">
       <div className="auth-panel">
         <div className="kicker">Tournament</div>
         <h1>Umpire</h1>
         <div className="tape" />
-        <p className="muted">
-          {mode === "pair"
-            ? "Pair this court. Scan the organizer QR or enter the pairing code. New matches on that court do not need another scan."
-            : "Assigned matches only. Scores persist through refresh."}
+        <div className="ump-segment" role="group" aria-label="How this device is used">
+          <button type="button" aria-pressed={pairMode} onClick={() => switchMode("pair")}>Court device</button>
+          <button type="button" aria-pressed={!pairMode} onClick={() => switchMode("login")}>Umpire account</button>
+        </div>
+        <p className="muted ump-auth-lead">
+          {pairMode
+            ? "Scan the organizer's court QR once. New matches on that court appear here automatically."
+            : mode === "reset"
+              ? "Enter your account email and we'll send a reset link."
+              : "Sign in to score the matches assigned to you."}
         </p>
         {savedCount > 0 && (
           <Alert tone="warn">
-            {savedCount} scoring action{savedCount === 1 ? " is" : "s are"} saved on this device and not yet synced. Signing in needs an internet connection; they are sent automatically once the same umpire account signs in again. (Actions saved under an earlier court pairing can't be sent by a new pairing — they stay on this device.)
+            {savedCount} scoring action{savedCount === 1 ? " is" : "s are"} saved on this device and not yet sent. They sync automatically when the same account or court pairing signs in again (internet required).
           </Alert>
         )}
-        <form className="stack" onSubmit={submit} style={{ marginTop: 16 }}>
-          {mode === "pair" ? (
+        <form className="stack ump-auth-form" onSubmit={submit}>
+          {pairMode ? (
             <>
-              <h2 style={{ margin: 0 }}>Pair this court</h2>
-              <Button type="button" disabled={busy} onClick={() => { setScanning(true); setError(""); }}>
-                <QrCode size={16} aria-hidden="true" /> Scan QR code
+              <Button type="button" className="cta" disabled={busy} onClick={() => { setScanning(true); setError(""); }}>
+                <QrCode size={18} aria-hidden="true" /> Scan court QR
               </Button>
               {scanning && (
                 <PairingScanner
@@ -738,7 +803,7 @@ function Auth({ cfg, supabase, store, error, setError, onPaired }) {
                     try {
                       await pairWithRaw(raw);
                     } catch (err) {
-                      setError(err.message);
+                      setError(friendlyError(err, "pair"));
                     } finally {
                       setBusy(false);
                     }
@@ -746,8 +811,8 @@ function Auth({ cfg, supabase, store, error, setError, onPaired }) {
                   onClose={() => setScanning(false)}
                 />
               )}
-              <p className="muted">or</p>
-              <Input label="Enter pairing code" value={pairText} onChange={(e) => setPairText(e.target.value)} placeholder="Paste the organizer pairing JSON" />
+              <div className="ump-or" aria-hidden="true"><span>or enter the code</span></div>
+              <Input label="Pairing code" value={pairText} onChange={(e) => setPairText(e.target.value)} placeholder="Code from the organizer" autoComplete="off" autoCapitalize="off" spellCheck={false} />
             </>
           ) : (
             <>
@@ -759,15 +824,14 @@ function Auth({ cfg, supabase, store, error, setError, onPaired }) {
           )}
           {error && <Alert>{error}</Alert>}
           {info && <Alert tone="ok">{info}</Alert>}
-          <Button type="submit" disabled={busy || (mode === "pair" && !pairText.trim())}>
-            {busy ? "Working…" : mode === "pair" ? "Pair" : mode === "reset" ? "Send reset" : "Sign in"}
+          <Button type="submit" variant={pairMode ? "secondary" : "primary"} className={pairMode ? "" : "cta"} disabled={busy || (pairMode && !pairText.trim())}>
+            {busy
+              ? (pairMode ? "Pairing…" : mode === "reset" ? "Sending…" : "Signing in…")
+              : pairMode ? "Pair court" : mode === "reset" ? "Send reset link" : "Sign in"}
           </Button>
-          <Button variant="secondary" type="button" onClick={() => setMode(mode === "pair" ? "login" : "pair")}>
-            {mode === "pair" ? "Use umpire account" : "Pair a court instead"}
-          </Button>
-          {mode !== "pair" && (
-            <Button variant="secondary" type="button" onClick={() => setMode(mode === "reset" ? "login" : "reset")}>
-              {mode === "reset" ? "Back to sign in" : "Forgot password"}
+          {!pairMode && (
+            <Button variant="ghost" type="button" className="ump-link" onClick={() => switchMode(mode === "reset" ? "login" : "reset")}>
+              {mode === "reset" ? "Back to sign in" : "Forgot password?"}
             </Button>
           )}
         </form>
@@ -799,20 +863,20 @@ function RecoveryScreen({ supabase, onDone, onSignOut }) {
       if (err) throw err;
       onDone();
     } catch (err) {
-      setError(err.message);
+      setError(friendlyError(err, "action"));
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="auth-wrap ump-auth" style={{ background: "var(--court-2)" }}>
+    <div className="auth-wrap ump-auth">
       <div className="auth-panel">
         <div className="kicker">Tournament</div>
         <h1>Umpire</h1>
         <div className="tape" />
-        <p className="muted">Choose a new password to finish reset.</p>
-        <form className="stack" onSubmit={submit} style={{ marginTop: 16 }}>
+        <p className="muted">Choose a new password to finish the reset.</p>
+        <form className="stack ump-auth-form" onSubmit={submit}>
           <Input label="New password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} autoComplete="new-password" />
           <Input label="Confirm password" type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} required minLength={8} autoComplete="new-password" />
           {error && <Alert>{error}</Alert>}
@@ -921,9 +985,13 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
 
   const nameFor = (matchId, slot) => participantNameFor(meta.sides, meta.participants, matchId, slot);
 
+  // The search box only exists for longer lists; a query typed earlier must
+  // never keep filtering once the box is gone (it could not be cleared).
+  const searchable = (rows?.length || 0) > 6;
+  const activeQuery = searchable ? query.trim() : "";
   const filtered = (rows || []).filter((m) => {
-    if (!query.trim()) return true;
-    const q = query.trim().toLowerCase();
+    if (!activeQuery) return true;
+    const q = activeQuery.toLowerCase();
     const a = nameFor(m.id, "A").toLowerCase();
     const b = nameFor(m.id, "B").toLowerCase();
     return (
@@ -937,28 +1005,40 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
   const grouped = rows ? groupMatches(filtered) : null;
   const doneRows = grouped ? (showAllDone ? grouped.done : grouped.done.slice(0, 8)) : [];
 
+  const [manualRefreshing, refresh] = useManualRefresh(load);
+  const refreshing = manualRefreshing || (list.status === "loading" && rows !== null);
+  const deviceOffline = useDeviceOffline();
+
   return (
     <div className="ump-shell">
       <header className="ump-top">
-        <div>
+        <div className="ump-top-title">
           <div className="kicker">Umpire</div>
-          <h1 style={{ fontSize: "1.4rem" }}>Matches</h1>
-          <div className="muted" style={{ color: "var(--muted-court)" }}>{session.user.email}</div>
-          <div className="muted app-version" style={{ color: "var(--muted-court)", fontSize: "var(--text-xs)" }}>Version {APP_VERSION}</div>
+          <h1>My matches</h1>
+          <div className="ump-meta ump-ellipsis">{session.user.email}{session.offline ? " · offline" : ""}</div>
         </div>
-        <div className="row">
-          <Button variant="secondary" onClick={load}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>
-          <Button variant="secondary" onClick={onSignOut}><LogOut size={15} aria-hidden="true" /> Sign out</Button>
+        <div className="ump-top-actions">
+          <Button variant="secondary" onClick={refresh} disabled={refreshing} aria-label="Refresh matches">
+            <RefreshCw size={16} aria-hidden="true" className={refreshing ? "ump-spin" : undefined} /> <span className="ump-hide-xs">Refresh</span>
+          </Button>
+          <Button variant="ghost" onClick={onSignOut}><LogOut size={16} aria-hidden="true" /> Sign out</Button>
         </div>
       </header>
       <div className="ump-list">
         <SyncNotices sync={sync} who={session.user.email} />
-        <ListStatusBanner state={list} onRetry={load} noun="your assigned matches" />
+        <ListStatusBanner state={list} onRetry={refresh} noun="your assigned matches" deviceOffline={deviceOffline} />
         <SavedMatches sync={sync} onOpen={onOpen} showAll={list.status !== "online" && list.status !== "loading"} />
-        {rows === null && list.status === "loading" && <LoadingState label="Loading assignments" />}
-        {rows?.length === 0 && <EmptyState title="No assigned matches">When an organizer assigns you, matches appear here.</EmptyState>}
-        {rows?.length > 0 && (
-          <Input label="Search matches" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Court, player, status" />
+        {rows === null && list.status === "loading" && <LoadingState label="Loading your matches…" />}
+        {rows?.length === 0 && (
+          <EmptyState title="No matches assigned yet">
+            When the organizer assigns you to a match it shows up here. Tap Refresh if you were just assigned.
+          </EmptyState>
+        )}
+        {searchable && (
+          <Input label="Find a match" type="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Player, court or round" />
+        )}
+        {grouped && activeQuery && filtered.length === 0 && (
+          <EmptyState title="No matches found">Nothing matches “{activeQuery}”.</EmptyState>
         )}
         {grouped && (
           <>
@@ -974,6 +1054,7 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
             {grouped.other.length > 0 && <MatchGroup title="Other" rows={grouped.other} onOpen={onOpen} nameFor={nameFor} />}
           </>
         )}
+        <div className="ump-footer app-version">Umpire version {APP_VERSION}</div>
       </div>
     </div>
   );
@@ -1049,7 +1130,7 @@ function GameTimeModal({ match, busy, onClose, onSend }) {
   return (
     <Modal title="Game time" onClose={() => !busy && onClose()}>
       <div className="stack">
-        <p className="muted" style={{ margin: 0 }}>
+        <p className="muted ump-modal-text">
           {hasTimer ? `Currently ${Math.round(configured.durationSec / 60)} minutes.` : "No game time is set for this match."}
         </p>
         <Input
@@ -1061,7 +1142,7 @@ function GameTimeModal({ match, busy, onClose, onSend }) {
           disabled={busy}
         />
         {error && <Alert>{error}</Alert>}
-        <div className="row" style={{ justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+        <div className="ump-modal-actions">
           <Button variant="ghost" disabled={busy} onClick={onClose}>Cancel</Button>
           {hasTimer && (
             <Button variant="secondary" disabled={busy} onClick={() => submit({ action: "clear" })}>Remove</Button>
@@ -1081,23 +1162,47 @@ function knownScoringTarget(match) {
   return null;
 }
 
+function roundLabel(m) {
+  if (m?.stage_label) return stageTitle(m.stage_label);
+  return m?.round != null ? `Round ${m.round}` : null;
+}
+
+// One tappable match row: players first (what the umpire scans for), then
+// court / stage / score on one quiet line, status badge on the right.
+function MatchCard({ live, onOpen, nameA, nameB, badge, meta }) {
+  return (
+    <ClickableCard className="ump-card" live={live} onClick={onOpen}>
+      <div className="ump-card-head">
+        <div className="ump-name">
+          <span>{nameA}</span>
+          <span><span className="ump-vs">vs</span>{nameB}</span>
+        </div>
+        <div className="ump-card-badge">{badge}</div>
+      </div>
+      <div className="ump-meta">{meta.filter(Boolean).join(" · ")}</div>
+    </ClickableCard>
+  );
+}
+
 function MatchGroup({ title, rows, onOpen, nameFor }) {
   if (!rows.length) return null;
   return (
-    <section>
-      <div className="section-label">{title}</div>
+    <section className="ump-group">
+      <div className="section-label">{title} <span className="ump-count">{rows.length}</span></div>
       {rows.map((m) => (
-        <ClickableCard key={m.id} className="ump-card" live={m.status === "in_progress"} onClick={() => onOpen(m.id)}>
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            <strong>{m.courtName || "No court"}</strong>
-            {m.status === "in_progress" ? <Badge tone="live">● LIVE</Badge> : <StatusBadge status={m.status} />}
-          </div>
-          <div className="ump-name">{nameFor(m.id, "A")} vs {nameFor(m.id, "B")}</div>
-          <div className="muted" style={{ color: "var(--muted-court)" }}>
-            {m.score_state?.scoreA != null ? `${m.score_state.scoreA}–${m.score_state.scoreB}` : "No score yet"}
-            {m.stage_label ? ` · ${stageTitle(m.stage_label)}` : ` · Round ${m.round}`}
-          </div>
-        </ClickableCard>
+        <MatchCard
+          key={m.id}
+          live={m.status === "in_progress"}
+          onOpen={() => onOpen(m.id)}
+          nameA={nameFor(m.id, "A")}
+          nameB={nameFor(m.id, "B")}
+          badge={<StatusBadge status={m.status} />}
+          meta={[
+            m.courtName || "No court",
+            roundLabel(m),
+            m.score_state?.scoreA != null ? `${m.score_state.scoreA}–${m.score_state.scoreB}` : null,
+          ]}
+        />
       ))}
     </section>
   );
@@ -1174,17 +1279,23 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
   // A revoked pairing can't open these matches any more — don't list them.
   const grouped = rows && !revoked ? groupMatches(rows) : null;
 
+  const [manualRefreshing, refresh] = useManualRefresh(load);
+  const refreshing = manualRefreshing || (list.status === "loading" && rows !== null);
+  const deviceOffline = useDeviceOffline();
+
   return (
     <div className="ump-shell">
       <header className="ump-top">
-        <div>
-          <div className="kicker">Connected</div>
-          <h1 style={{ fontSize: "1.4rem" }}>{court?.name || "Court"}</h1>
-          <div className="muted">Paired. Open the current match to score.</div>
+        <div className="ump-top-title">
+          <div className="kicker">Court station</div>
+          <h1 className="ump-ellipsis">{court?.name || "Court"}</h1>
+          <div className="ump-meta">Tap the live or next match to score.</div>
         </div>
-        <div className="row">
-          <Button variant="secondary" onClick={load}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>
-          <Button variant="secondary" onClick={onUnpair}><LogOut size={15} aria-hidden="true" /> Unpair</Button>
+        <div className="ump-top-actions">
+          <Button variant="secondary" onClick={refresh} disabled={refreshing} aria-label="Refresh matches">
+            <RefreshCw size={16} aria-hidden="true" className={refreshing ? "ump-spin" : undefined} /> <span className="ump-hide-xs">Refresh</span>
+          </Button>
+          <Button variant="ghost" onClick={onUnpair}><LogOut size={16} aria-hidden="true" /> Unpair</Button>
         </div>
       </header>
       <div className="ump-list">
@@ -1195,11 +1306,15 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
             <Button onClick={onUnpair}>Pair again</Button>
           </>
         ) : (
-          <ListStatusBanner state={list} onRetry={load} noun="this court's matches" />
+          <ListStatusBanner state={list} onRetry={refresh} noun="this court's matches" deviceOffline={deviceOffline} />
         )}
         <SavedMatches sync={sync} onOpen={onOpen} showAll={Boolean(revoked) || (list.status !== "online" && list.status !== "loading")} />
-        {rows === null && list.status === "loading" && !revoked && <LoadingState label="Loading court" />}
-        {!revoked && rows?.length === 0 && <EmptyState title="No matches on this court">When an organizer assigns a match here, it appears without a new QR scan.</EmptyState>}
+        {rows === null && list.status === "loading" && !revoked && <LoadingState label="Loading this court's matches…" />}
+        {!revoked && rows?.length === 0 && (
+          <EmptyState title="No matches on this court yet">
+            When the organizer puts a match on this court it appears here — no new QR scan needed. Tap Refresh to check now.
+          </EmptyState>
+        )}
         {grouped && (
           <>
             <MatchGroup title="Live now" rows={grouped.live} onOpen={onOpen} nameFor={nameFor} />
@@ -1208,6 +1323,7 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
             <MatchGroup title="Completed" rows={grouped.done.slice(0, 8)} onOpen={onOpen} nameFor={nameFor} />
           </>
         )}
+        <div className="ump-footer app-version">Umpire version {APP_VERSION}</div>
       </div>
     </div>
   );
@@ -1274,18 +1390,18 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose, initialS
             This match is already completed. This correction updates the recorded score only — it cannot change the winner. Standings and bracket progression are not affected.
           </Alert>
         )}
-        <p className="muted" style={{ margin: 0 }}>Game {state.gameNumber || 1} · {nameA} vs {nameB}{winTo ? ` · Race to ${winTo}` : ""}</p>
-        <div className="row" style={{ alignItems: "flex-end" }}>
-          <div className="stack" style={{ gap: 4 }}>
+        <p className="muted ump-modal-text">Game {state.gameNumber || 1} · {nameA} vs {nameB}{winTo ? ` · Race to ${winTo}` : ""}</p>
+        <div className="ump-edit-grid">
+          <div className="ump-edit-side">
             <Input label={nameA} inputMode="numeric" value={scoreA} onChange={(e) => setScoreA(digitsOnly(e.target.value))} />
-            <div className="row" style={{ gap: 6 }}>
+            <div className="ump-stepper">
               <Button type="button" variant="secondary" onClick={() => step(setScoreA, scoreA, -1)} disabled={busy}>−1</Button>
               <Button type="button" variant="secondary" onClick={() => step(setScoreA, scoreA, 1)} disabled={busy}>+1</Button>
             </div>
           </div>
-          <div className="stack" style={{ gap: 4 }}>
+          <div className="ump-edit-side">
             <Input label={nameB} inputMode="numeric" value={scoreB} onChange={(e) => setScoreB(digitsOnly(e.target.value))} />
-            <div className="row" style={{ gap: 6 }}>
+            <div className="ump-stepper">
               <Button type="button" variant="secondary" onClick={() => step(setScoreB, scoreB, -1)} disabled={busy}>−1</Button>
               <Button type="button" variant="secondary" onClick={() => step(setScoreB, scoreB, 1)} disabled={busy}>+1</Button>
             </div>
@@ -1299,21 +1415,21 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose, initialS
         />
         {scoreError && <Alert>{scoreError}</Alert>}
         {check?.ok && check.complete && !unchanged && !wasCompleted && (
-          <p className="muted" style={{ margin: 0 }}>This score ends the match — first to {winTo} wins.</p>
+          <p className="muted ump-modal-text">This score ends the match — first to {winTo} wins.</p>
         )}
         {error && <Alert>{error}</Alert>}
         {!confirming ? (
-          <div className="row">
+          <div className="ump-modal-actions">
             <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
             <Button type="button" disabled={!canContinue} onClick={() => setConfirming(true)}>Save score</Button>
           </div>
         ) : (
           <>
-            <p style={{ margin: 0 }}>
+            <p className="ump-modal-text">
               Change score from {state.scoreA ?? 0}–{state.scoreB ?? 0} to {nextA}–{nextB}?
               {wasCompleted ? " This match is completed — the correction will be audited." : ""}
             </p>
-            <div className="row">
+            <div className="ump-modal-actions">
               <Button type="button" variant="secondary" onClick={() => setConfirming(false)} disabled={busy}>Back</Button>
               <Button type="button" disabled={busy} onClick={submit}>{busy ? "Saving…" : "Apply correction"}</Button>
             </div>
@@ -1348,6 +1464,13 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const [reapplyLocal, setReapplyLocal] = useState(null);
   const [resolving, setResolving] = useState(false);
   const [justSynced, setJustSynced] = useState(false);
+  const [confirmMatchPoint, setConfirmMatchPoint] = useState(null);
+  const [pendingStale, setPendingStale] = useState(false);
+  // Set when this screen's own reload failed for network reasons, cleared by
+  // the next successful one — so the status chip never says "Online" while
+  // the server is unreachable and nothing happens to be queued.
+  const [loadOffline, setLoadOffline] = useState(false);
+  const deviceOffline = useDeviceOffline();
   const baseRef = useRef(null);
   baseRef.current = base;
 
@@ -1405,6 +1528,19 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
     return undefined;
   }, [unsyncedHere, hydrated]);
 
+  // Online, a point normally syncs in well under a second. Only explain the
+  // "saved on this device" state once it has lasted a few seconds, so routine
+  // scoring never flashes extra text under the scoreboard.
+  const hasUnsynced = unsyncedHere > 0;
+  useEffect(() => {
+    if (!hasUnsynced) {
+      setPendingStale(false);
+      return undefined;
+    }
+    const t = window.setTimeout(() => setPendingStale(true), 4000);
+    return () => window.clearTimeout(t);
+  }, [hasUnsynced]);
+
   const load = useCallback(async () => {
     try {
       let record;
@@ -1429,6 +1565,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
         // couldn't refresh) supabase-js queries anonymously and RLS answers
         // "not found" — never let that replace the match saved on this device.
         if (await sessionGate(supabase)) {
+          setLoadOffline(true);
           if (!baseRef.current) setLoadError("You're offline and this match isn't saved on this device yet. Reconnect to load it.");
           return;
         }
@@ -1442,17 +1579,18 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
         // saved on this device) — the Reload button retries.
         const firstErr = m.error || s.error || ca.error;
         if (firstErr) {
-          if (!baseRef.current) setLoadError(`This match isn't saved on this device yet and couldn't be loaded (${firstErr.message}). Reconnect and try again.`);
+          setLoadOffline(classifyQueryFailure(firstErr) === "network");
+          if (!baseRef.current) setLoadError(`This match isn't saved on this device yet and couldn't be loaded. ${friendlyError(firstErr, "load")}`);
           return;
         }
-        if (!m.data) { if (!baseRef.current) setLoadError("Match not found."); return; }
+        if (!m.data) { if (!baseRef.current) setLoadError("This match can't be found. It may have been removed or reassigned — go back and refresh your list."); return; }
         const participantIds = [...new Set((s.data || []).map((x) => x.participant_id).filter(Boolean))];
         const [p, c] = await Promise.all([
           participantIds.length ? supabase.from("participants").select("*").in("id", participantIds) : Promise.resolve({ data: [] }),
           ca.data?.court_id ? supabase.from("courts").select("*").eq("id", ca.data.court_id).maybeSingle() : Promise.resolve({ data: null }),
         ]);
         if (p.error || c?.error) {
-          if (!baseRef.current) setLoadError((p.error || c.error).message);
+          if (!baseRef.current) setLoadError(friendlyError(p.error || c.error, "load"));
           return;
         }
         record = matchContextRecord({ owner, match: m.data, sides: s.data || [], participants: p.data || [], court: c?.data || null });
@@ -1462,15 +1600,17 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
       // any unsynced local actions — a reload never replaces them.
       await store.putMatch(record);
       await refreshLocal();
+      setLoadOffline(false);
       setLoadError("");
       setError("");
       engine?.kick();
     } catch (err) {
       if (isNetworkError(err)) {
+        setLoadOffline(true);
         if (!baseRef.current) setLoadError("You're offline and this match isn't saved on this device yet. Reconnect to load it.");
         return;
       }
-      const message = isStationInactiveError(err) ? "This court station was revoked. Pair again with a new QR." : err.message;
+      const message = isStationInactiveError(err) ? "This court station was revoked. Pair again with a new QR." : friendlyError(err, "load");
       if (baseRef.current) setError(message); else setLoadError(message);
     }
   }, [supabase, matchId, station, cfg, getAuth, owner, store, refreshLocal, engine]);
@@ -1482,10 +1622,14 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
     function onVis() {
       if (document.visibilityState === "visible") load();
     }
+    // Also re-read on reconnect (as the match lists do), so an offline status
+    // from a failed reload clears as soon as the server answers again.
     window.addEventListener("focus", load);
+    window.addEventListener("online", load);
     document.addEventListener("visibilitychange", onVis);
     return () => {
       window.removeEventListener("focus", load);
+      window.removeEventListener("online", load);
       document.removeEventListener("visibilitychange", onVis);
     };
   }, [load]);
@@ -1523,6 +1667,16 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
     return enqueue(type, extra);
   }
 
+  // The match-winning point is the one tap Undo can't reverse: once it syncs
+  // the server completes the match and advances the bracket. So that tap —
+  // and only that tap — asks first (see scoringGuards.js).
+  function scorePoint(team) {
+    if (laneBusy) return; // the lane refuses overlapping writes anyway
+    const win = view ? matchPointPreview(view.match, view.localLastSeq, team) : null;
+    if (win) setConfirmMatchPoint(win);
+    else sendScore("point", { team });
+  }
+
   async function sendCorrection(correctionPayload) {
     const res = await enqueue("correction", correctionPayload);
     if (!res.accepted) throw new Error(res.error?.message || "Could not save the correction");
@@ -1534,7 +1688,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   // (otherwise the server would see them out of order).
   async function onlineOnly(type, payload, offlineMessage) {
     if (unsyncedHere > 0) {
-      setError("This match still has actions saved on this device that haven't synced. Connect to the internet and wait for SYNCED first.");
+      setError("This match still has actions saved on this device that haven't synced. Connect to the internet and wait until the status shows Synced.");
       engine?.kick({ resetBackoff: true });
       return false;
     }
@@ -1550,7 +1704,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
       }
       return true;
     } catch (err) {
-      setError(isNetworkError(err) ? offlineMessage : err.message);
+      setError(isNetworkError(err) ? offlineMessage : friendlyError(err, "action"));
       return false;
     } finally {
       setBusy(false);
@@ -1580,6 +1734,9 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
     try {
       await engine?.archiveLane(matchId);
       lane.reset(Number(baseRef.current?.match?.score_state?.lastSeq || 0));
+      // The unsynced count drops to 0 because the actions were archived, not
+      // sent — don't let that read as "Synced".
+      prevUnsynced.current = 0;
       await refreshLocal();
       setError("");
     } finally {
@@ -1605,24 +1762,30 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
     return res;
   }
 
+  const backLabel = station ? "Court" : "Matches";
+  const backButton = (
+    <Button variant="secondary" className="ump-back" onClick={onBack} aria-label={station ? "Back to court" : "Back to my matches"}>
+      <ArrowLeft size={18} aria-hidden="true" /> <span className="ump-hide-xs">{backLabel}</span>
+    </Button>
+  );
+
   if (!hydrated && !match) {
     return (
       <div className="ump-shell ump-desk">
-        <div className="ump-top"><LoadingState label="Loading match" /></div>
+        <header className="ump-top">{backButton}</header>
+        <div className="ump-center"><LoadingState label="Loading match…" /></div>
       </div>
     );
   }
   if (loadError && !match) {
     return (
       <div className="ump-shell ump-desk">
-        <header className="ump-top">
-          <Button variant="secondary" onClick={onBack}><ArrowLeft size={15} aria-hidden="true" /> {station ? "Court" : "My matches"}</Button>
-        </header>
+        <header className="ump-top">{backButton}</header>
         <div className="ump-list">
           <Alert>{loadError}</Alert>
           {station && /revoked/i.test(loadError)
             ? <Button onClick={onSignOut}>Pair again</Button>
-            : <Button onClick={load}>Retry</Button>}
+            : <Button onClick={load}>Try again</Button>}
         </div>
       </div>
     );
@@ -1630,7 +1793,8 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   if (!match) {
     return (
       <div className="ump-shell ump-desk">
-        <div className="ump-top"><LoadingState label="Loading match" /></div>
+        <header className="ump-top">{backButton}</header>
+        <div className="ump-center"><LoadingState label="Loading match…" /></div>
       </div>
     );
   }
@@ -1646,11 +1810,14 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const winnerName = winnerSlot === "A" ? nameA : winnerSlot === "B" ? nameB : null;
   const gamesA = score.gamesWonA ?? score.gamesA ?? (winnerSlot === "A" ? 1 : 0);
   const gamesB = score.gamesWonB ?? score.gamesB ?? (winnerSlot === "B" ? 1 : 0);
+  const multiGame = (score.bestOf || 1) > 1;
   const canStart = (match.status === "assigned" || match.status === "ready") && isCoinTossCommitted(match);
   const scoring = match.status === "in_progress";
   const readyToComplete = match.status === "in_progress" && score.status === "completed";
   const completed = match.status === "completed";
   const showToss = (match.status === "assigned" || match.status === "in_progress" || match.status === "ready") && !completed;
+  const tossCommitted = isCoinTossCommitted(match);
+  const toss = tossCommitted ? readCoinToss(match) : null;
 
   const inConflict = Boolean(view && (view.conflicts.length > 0 || view.blocked.length > 0));
   const conflictEntries = view ? [...view.conflicts, ...view.blocked] : [];
@@ -1659,7 +1826,8 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const localResult = [...conflictEntries].reverse().find((e) => e.local?.result)?.local?.result || null;
   const serverScore = base?.match?.score_state || {};
   const pendingHere = view ? view.pending.length : 0;
-  const offlineNow = Boolean(syncStatus?.offline) || (typeof navigator !== "undefined" && navigator.onLine === false);
+  const completionQueued = Boolean(view?.pending.some((e) => e.type === "complete_match"));
+  const offlineNow = Boolean(syncStatus?.offline) || deviceOffline || loadOffline;
   // A paired court station may only score points and undo: the server refuses
   // corrections from a station, and a refused correction would block this
   // match's sync queue. So corrections are offered to signed-in umpires only.
@@ -1667,82 +1835,86 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const canReapply = canCorrect && Boolean(localResult) && (localResult.bestOf || 1) <= 1
     && ["in_progress", "completed"].includes(base?.match?.status);
   const actionsLocked = laneBusy || inConflict;
+  const nothingToUndo = !hasUndoablePoint(score);
+  const chip = syncChipState({
+    inConflict,
+    needsAuth: syncStatus?.needsAuth,
+    offline: offlineNow,
+    pending: pendingHere,
+    saving: laneBusy,
+    justSynced,
+    durable: store.durable !== false,
+  });
+  const showPendingNote = pendingHere > 0 && !inConflict && (pendingStale || offlineNow || Boolean(syncStatus?.needsAuth));
+  const servingClass = completed ? "" : score.servingTeam === "A" ? "serving-a" : score.servingTeam === "B" ? "serving-b" : "";
+  const serverNum = Number(score.server);
+  const configuredTimer = timerView(match, Date.now());
+  const context = [
+    match.stage_label ? stageTitle(match.stage_label) : `Round ${match.round || 1}`,
+    court?.name || "No court",
+    score.winTo ? `Race to ${score.winTo}` : null,
+  ].filter(Boolean);
 
   return (
     <div className="ump-shell ump-desk">
-      <header className="ump-top">
-        <Button variant="secondary" onClick={onBack}><ArrowLeft size={15} aria-hidden="true" /> {station ? "Court" : "My matches"}</Button>
-        <div className="row ump-top-actions">
+      <header className="ump-top ump-desk-top">
+        {backButton}
+        {/* Announced only when it needs attention; routine Saving/Synced
+            changes on every tap would be constant screen-reader noise. */}
+        <span className="ump-chip" data-tone={chip.tone} aria-live={chip.tone === "warn" || chip.tone === "error" ? "polite" : "off"}>
+          <span className="ump-chip-dot" aria-hidden="true" />
+          <span className="ump-ellipsis">{chip.label}</span>
+        </span>
+        <div className="ump-top-actions">
           {scoring && !station && (
             <Button variant="secondary" className="ump-hold-btn" onClick={() => setShowHold(true)} disabled={busy}>
-              <PauseCircle size={15} aria-hidden="true" /> Hold
+              <PauseCircle size={16} aria-hidden="true" /> Hold
             </Button>
           )}
-          <Button variant="secondary" onClick={load} disabled={busy}><RefreshCw size={15} aria-hidden="true" /> Reload</Button>
-          <Button variant="ghost" onClick={onSignOut}><LogOut size={15} aria-hidden="true" /> Sign out</Button>
+          <Button variant="secondary" className="ump-icon-btn" onClick={load} disabled={busy} aria-label="Reload match" title="Reload match">
+            <RefreshCw size={18} aria-hidden="true" />
+          </Button>
         </div>
       </header>
 
-      <div className="ump-context-bar">
-        <span className="ump-context-item">{match.stage_label ? stageTitle(match.stage_label) : `Round ${match.round || 1}`}</span>
-        <span className="ump-context-sep" aria-hidden="true">·</span>
-        <span className="ump-context-item">{court?.name || "No court"}</span>
-        {score.winTo ? (
-          <>
-            <span className="ump-context-sep" aria-hidden="true">·</span>
-            <span className="ump-context-item">Race to {score.winTo}</span>
-          </>
-        ) : null}
-      </div>
+      <div className="ump-context-bar">{context.join(" · ")}</div>
+
       <div className="ump-score">
-        <div className="ump-court-label">
-          {(court?.name || "NO COURT").toUpperCase()}
-        </div>
         <Scoreboard
+          className={servingClass}
           nameA={nameA}
           nameB={nameB}
           scoreA={score.scoreA ?? 0}
           scoreB={score.scoreB ?? 0}
           center={(
             <>
-              <div className="game">Game {score.gameNumber || 1}</div>
+              <div className="game">
+                Game {score.gameNumber || 1}
+                {multiGame ? <span className="ump-games"> · {gamesA}–{gamesB}</span> : null}
+              </div>
               {/* On expiry, one re-read picks up any time the organizer added. */}
               <MatchGameTimer match={match} onExpire={load} />
               <StatusBadge status={match.status} />
-              {laneBusy ? <div className="ump-sync"><span className="ump-sync-dot" aria-hidden="true" /> Saving…</div> : null}
-              {inConflict ? (
-                <div className="ump-sync ump-sync-offline">
-                  <span className="ump-sync-dot" aria-hidden="true" /> Sync conflict — action needed
-                </div>
-              ) : pendingHere > 0 ? (
-                <div className="ump-sync ump-sync-offline">
-                  <span className="ump-sync-dot" aria-hidden="true" />{" "}
-                  {syncStatus?.needsAuth
-                    ? `SAVED ON THIS DEVICE — ${pendingHere} waiting for sign-in`
-                    : offlineNow
-                      ? `OFFLINE — ${pendingHere} saved on this device`
-                      : `SYNCING — ${pendingHere} saved on this device`}
-                </div>
-              ) : justSynced ? (
-                <div className="ump-sync">SYNCED</div>
-              ) : null}
             </>
           )}
         />
-        {score.servingTeam && (
+        {score.servingTeam && !completed && (
           <p className="ump-serve">
-            <strong>{score.servingTeam === "A" ? nameA : nameB}</strong> to serve
-            {(Number(score.server) === 1 || Number(score.server) === 2) && (
-              <span className="ump-serve-num"> — {Number(score.server) === 1 ? "1st serve" : "2nd serve"}</span>
+            <span className="ump-serve-dot" aria-hidden="true" />
+            <strong>{score.servingTeam === "A" ? nameA : nameB}</strong>
+            <span> serving</span>
+            {(serverNum === 1 || serverNum === 2) && (
+              <span className="ump-serve-num"> · {serverNum === 1 ? "1st serve" : "2nd serve"}</span>
             )}
           </p>
         )}
-        {pendingHere > 0 && !inConflict && (
-          <p className="muted" style={{ color: "var(--muted-court)", margin: 0 }}>
-            Confirmed by server: {serverScore.scoreA ?? 0}–{serverScore.scoreB ?? 0}. The score above includes {pendingHere} action{pendingHere === 1 ? "" : "s"} saved only on this device.
-            {" "}
-            <Button variant="ghost" className="compact" onClick={() => engine?.kick({ resetBackoff: true })}>Sync now</Button>
-          </p>
+        {showPendingNote && (
+          <div className="ump-pending-note">
+            <span>
+              Server has {serverScore.scoreA ?? 0}–{serverScore.scoreB ?? 0}. {pendingHere} action{pendingHere === 1 ? " is" : "s are"} saved on this device and will sync automatically.
+            </span>
+            <Button variant="secondary" className="compact" onClick={() => engine?.kick({ resetBackoff: true })}>Sync now</Button>
+          </div>
         )}
       </div>
 
@@ -1755,12 +1927,12 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
         {inConflict && (
           <Alert>
             <strong>Sync conflict.</strong> {conflictReason}
-            <div style={{ marginTop: 6 }}>
+            <div className="ump-alert-detail">
               Server score: {serverScore.scoreA ?? 0}–{serverScore.scoreB ?? 0}
               {localResult ? ` · This device's unsynced score: ${localResult.scoreA}–${localResult.scoreB}` : ""}
               {` · ${conflictEntries.length} action${conflictEntries.length === 1 ? "" : "s"} kept on this device`}
             </div>
-            <div className="row" style={{ marginTop: 8, flexWrap: "wrap" }}>
+            <div className="row ump-alert-detail">
               {view.conflicts.length > 0 && (
                 <Button variant="secondary" disabled={resolving} onClick={() => engine?.retryLane(matchId)}>Retry sync</Button>
               )}
@@ -1769,82 +1941,21 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
                 <Button variant="secondary" disabled={resolving} onClick={() => setReapplyLocal(localResult)}>Apply this device's score as a correction</Button>
               )}
             </div>
-            <div className="muted" style={{ marginTop: 6 }}>
+            <div className="muted ump-alert-detail">
               Nothing is deleted. You can also leave this for now — the saved actions stay on this device until you choose.
             </div>
           </Alert>
         )}
 
-        {canStart && (
-          <Button
-            disabled={busy}
-            onClick={() => setShowScoringConfirm(true)}
-          >
-            Start match
-          </Button>
+        {/* Nothing can be done here yet — say why instead of showing a blank panel. */}
+        {match.status === "scheduled" && (
+          <p className="ump-status-note">Not ready yet. The organizer still has to set this match up — it becomes playable here automatically. Tap Reload to check.</p>
+        )}
+        {match.status === "postponed" && (
+          <p className="ump-status-note">This match is on hold. The organizer resumes it from the desk; tap Reload once play continues.</p>
         )}
 
-        {canUmpireSetGameTime(match, { station: Boolean(station) }) && (
-          <Button variant="secondary" disabled={busy} onClick={() => setShowGameTime(true)}>
-            {timerView(match, Date.now()).state === "configured"
-              ? `Game time: ${Math.round(timerView(match, Date.now()).durationSec / 60)} min`
-              : "Set game time"}
-          </Button>
-        )}
-
-        {showGameTime && canUmpireSetGameTime(match, { station: Boolean(station) }) && (
-          <GameTimeModal
-            match={match}
-            busy={busy}
-            onClose={() => setShowGameTime(false)}
-            onSend={(payload) => onlineOnly(
-              "set_match_timer",
-              { match_id: match.id, ...payload },
-              "You're offline — the game time was NOT changed. Changing it needs an internet connection.",
-            )}
-          />
-        )}
-
-        {showScoringConfirm && (
-          <Modal title="Match scoring" onClose={() => setShowScoringConfirm(false)}>
-            <div className="stack">
-              {knownScoringTarget(match) ? (
-                <p style={{ margin: 0 }}>
-                  <strong>Race to {knownScoringTarget(match)}</strong>
-                  <span className="muted"> — set by stage. The first team to {knownScoringTarget(match)} wins immediately (no deuce).</span>
-                </p>
-              ) : (
-                <p className="muted" style={{ margin: 0 }}>
-                  The target is set automatically by stage (qualification: race to 11 · semifinal/final: race to 15) and shown once the match starts. No deuce.
-                </p>
-              )}
-              {timerView(match, Date.now()).state === "configured" && (
-                <p style={{ margin: 0 }}>
-                  <strong>Game time: {Math.round(timerView(match, Date.now()).durationSec / 60)} minutes</strong>
-                  <span className="muted"> — the countdown starts when the match starts.</span>
-                </p>
-              )}
-              <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
-                <Button variant="secondary" disabled={busy} onClick={() => setShowScoringConfirm(false)}>Cancel</Button>
-                <Button
-                  disabled={busy}
-                  onClick={async () => {
-                    setShowScoringConfirm(false);
-                    await onlineOnly(
-                      "start_match",
-                      { match_id: match.id },
-                      "You're offline — the match was NOT started. Starting a match needs an internet connection.",
-                    );
-                  }}
-                >
-                  Start Match
-                </Button>
-              </div>
-            </div>
-          </Modal>
-        )}
-
-        {showToss && (
+        {showToss && !tossCommitted && (
           <CoinTossPanel
             match={match}
             nameA={nameA}
@@ -1869,44 +1980,150 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
           />
         )}
 
+        {/* Once the toss is recorded, the scoreboard's serve line carries it
+            during play; before the start it is summarised in one line. */}
+        {toss && !scoring && !completed && (
+          <div className="ump-toss-summary">
+            <span className="section-label">Coin toss</span>
+            <span>
+              First server <strong>{toss.servingTeam === "B" ? nameB : nameA}</strong>
+              {toss.courtSide ? ` · ${toss.courtSide === "left" ? "Left" : "Right"} side` : ""}
+            </span>
+          </div>
+        )}
+
+        {canUmpireSetGameTime(match, { station: Boolean(station) }) && (
+          <Button variant="secondary" disabled={busy} onClick={() => setShowGameTime(true)}>
+            {configuredTimer.state === "configured"
+              ? `Game time: ${Math.round(configuredTimer.durationSec / 60)} min · Change`
+              : "Set game time"}
+          </Button>
+        )}
+
+        {canStart && (
+          <Button className="cta ump-primary" disabled={busy} onClick={() => setShowScoringConfirm(true)}>
+            {busy ? "Starting…" : "Start match"}
+          </Button>
+        )}
+
+        {showGameTime && canUmpireSetGameTime(match, { station: Boolean(station) }) && (
+          <GameTimeModal
+            match={match}
+            busy={busy}
+            onClose={() => setShowGameTime(false)}
+            onSend={(payload) => onlineOnly(
+              "set_match_timer",
+              { match_id: match.id, ...payload },
+              "You're offline — the game time was NOT changed. Changing it needs an internet connection.",
+            )}
+          />
+        )}
+
+        {showScoringConfirm && (
+          <Modal title="Start this match?" onClose={() => setShowScoringConfirm(false)}>
+            <div className="stack">
+              <p className="ump-modal-lead">{nameA} <span className="muted">vs</span> {nameB}</p>
+              {knownScoringTarget(match) ? (
+                <p className="ump-modal-text">
+                  <strong>Race to {knownScoringTarget(match)}</strong>
+                  <span className="muted"> — set by stage. The first team to {knownScoringTarget(match)} wins immediately (no deuce).</span>
+                </p>
+              ) : (
+                <p className="muted ump-modal-text">
+                  The target is set automatically by stage (qualification: race to 11 · semifinal/final: race to 15) and shown once the match starts. No deuce.
+                </p>
+              )}
+              {configuredTimer.state === "configured" && (
+                <p className="ump-modal-text">
+                  <strong>Game time: {Math.round(configuredTimer.durationSec / 60)} minutes</strong>
+                  <span className="muted"> — the countdown starts when the match starts.</span>
+                </p>
+              )}
+              <div className="ump-modal-actions">
+                <Button variant="secondary" disabled={busy} onClick={() => setShowScoringConfirm(false)}>Cancel</Button>
+                <Button
+                  disabled={busy}
+                  onClick={async () => {
+                    setShowScoringConfirm(false);
+                    await onlineOnly(
+                      "start_match",
+                      { match_id: match.id },
+                      "You're offline — the match was NOT started. Starting a match needs an internet connection.",
+                    );
+                  }}
+                >
+                  Start match
+                </Button>
+              </div>
+            </div>
+          </Modal>
+        )}
+
         {scoring && !readyToComplete && (
           <>
             <div className="pads">
-              <Button className="point a" disabled={busy || actionsLocked} aria-label={`Point ${nameA}`} onClick={() => sendScore("point", { team: "A" })}>
-                Point {nameA}
+              <Button
+                className="point a"
+                data-saving={laneBusy ? "true" : undefined}
+                disabled={busy || inConflict}
+                aria-label={`Point ${nameA}`}
+                onClick={() => scorePoint("A")}
+              >
+                <span className="point-kicker" aria-hidden="true">Point</span>
+                <span className="point-name">{nameA}</span>
               </Button>
-              <Button className="point b" disabled={busy || actionsLocked} aria-label={`Point ${nameB}`} onClick={() => sendScore("point", { team: "B" })}>
-                Point {nameB}
+              <Button
+                className="point b"
+                data-saving={laneBusy ? "true" : undefined}
+                disabled={busy || inConflict}
+                aria-label={`Point ${nameB}`}
+                onClick={() => scorePoint("B")}
+              >
+                <span className="point-kicker" aria-hidden="true">Point</span>
+                <span className="point-name">{nameB}</span>
               </Button>
             </div>
-            <div className="row">
-              <Button variant="secondary" disabled={busy || actionsLocked} onClick={() => setConfirmUndo(true)}>
-                Undo last point
+            <div className="ump-secondary-row">
+              <Button variant="secondary" className="ump-undo" disabled={busy || actionsLocked || nothingToUndo} onClick={() => setConfirmUndo(true)}>
+                <Undo2 size={18} aria-hidden="true" /> Undo last point
               </Button>
               {canCorrect && (
-                <Button variant="ghost" className="compact" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
-                  Edit score
+                <Button variant="ghost" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
+                  <Pencil size={16} aria-hidden="true" /> Edit score
                 </Button>
               )}
             </div>
           </>
         )}
 
-        {readyToComplete && !confirmComplete && (
-          <Button disabled={busy || actionsLocked} onClick={() => setConfirmComplete(true)}>Complete match</Button>
-        )}
+        {readyToComplete && (completionQueued ? (
+          <Alert tone="ok">Result saved on this device. It is sent automatically — you can go back to your matches.</Alert>
+        ) : !confirmComplete && (
+          <Button className="cta ump-primary" disabled={busy || actionsLocked} onClick={() => setConfirmComplete(true)}>
+            Complete match
+          </Button>
+        ))}
 
         {completed && (
           <Card className="ump-complete">
-            <div className="kicker" style={{ color: "var(--gold-accent)" }}>Match complete</div>
-            <h2>Winner {winnerName}</h2>
-            <p>Final score {gamesA} – {gamesB}</p>
-            <p className="muted">{score.scoreA ?? 0}–{score.scoreB ?? 0} in the last game</p>
-            {canCorrect && (
-              <Button variant="ghost" className="compact" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
-                Edit score
+            <div className="kicker">Match complete</div>
+            <div className="ump-complete-label">Winner</div>
+            <h2>{winnerName || "—"}</h2>
+            <p className="ump-final">
+              {multiGame
+                ? <>Games {gamesA}–{gamesB} <span className="muted">· last game {score.scoreA ?? 0}–{score.scoreB ?? 0}</span></>
+                : <>Final score {score.scoreA ?? 0}–{score.scoreB ?? 0}</>}
+            </p>
+            <div className="ump-complete-actions">
+              <Button className="cta" onClick={onBack}>
+                <ArrowLeft size={18} aria-hidden="true" /> {station ? "Back to court" : "Back to my matches"}
               </Button>
-            )}
+              {canCorrect && (
+                <Button variant="ghost" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
+                  <Pencil size={16} aria-hidden="true" /> Edit score
+                </Button>
+              )}
+            </div>
           </Card>
         )}
       </div>
@@ -1948,8 +2165,8 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
       {showHold && (
         <Modal title="Hold this match?" onClose={() => !holding && setShowHold(false)}>
           <div className="stack">
-            <p style={{ margin: 0 }}>
-              The match is put on hold — the current score and history are kept exactly as they are. The organizer can resume it from the desk when play continues.
+            <p className="ump-modal-text">
+              The current score and history are kept exactly as they are. The organizer resumes the match from the desk when play continues.
             </p>
             <Input
               label="Reason (optional)"
@@ -1959,7 +2176,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
               disabled={holding}
             />
             {error && <Alert>{error}</Alert>}
-            <div className="row">
+            <div className="ump-modal-actions">
               <Button variant="secondary" onClick={() => setShowHold(false)} disabled={holding}>Cancel</Button>
               <Button onClick={confirmHold} disabled={holding}>{holding ? "Holding…" : "Hold match"}</Button>
             </div>
@@ -1969,8 +2186,8 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
 
       {confirmComplete && (
         <ConfirmDialog
-          title="Match complete"
-          body={`Winner: ${winnerName || "—"}. Final score ${gamesA} – ${gamesB}. This writes the official result.`}
+          title="Complete match?"
+          body={`Winner: ${winnerName || "—"}. ${multiGame ? `Games ${gamesA}–${gamesB}.` : `Final score ${score.scoreA ?? 0}–${score.scoreB ?? 0}.`} This records the official result.`}
           confirmLabel="Complete match"
           busy={busy}
           onCancel={() => setConfirmComplete(false)}
@@ -1981,10 +2198,40 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
         />
       )}
 
+      {confirmMatchPoint && (
+        // Cancel comes first (and takes focus): a stray second tap must not
+        // record the winning point.
+        <Modal title="Match point" onClose={() => setConfirmMatchPoint(null)}>
+          <div className="stack">
+            <p className="ump-modal-lead">
+              {confirmMatchPoint.team === "A" ? nameA : nameB} wins{" "}
+              {confirmMatchPoint.bestOf > 1
+                ? `the match ${confirmMatchPoint.gamesWonA ?? 0}–${confirmMatchPoint.gamesWonB ?? 0}`
+                : `${confirmMatchPoint.scoreA}–${confirmMatchPoint.scoreB}`}
+            </p>
+            <p className="muted ump-modal-text">
+              This point ends the match. Once it reaches the server the result is official and Undo can't reverse it.
+            </p>
+            <div className="ump-modal-actions">
+              <Button variant="secondary" onClick={() => setConfirmMatchPoint(null)}>Cancel</Button>
+              <Button
+                onClick={() => {
+                  const { team } = confirmMatchPoint;
+                  setConfirmMatchPoint(null);
+                  sendScore("point", { team });
+                }}
+              >
+                Record winning point
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
       {confirmUndo && (
         <ConfirmDialog
-          title="Undo last point"
-          body="This removes the most recently scored point. Continue?"
+          title="Undo last point?"
+          body={`This removes the most recent point. The score is ${score.scoreA ?? 0}–${score.scoreB ?? 0} now.`}
           confirmLabel="Undo point"
           onCancel={() => setConfirmUndo(false)}
           onConfirm={() => {
