@@ -128,7 +128,7 @@ export function getInstallerProductVersion(path) {
 // so a stale artifact left over from an earlier build can never pass as the new one.
 export function verifyWindowsInstaller({
   root, operatorDir, version, notOlderThanMs,
-  artifactNamePattern = "Tournament-Operator-Setup",
+  artifactNamePattern = "RESETIQ-Operator-Setup",
   skipUpdateCheck = false,
 }) {
   if (!skipUpdateCheck) {

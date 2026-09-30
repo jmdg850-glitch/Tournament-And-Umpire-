@@ -36,9 +36,9 @@ class WritePathReached extends Error { constructor(what) { super(`WRITE_PATH_REA
 
 function createDb() {
   let clock = 0;
-  const tables = { licenses: [], license_admins: [{ user_id: ADMIN.id }], profiles: [], tournaments: [], tournament_members: [], command_receipts: [] };
+  const tables = { licenses: [], license_devices: [], license_admins: [{ user_id: ADMIN.id }], profiles: [], tournaments: [], tournament_members: [], command_receipts: [] };
   const readable = new Set(Object.keys(tables));
-  const writable = new Set(["licenses"]);
+  const writable = new Set(["licenses", "license_devices"]);
 
   function from(table) {
     if (!readable.has(table)) throw new WritePathReached(`from(${table})`);
@@ -46,7 +46,7 @@ function createDb() {
     let op = "select";
     let patch = null;
     let orderDesc = false;
-    const match = (r) => filters.every(([kind, k, v]) => (kind === "neq" ? r[k] !== v : r[k] === v));
+    const match = (r) => filters.every(([kind, k, v]) => (kind === "neq" ? r[k] !== v : kind === "in" ? v.includes(r[k]) : r[k] === v));
     const run = () => {
       const rows = tables[table];
       if (op === "update") {
@@ -80,6 +80,7 @@ function createDb() {
       eq(k, v) { filters.push(["eq", k, v]); return api; },
       is(k, v) { filters.push(["eq", k, v]); return api; },
       neq(k, v) { filters.push(["neq", k, v]); return api; },
+      in(k, vs) { filters.push(["in", k, vs]); return api; },
       order(_k, opts) { orderDesc = opts?.ascending === false; return api; },
       limit() { return api; },
       async maybeSingle() { const r = run(); return { data: r.data?.[0] ?? null, error: r.error }; },
@@ -88,10 +89,26 @@ function createDb() {
     };
     return api;
   }
-  return {
-    tables,
-    admin: { from, rpc: async (name) => { throw new WritePathReached(`rpc(${name})`); } },
-  };
+  // The one license RPC, following public.license_register_device (0020) rule
+  // for rule. Every other RPC (apply_official_writes, ...) is past the gate.
+  async function rpc(name, p) {
+    if (name !== "license_register_device") throw new WritePathReached(`rpc(${name})`);
+    const l = tables.licenses.find((r) => r.id === p.p_license_id);
+    if (!l) return { data: { ok: false, code: "NOT_FOUND" }, error: null };
+    if (l.status === "revoked") return { data: { ok: false, code: "REVOKED" }, error: null };
+    if (l.expires_at && Date.parse(l.expires_at) <= Date.now()) return { data: { ok: false, code: "EXPIRED" }, error: null };
+    const live = tables.license_devices.filter((d) => d.license_id === l.id && d.released_at === null);
+    const max = l.max_devices ?? 1;
+    const here = live.find((d) => d.device_id === p.p_device_id);
+    if (here) return { data: { ok: true, outcome: "already_here", active_devices: live.length, max_devices: max }, error: null };
+    if (p.p_first_only && live.length >= 1) return { data: { ok: false, code: "ALREADY_ACTIVATED" }, error: null };
+    if (live.length >= max) return { data: { ok: false, code: "DEVICE_LIMIT" }, error: null };
+    const at = new Date().toISOString();
+    tables.license_devices.push({ id: uuid(), license_id: l.id, device_id: p.p_device_id, device_label: p.p_device_label, user_id: p.p_user_id, first_activated_at: at, last_seen_at: at, released_at: null });
+    Object.assign(l, { status: "active", activated_at: l.activated_at || at, activated_user_id: l.activated_user_id || p.p_user_id });
+    return { data: { ok: true, outcome: "registered", active_devices: live.length + 1, max_devices: max }, error: null };
+  }
+  return { tables, admin: { from, rpc } };
 }
 
 // The `license` function's HTTP contract (supabase/functions/license/index.ts):

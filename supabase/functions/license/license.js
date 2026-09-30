@@ -1,4 +1,5 @@
-// Simple licensing: ONE customer email -> ONE access code -> ONE PC.
+// Licensing: ONE customer email / account -> ONE access code -> up to
+// max_devices registered PCs (admin-controlled, default 1).
 //
 // Runs inside the `license` Edge Function (Deno) with a service-role Supabase
 // client; the same file is unit-tested under Node. No dependencies.
@@ -9,17 +10,29 @@
 //  - A customer can activate only a code issued to THEIR OWN verified email.
 //    Knowing someone else's code is useless without owning that mailbox.
 //  - Admin actions require a row in public.license_admins, checked on every call.
+//  - The device limit is enforced when a device REGISTERS, atomically, by the
+//    database function public.license_register_device (row lock on the
+//    license), never by a count-then-insert here.
 //  - Code-first setup (claim / set_password) needs no session: possession of
-//    the admin-issued access code is the proof. It binds the code's license to
-//    this PC and may create the Supabase Auth account for the license's email
-//    (password hashed by Supabase Auth) — but never overwrites an existing
-//    account's password, and only from the PC the license is bound to.
+//    the admin-issued access code is the proof. It may register only the
+//    license's FIRST device, and only while no account is linked to it; after
+//    that a new PC must sign in and `activate`. It may create the Supabase Auth
+//    account for the license's email (password hashed by Supabase Auth) — but
+//    never overwrites an existing account's password, and only from a device
+//    registered to the license.
 //  - The database is only reachable through this function (RLS: no client grants).
+//  - Everyday /command actions are device-blind by design (packages/api
+//    requireLicense checks account + license only).
 
 const ALPHABET = "23456789ABCDEFGHJKMNPQRSTVWXYZ"; // 30 symbols: no 0/1/I/L/O/U
 const CODE_GROUPS = 3;
 const GROUP_LEN = 4;
 const CODE_LEN = CODE_GROUPS * GROUP_LEN;
+
+export const MAX_DEVICES_MIN = 1;
+export const MAX_DEVICES_MAX = 100;
+// last_seen_at is refreshed by `check` at most this often per device.
+export const LAST_SEEN_TOUCH_MS = 60 * 60 * 1000;
 
 export const ERRORS = {
   UNAUTHENTICATED: [401, "Please sign in to continue."],
@@ -36,9 +49,11 @@ export const ERRORS = {
   NOT_BOUND_HERE: [409, "Activate this access code on this PC first."],
   REVOKED: [403, "This license has been revoked."],
   EXPIRED: [403, "This license has expired."],
-  ALREADY_ACTIVATED: [409, "This license is already activated on another PC."],
+  ALREADY_ACTIVATED: [409, "This license is already activated on another PC. Sign in on this PC to add it to your license."],
+  DEVICE_LIMIT: [409, "This license has reached its device limit. Ask your provider to release a device or raise the limit."],
   EMAIL_HAS_LICENSE: [409, "This email already has a license. Revoke it first to issue a new one."],
   NOT_FOUND: [404, "License not found."],
+  DEVICE_NOT_FOUND: [404, "That device is not registered to this license."],
   INVALID_STATE: [409, "That change is not allowed for this license's current status."],
   GENERATION_FAILED: [500, "LICENSE GENERATION FAILED"],
   INTERNAL: [500, "Something went wrong. Please try again."],
@@ -115,8 +130,16 @@ export function validateDevice(device) {
   return { id: device.id, label };
 }
 
+// Admin-chosen device limit: a whole number 1..100.
+export function validateMaxDevices(value) {
+  if (!Number.isInteger(value) || value < MAX_DEVICES_MIN || value > MAX_DEVICES_MAX) {
+    throw new LicenseError("VALIDATION", `max_devices must be a whole number from ${MAX_DEVICES_MIN} to ${MAX_DEVICES_MAX}`);
+  }
+  return value;
+}
+
 // ---------------------------------------------------------------------------
-// The one decision every activation goes through
+// License validity (the device limit itself is decided by the database)
 // ---------------------------------------------------------------------------
 
 export function isExpired(license, now) {
@@ -125,27 +148,26 @@ export function isExpired(license, now) {
   return Number.isFinite(t) && t <= now;
 }
 
-// -> { ok: true, action: "bind" | "already_here" } | { ok: false, code }
-export function decideActivation({ license, deviceId, now }) {
+// Can this license register/use devices at all? -> { ok: true } | { ok: false, code }
+export function decideActivation({ license, now }) {
   if (!license) return { ok: false, code: "INVALID_CODE" };
   if (license.status === "revoked") return { ok: false, code: "REVOKED" };
   if (isExpired(license, now)) return { ok: false, code: "EXPIRED" };
-  if (license.status === "active") {
-    return license.device_id === deviceId ? { ok: true, action: "already_here" } : { ok: false, code: "ALREADY_ACTIVATED" };
-  }
-  return { ok: true, action: "bind" };
+  return { ok: true };
 }
 
-// What a customer app is told about its license (never the code itself).
-export function customerView(license, deviceId, now) {
+// What a customer app is told about its license on THIS device (never the code).
+// `registered`: this device holds an active (unreleased) slot on the license.
+// `not_registered` deliberately carries no `message`: installed Operator builds
+// show the Access Code form only when there is no message, so a new or released
+// PC can still activate itself.
+export function customerView(license, registered, now) {
   if (!license) return { status: "none" };
   let status = license.status;
   if (status === "revoked") { /* stays revoked */ }
   else if (isExpired(license, now)) status = "expired";
-  else if (status === "active" && license.device_id !== deviceId) status = "other_device";
-  const messages = {
-    revoked: ERRORS.REVOKED[1], expired: ERRORS.EXPIRED[1], other_device: ERRORS.ALREADY_ACTIVATED[1],
-  };
+  else if (status === "active" && !registered) status = "not_registered";
+  const messages = { revoked: ERRORS.REVOKED[1], expired: ERRORS.EXPIRED[1] };
   return {
     status,
     ...(messages[status] ? { message: messages[status] } : {}),
@@ -166,10 +188,12 @@ export const PASSWORD_MIN = 8;
 export const PASSWORD_MAX = 72; // bcrypt's input limit in Supabase Auth
 const ADMIN_ACTIONS = {
   whoami: [],
-  create: ["email", "expires_at"],
+  create: ["email", "expires_at", "max_devices"],
   list: ["search"],
   revoke: ["id"],
-  release: ["id"],
+  release: ["id"], // legacy (License Admin <= 1.0.11): release every device of a license
+  release_device: ["license_id", "device_id"],
+  set_max_devices: ["id", "max_devices"],
 };
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -196,10 +220,44 @@ function requireVerifiedEmail(actor) {
   return email;
 }
 
+// ----- devices -----
+
+// The ONLY way a device gets a slot: the database locks the license row,
+// re-checks revoked/expired, reuses an existing registration, and compares the
+// active count with max_devices — all in one transaction.
+async function registerDevice(admin, license, device, { userId = null, firstOnly = false } = {}) {
+  const { data, error } = await admin.rpc("license_register_device", {
+    p_license_id: license.id,
+    p_device_id: device.id,
+    p_device_label: device.label || null,
+    p_user_id: userId,
+    p_first_only: firstOnly,
+  });
+  if (error) throw dbFail(error, "device registration");
+  if (!data || data.ok !== true) {
+    const code = data?.code === "NOT_FOUND" ? "INVALID_CODE" : data?.code;
+    throw new LicenseError(ERRORS[code] ? code : "INTERNAL");
+  }
+  return data; // { ok, outcome: "registered" | "already_here", active_devices, max_devices }
+}
+
+async function findActiveDevice(admin, licenseId, deviceId) {
+  const { data, error } = await admin.from("license_devices").select("*")
+    .eq("license_id", licenseId).eq("device_id", deviceId).is("released_at", null).maybeSingle();
+  if (error) throw dbFail(error, "device lookup");
+  return data;
+}
+
 // ----- customer -----
 
 async function findByEmailAndCode(admin, email, code) {
   const { data, error } = await admin.from("licenses").select("*").eq("email", email).eq("access_code", code).maybeSingle();
+  if (error) throw dbFail(error, "license lookup");
+  return data;
+}
+
+async function findById(admin, id) {
+  const { data, error } = await admin.from("licenses").select("*").eq("id", id).maybeSingle();
   if (error) throw dbFail(error, "license lookup");
   return data;
 }
@@ -210,31 +268,20 @@ async function activate({ admin, actor, body, now }) {
   if (!code) throw new LicenseError("INVALID_CODE_FORMAT");
   const device = validateDevice(body.device);
 
-  let license = await findByEmailAndCode(admin, email, code);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const d = decideActivation({ license, deviceId: device.id, now });
-    if (!d.ok) throw new LicenseError(d.code);
-    if (d.action === "already_here") {
-      // Bound by a code-first claim before this account existed: link it now.
-      if (!license.activated_user_id) {
-        const { error } = await admin.from("licenses").update({ activated_user_id: actor.id })
-          .eq("id", license.id).is("activated_user_id", null);
-        if (error) throw dbFail(error, "account link");
-      }
-      return customerView(license, device.id, now);
-    }
+  const license = await findByEmailAndCode(admin, email, code);
+  const d = decideActivation({ license, now });
+  if (!d.ok) throw new LicenseError(d.code);
+  // Already registered here -> no new slot; new device -> a slot if one is free,
+  // otherwise DEVICE_LIMIT.
+  await registerDevice(admin, license, device, { userId: actor.id });
 
-    // Atomic first-activation bind: only succeeds while still unbound, so two
-    // PCs racing for the same license can never both win.
-    const { data, error } = await admin.from("licenses").update({
-      status: "active", device_id: device.id, device_label: device.label || null,
-      activated_at: new Date(now).toISOString(), activated_user_id: actor.id,
-    }).eq("id", license.id).eq("status", "unused").is("device_id", null).select("*");
-    if (error) throw dbFail(error, "activation");
-    if (data && data.length === 1) return customerView(data[0], device.id, now);
-    license = await findByEmailAndCode(admin, email, code); // lost a race: decide again on fresh state
+  // Bound by a code-first claim before this account existed: link it now.
+  if (!license.activated_user_id) {
+    const { error } = await admin.from("licenses").update({ activated_user_id: actor.id })
+      .eq("id", license.id).is("activated_user_id", null);
+    if (error) throw dbFail(error, "account link");
   }
-  throw new LicenseError("ALREADY_ACTIVATED");
+  return customerView(await findById(admin, license.id), true, now);
 }
 
 // ----- code-first setup (no session) -----
@@ -252,36 +299,36 @@ export function maskEmail(email) {
   return `${shown}${"•".repeat(Math.max(1, Math.min(user.length - shown.length, 6)))}@${domain}`;
 }
 
-// Step 1: validate the code and bind its license to this PC (same decision and
-// atomic bind as activate). Already bound here → no write, continue setup.
+// Step 1: validate the code. While no account is linked to the license, this
+// may register the license's FIRST device (initial setup). Once an account
+// exists, the code alone never registers anything: the buyer is sent to sign
+// in, and a new PC is added through the signed-in `activate`. So a leaked code
+// cannot fill the license's device slots anonymously.
 async function claim({ admin, body, now }) {
   const code = normalizeCode(body.code);
   if (!code) throw new LicenseError("INVALID_CODE_FORMAT");
   const device = validateDevice(body.device);
 
   let license = await findByCode(admin, code);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const d = decideActivation({ license, deviceId: device.id, now });
-    if (!d.ok) throw new LicenseError(d.code === "INVALID_CODE" ? "UNKNOWN_CODE" : d.code);
-    if (d.action === "bind") {
-      const { data, error } = await admin.from("licenses").update({
-        status: "active", device_id: device.id, device_label: device.label || null,
-        activated_at: new Date(now).toISOString(), activated_user_id: null,
-      }).eq("id", license.id).eq("status", "unused").is("device_id", null).select("*");
-      if (error) throw dbFail(error, "activation");
-      if (!data || data.length !== 1) { license = await findByCode(admin, code); continue; }
-      license = data[0];
-    }
-    return {
-      ...customerView(license, device.id, now),
-      email_masked: maskEmail(license.email),
-      bound: d.action === "bind" ? "now" : "already_here",
-      // A license already linked to an account signs in; otherwise the buyer
-      // creates a password (set_password still refuses if an account exists).
-      next: license.activated_user_id ? "sign_in" : "set_password",
-    };
+  const d = decideActivation({ license, now });
+  if (!d.ok) throw new LicenseError(d.code === "INVALID_CODE" ? "UNKNOWN_CODE" : d.code);
+
+  let bound;
+  if (license.activated_user_id) {
+    bound = (await findActiveDevice(admin, license.id, device.id)) ? "already_here" : "not_registered";
+  } else {
+    const r = await registerDevice(admin, license, device, { firstOnly: true });
+    bound = r.outcome === "registered" ? "now" : "already_here";
+    license = await findById(admin, license.id);
   }
-  throw new LicenseError("ALREADY_ACTIVATED");
+  return {
+    ...customerView(license, bound !== "not_registered", now),
+    email_masked: maskEmail(license.email),
+    bound,
+    // A license already linked to an account signs in; otherwise the buyer
+    // creates a password (set_password still refuses if an account exists).
+    next: license.activated_user_id ? "sign_in" : "set_password",
+  };
 }
 
 function isEmailExistsError(error) {
@@ -290,8 +337,8 @@ function isEmailExistsError(error) {
     || text.includes("already been registered") || text.includes("already registered") || text.includes("already exists");
 }
 
-// Step 2: create the buyer's own account for the license's email. Only from the
-// PC the license is bound to, and never over an existing account.
+// Step 2: create the buyer's own account for the license's email. Only from a
+// device registered to the license, and never over an existing account.
 async function setPassword({ admin, body, now }) {
   const code = normalizeCode(body.code);
   if (!code) throw new LicenseError("INVALID_CODE_FORMAT");
@@ -302,9 +349,9 @@ async function setPassword({ admin, body, now }) {
   }
 
   const license = await findByCode(admin, code);
-  const d = decideActivation({ license, deviceId: device.id, now });
+  const d = decideActivation({ license, now });
   if (!d.ok) throw new LicenseError(d.code === "INVALID_CODE" ? "UNKNOWN_CODE" : d.code);
-  if (d.action !== "already_here") throw new LicenseError("NOT_BOUND_HERE");
+  if (!(await findActiveDevice(admin, license.id, device.id))) throw new LicenseError("NOT_BOUND_HERE");
   if (license.activated_user_id) throw new LicenseError("ACCOUNT_EXISTS");
 
   const { data, error } = await admin.auth.admin.createUser({ email: license.email, password, email_confirm: true });
@@ -327,19 +374,70 @@ async function check({ admin, actor, body, now }) {
   if (error) throw dbFail(error, "license check");
   // The live (non-revoked) license wins; otherwise report the latest revoked one.
   const license = (data || []).find((l) => l.status !== "revoked") || (data || [])[0] || null;
-  return customerView(license, device.id, now);
+  let registered = false;
+  if (license && license.status === "active") {
+    const row = await findActiveDevice(admin, license.id, device.id);
+    registered = Boolean(row);
+    const seen = row?.last_seen_at ? Date.parse(row.last_seen_at) : 0;
+    if (row && !(seen > now - LAST_SEEN_TOUCH_MS)) {
+      // Best effort: "last seen" is display-only for the admin.
+      const { error: touchError } = await admin.from("license_devices")
+        .update({ last_seen_at: new Date(now).toISOString() }).eq("id", row.id);
+      if (touchError) console.error("[license] last seen:", touchError.code);
+    }
+  }
+  return customerView(license, registered, now);
 }
 
 // ----- admin -----
 
-function adminView(l, now) {
+function deviceView(d) {
+  return {
+    id: d.id,
+    label: d.device_label || null,
+    device_id_short: d.device_id ? `${d.device_id.slice(0, 12)}…` : null,
+    first_activated_at: d.first_activated_at,
+    last_seen_at: d.last_seen_at || null,
+    released_at: d.released_at || null,
+  };
+}
+
+function adminView(l, devices, now) {
+  const own = devices.filter((d) => d.license_id === l.id)
+    .sort((a, b) => String(a.first_activated_at).localeCompare(String(b.first_activated_at)));
+  const active = own.filter((d) => !d.released_at);
+  const max = Number.isInteger(l.max_devices) ? l.max_devices : 1;
+  const first = active[0] || null;
   return {
     id: l.id, email: l.email, code: l.access_code, status: l.status,
     expired: isExpired(l, now), expires_at: l.expires_at,
-    activated: l.status === "active", device_label: l.device_label,
-    device_id_short: l.device_id ? `${l.device_id.slice(0, 12)}…` : null,
+    max_devices: max,
+    active_devices: active.length,
+    over_limit: active.length > max,
+    devices: own.map(deviceView),
+    // Kept for License Admin <= 1.0.11 (one "Activated PC" column).
+    activated: active.length > 0,
+    device_label: first?.device_label || null,
+    device_id_short: first?.device_id ? `${first.device_id.slice(0, 12)}…` : null,
     activated_at: l.activated_at, revoked_at: l.revoked_at, created_at: l.created_at,
   };
+}
+
+// Device rows of the given licenses, fetched in chunks so a long license list
+// never builds an oversized URL or hits the API's per-response row cap.
+async function devicesFor(admin, licenseIds) {
+  const out = [];
+  for (let i = 0; i < licenseIds.length; i += 100) {
+    const { data, error } = await admin.from("license_devices").select("*")
+      .in("license_id", licenseIds.slice(i, i + 100)).order("first_activated_at", { ascending: true }).limit(10000);
+    if (error) throw dbFail(error, "device list");
+    out.push(...(data || []));
+  }
+  return out;
+}
+
+async function viewOne(admin, license, now) {
+  return adminView(license, await devicesFor(admin, [license.id]), now);
 }
 
 async function create({ admin, actor, body, now }) {
@@ -351,11 +449,12 @@ async function create({ admin, actor, body, now }) {
     if (!Number.isFinite(t) || t <= now) throw new LicenseError("VALIDATION", "expiry must be a future date");
     expires_at = new Date(t).toISOString();
   }
+  const max_devices = body.max_devices === undefined ? 1 : validateMaxDevices(body.max_devices);
 
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateCode();
     const { data: row, error } = await admin.from("licenses")
-      .insert({ email, access_code: code, expires_at, created_by: actor.id }).select("*").single();
+      .insert({ email, access_code: code, expires_at, max_devices, created_by: actor.id }).select("*").single();
     if (error) {
       if (error.code === "23505") {
         if (String(error.message).includes("licenses_one_live_per_email")) throw new LicenseError("EMAIL_HAS_LICENSE");
@@ -370,7 +469,7 @@ async function create({ admin, actor, body, now }) {
       await admin.from("licenses").delete().eq("id", row.id);
       throw new LicenseError("GENERATION_FAILED");
     }
-    return { license: adminView(back, now), code };
+    return { license: adminView(back, [], now), code };
   }
   throw new LicenseError("GENERATION_FAILED");
 }
@@ -378,47 +477,79 @@ async function create({ admin, actor, body, now }) {
 async function list({ admin, body, now }) {
   const { data, error } = await admin.from("licenses").select("*").order("created_at", { ascending: false }).limit(1000);
   if (error) throw dbFail(error, "license list");
+  const devices = await devicesFor(admin, (data || []).map((l) => l.id));
   let items = data || [];
   if (typeof body.search === "string" && body.search.trim()) {
     const q = body.search.trim().toLowerCase();
     const qCode = q.replace(/[\s_-]+/g, "").toUpperCase();
+    const labelHit = new Set(devices.filter((d) => (d.device_label || "").toLowerCase().includes(q)).map((d) => d.license_id));
     items = items.filter((l) =>
-      l.email.includes(q) || (l.device_label || "").toLowerCase().includes(q) ||
+      l.email.includes(q) || labelHit.has(l.id) ||
       (qCode.length >= 3 && l.access_code.replaceAll("-", "").includes(qCode)));
   }
-  return { total: items.length, items: items.map((l) => adminView(l, now)) };
+  return { total: items.length, items: items.map((l) => adminView(l, devices, now)) };
 }
 
-function requireId(body) {
-  if (typeof body.id !== "string" || !UUID_RE.test(body.id)) throw new LicenseError("VALIDATION", "id must be a uuid");
-  return body.id;
+function requireUuid(value, field) {
+  if (typeof value !== "string" || !UUID_RE.test(value)) throw new LicenseError("VALIDATION", `${field} must be a uuid`);
+  return value;
 }
 
 async function changeLicense({ admin, body, now }, patch, requireStatus) {
-  const id = requireId(body);
+  const id = requireUuid(body.id, "id");
   let q = admin.from("licenses").update(patch).eq("id", id);
   q = requireStatus === "not_revoked" ? q.neq("status", "revoked") : q.eq("status", requireStatus);
   const { data, error } = await q.select("*");
   if (error) throw dbFail(error, "license update");
-  if (data && data.length === 1) return { license: adminView(data[0], now) };
+  if (data && data.length === 1) return { license: await viewOne(admin, data[0], now) };
   const { data: exists } = await admin.from("licenses").select("id").eq("id", id).maybeSingle();
   throw new LicenseError(exists ? "INVALID_STATE" : "NOT_FOUND");
 }
 
+// Revoking invalidates the whole license: every device loses access (check ->
+// revoked; /command -> LICENSE_INVALID). Device rows are kept as history.
 const revoke = (ctx) => changeLicense(ctx, { status: "revoked", revoked_at: new Date(ctx.now).toISOString() }, "not_revoked");
 
-// Deliberate PC move: clears the binding so the customer can activate on a new PC.
-const release = (ctx) => changeLicense(
-  ctx,
-  { status: "unused", device_id: null, device_label: null, activated_at: null, activated_user_id: null },
-  "active",
-);
+// Raising or lowering the limit never releases devices. Lowering it below the
+// current usage only stops NEW registrations until usage is back under it.
+const setMaxDevices = (ctx) => changeLicense(ctx, { max_devices: validateMaxDevices(ctx.body.max_devices) }, "not_revoked");
+
+// Release ONE device of ONE license. Both ids must match, so a device of
+// another license can never be released through this license.
+async function releaseDevice({ admin, body, now }) {
+  const licenseId = requireUuid(body.license_id, "license_id");
+  const deviceRowId = requireUuid(body.device_id, "device_id");
+  const license = await findById(admin, licenseId);
+  if (!license) throw new LicenseError("NOT_FOUND");
+  const { data, error } = await admin.from("license_devices").update({ released_at: new Date(now).toISOString() })
+    .eq("id", deviceRowId).eq("license_id", licenseId).is("released_at", null).select("*");
+  if (error) throw dbFail(error, "device release");
+  if (!data || data.length !== 1) throw new LicenseError("DEVICE_NOT_FOUND");
+  return { license: await viewOne(admin, license, now) };
+}
+
+// Legacy action (License Admin <= 1.0.11 "Release PC"): releases every active
+// device of the license so the customer can activate a replacement PC.
+async function release({ admin, body, now }) {
+  const id = requireUuid(body.id, "id");
+  const license = await findById(admin, id);
+  if (!license) throw new LicenseError("NOT_FOUND");
+  if (license.status !== "active") throw new LicenseError("INVALID_STATE");
+  const { error } = await admin.from("license_devices").update({ released_at: new Date(now).toISOString() })
+    .eq("license_id", id).is("released_at", null).select("*");
+  if (error) throw dbFail(error, "device release");
+  return { license: await viewOne(admin, license, now) };
+}
 
 async function whoami({ actor }) {
   return { admin: true, user_id: actor.id, email: actor.email ?? null };
 }
 
-const HANDLERS = { activate, check, whoami, create, list, revoke, release, claim, set_password: setPassword };
+const HANDLERS = {
+  activate, check, whoami, create, list, revoke, release,
+  release_device: releaseDevice, set_max_devices: setMaxDevices,
+  claim, set_password: setPassword,
+};
 
 export function isPublicAction(body) {
   return Boolean(body && typeof body === "object" && !Array.isArray(body)

@@ -51,9 +51,11 @@ Operator Windows desktop (Electron, after a verified web build):
 npm run build:desktop -w @tournament/operator
 ```
 
-Installer output: `apps/operator/release/Tournament-Operator-Setup-1.0.0.exe`
+Installer output: `apps/operator/release/RESETIQ-Operator-Setup-<version>.exe`
 
-NSIS also writes `Tournament Operator.lnk` to the real user Desktop (`$DESKTOP`, including OneDrive) via `apps/operator/build/installer.nsh`.
+NSIS also writes `RESETIQ Operator.lnk` to the real user Desktop (`$DESKTOP`, including OneDrive) via `apps/operator/build/installer.nsh`.
+
+The app was renamed from "Tournament Operator" to "RESETIQ Operator" (`build.productName`). Electron's userData folder comes from the package `name` (`@tournament/operator` → `%APPDATA%\@tournament\operator`), not from `build.productName`, so the rename leaves the sign-in session, offline outbox and license state where they are — keep the package `name` unchanged. `appId`, the `tournament-operator://` scheme and the license device-id salt are also unchanged on purpose.
 
 The Vite build bakes `VITE_SUPABASE_*` and `VITE_COMMAND_URL` from `apps/operator/.env.local`. Never put `SUPABASE_SERVICE_ROLE_KEY` in those files.
 

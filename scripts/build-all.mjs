@@ -118,7 +118,7 @@ if (!existsSync(umpireDist) || statSync(umpireDist).isDirectory() === false) fai
 header("Version consistency");
 const versionCodeMatch = expectedVersionCode;
 const versionNameMatch = gradleRawForVerify.match(/versionName\s+"([^"]+)"/)?.[1];
-const installerVersionInName = winResult.path.match(/Tournament-Operator-Setup-([^.]+(?:\.[^.]+){2})\.exe$/)?.[1];
+const installerVersionInName = winResult.path.match(/RESETIQ-Operator-Setup-([^.]+(?:\.[^.]+){2})\.exe$/)?.[1];
 
 const versionRows = [
   ["Operator package.json", operatorVersion],

@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Ban, Copy, LogOut, Monitor, Plus, RefreshCw, Search } from "lucide-react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Ban, ChevronDown, ChevronUp, Copy, LogOut, Monitor, Plus, RefreshCw, Search } from "lucide-react";
 import { callAdmin, configured, supabase } from "./api.js";
-import { copyText, endOfDayIso, fmtDate, statusOf } from "./format.js";
+import {
+  DEVICE_LIMIT_HINT, DEVICE_LIMIT_MAX, DEVICE_LIMIT_MIN, copyText, endOfDayIso, fmtDate, parseDeviceLimit, statusOf,
+} from "./format.js";
 
 function Login() {
   const [mode, setMode] = useState("login");
@@ -89,20 +91,27 @@ function Confirm({ title, children, confirmLabel, busy, onCancel, onConfirm }) {
 function Generate({ onCreated, notify }) {
   const [email, setEmail] = useState("");
   const [expires, setExpires] = useState("");
+  const [devices, setDevices] = useState("1");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [made, setMade] = useState(null);
 
   async function submit(e) {
     e.preventDefault();
-    setBusy(true);
     setError("");
     setMade(null);
+    const max = parseDeviceLimit(devices);
+    if (max === null) {
+      setError(DEVICE_LIMIT_HINT);
+      return;
+    }
+    setBusy(true);
     try {
-      const res = await callAdmin("create", { email, ...(expires ? { expires_at: endOfDayIso(expires) } : {}) });
-      setMade({ code: res.code, email: res.license.email });
+      const res = await callAdmin("create", { email, max_devices: max, ...(expires ? { expires_at: endOfDayIso(expires) } : {}) });
+      setMade({ code: res.code, email: res.license.email, max: res.license.max_devices ?? max });
       setEmail("");
       setExpires("");
+      setDevices("1");
       onCreated();
     } catch (err) {
       setError(err.code === "GENERATION_FAILED" ? "LICENSE GENERATION FAILED" : err.message);
@@ -121,6 +130,9 @@ function Generate({ onCreated, notify }) {
         <label>Expires (optional)
           <input type="date" value={expires} onChange={(e) => setExpires(e.target.value)} min={new Date().toISOString().slice(0, 10)} />
         </label>
+        <label className="devices-input">Allowed devices
+          <input type="number" inputMode="numeric" min={DEVICE_LIMIT_MIN} max={DEVICE_LIMIT_MAX} step={1} value={devices} onChange={(e) => setDevices(e.target.value)} required />
+        </label>
         <button className="cta" disabled={busy}><Plus size={18} /> {busy ? "Generating…" : "Generate"}</button>
       </form>
       {error ? <div className="alert bad" role="alert">{error}</div> : null}
@@ -131,10 +143,79 @@ function Generate({ onCreated, notify }) {
           <button className="cta" onClick={async () => notify((await copyText(made.code)) ? "Access code copied" : "Copy failed - select the code manually")}>
             <Copy size={18} /> Copy code
           </button>
-          <p className="muted">Send the customer this code together with their email. It only works for that email, and binds to the first PC that activates it.</p>
+          <p className="muted">Send the customer this code together with their email. It only works for that email, on up to {made.max} {made.max === 1 ? "PC" : "PCs"}.</p>
         </div>
       ) : null}
     </section>
+  );
+}
+
+// Registered devices of one license, plus its editable device limit. The server
+// enforces the limit when a device activates; lowering it never releases a
+// device, it only stops NEW devices until usage is below the limit.
+function DeviceDetails({ license, onRelease, onChanged, notify }) {
+  const max = license.max_devices ?? 1;
+  const devices = license.devices || [];
+  const active = devices.filter((d) => !d.released_at);
+  const released = devices.filter((d) => d.released_at);
+  const [limit, setLimit] = useState(String(max));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const revoked = license.status === "revoked";
+  const wanted = parseDeviceLimit(limit);
+
+  async function save(e) {
+    e.preventDefault();
+    setError("");
+    if (wanted === null) {
+      setError(DEVICE_LIMIT_HINT);
+      return;
+    }
+    setSaving(true);
+    try {
+      await callAdmin("set_max_devices", { id: license.id, max_devices: wanted });
+      notify("Device limit saved");
+      onChanged();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const row = (d) => (
+    <li key={d.id} className={d.released_at ? "released" : undefined}>
+      <span className="dev-name" title={d.device_id_short || undefined}><Monitor size={14} aria-hidden="true" /> {d.label || d.device_id_short || "Unnamed PC"}</span>
+      <small className="muted">First activated {fmtDate(d.first_activated_at)} · Last seen {fmtDate(d.last_seen_at, "never")}</small>
+      {d.released_at ? <small className="muted">Released {fmtDate(d.released_at)}</small>
+        : !revoked ? <button className="btn" onClick={() => onRelease(d)}>Release</button> : null}
+    </li>
+  );
+
+  return (
+    <div className="device-details">
+      <p className="muted" style={{ margin: 0 }}>{active.length} of {max} {max === 1 ? "device" : "devices"} in use.</p>
+      {license.over_limit ? (
+        <div className="alert warn" role="status">More devices are registered than the current limit. They keep working, but no new PC can activate until fewer than {max} are in use.</div>
+      ) : null}
+      {active.length === 0 ? <p className="muted">No devices registered yet.</p> : <ul className="device-list">{active.map(row)}</ul>}
+      {released.length ? (
+        <details><summary className="muted">Released devices ({released.length})</summary><ul className="device-list">{released.map(row)}</ul></details>
+      ) : null}
+      {!revoked ? (
+        <form className="row limit" onSubmit={save}>
+          <label>Allowed devices
+            <input type="number" inputMode="numeric" min={DEVICE_LIMIT_MIN} max={DEVICE_LIMIT_MAX} step={1} value={limit}
+              onChange={(e) => setLimit(e.target.value)} aria-label={`Allowed devices for ${license.email}`} />
+          </label>
+          <button className="btn" disabled={saving || wanted === max}>{saving ? "Saving…" : "Save"}</button>
+          {wanted !== null && wanted < active.length ? (
+            <small className="muted">Lowering below {active.length} keeps the current devices; no new PC can activate until usage is below {wanted}.</small>
+          ) : null}
+        </form>
+      ) : null}
+      {error ? <div className="alert bad" role="alert">{error}</div> : null}
+    </div>
   );
 }
 
@@ -142,8 +223,9 @@ function Licenses({ refreshKey, onChanged, notify }) {
   const [search, setSearch] = useState("");
   const [items, setItems] = useState(null);
   const [error, setError] = useState("");
-  const [confirm, setConfirm] = useState(null); // { kind: "revoke" | "release", license }
+  const [confirm, setConfirm] = useState(null); // { kind: "revoke" | "release_device", license, device? }
   const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(null); // id of the license whose devices are shown
   const [refreshing, setRefreshing] = useState(false);
   // Only the newest list request may update the table, whether it came from
   // typing, a create/revoke/release, or the Refresh button.
@@ -196,8 +278,12 @@ function Licenses({ refreshKey, onChanged, notify }) {
   async function run() {
     setBusy(true);
     try {
-      await callAdmin(confirm.kind, { id: confirm.license.id });
-      notify(confirm.kind === "revoke" ? "License revoked" : "PC released");
+      if (confirm.kind === "release_device") {
+        await callAdmin("release_device", { license_id: confirm.license.id, device_id: confirm.device.id });
+      } else {
+        await callAdmin("revoke", { id: confirm.license.id });
+      }
+      notify(confirm.kind === "revoke" ? "License revoked" : "Device released");
       setConfirm(null);
       onChanged();
     } catch (err) {
@@ -224,23 +310,41 @@ function Licenses({ refreshKey, onChanged, notify }) {
       {error ? <div className="alert bad" role="alert">{error}</div> : null}
       {!items ? <p className="muted">Loading…</p> : items.length === 0 ? <p className="muted">No licenses yet. Generate one above.</p> : (
         <table>
-          <thead><tr><th>Customer email</th><th>Access code</th><th>Status</th><th>Activated PC</th><th>Created</th><th /></tr></thead>
+          <thead><tr><th>Customer email</th><th>Access code</th><th>Status</th><th>Devices</th><th>Created</th><th /></tr></thead>
           <tbody>
             {items.map((l) => {
               const st = statusOf(l);
+              const max = l.max_devices ?? 1;
+              const used = l.active_devices ?? (l.activated ? 1 : 0);
+              const over = l.over_limit ?? used > max;
+              const isOpen = open === l.id;
               return (
-                <tr key={l.id}>
-                  <td data-label="Customer" className="email">{l.email}</td>
-                  <td data-label="Access code" className="mono">{l.code}</td>
-                  <td data-label="Status"><span className={`badge ${st.key}`}>{st.label}</span></td>
-                  <td data-label="Activated PC">{l.activated ? <span title={l.device_id_short}><Monitor size={14} aria-hidden="true" /> {l.device_label || l.device_id_short}<br /><small className="muted">{fmtDate(l.activated_at)}</small></span> : "—"}</td>
-                  <td data-label="Created">{fmtDate(l.created_at)}</td>
-                  <td className="actions"><div className="acts">
-                    <button className="btn" onClick={async () => notify((await copyText(l.code)) ? "Access code copied" : "Copy failed")}><Copy size={14} /> Copy</button>
-                    {l.activated && l.status !== "revoked" ? <button className="btn" onClick={() => setConfirm({ kind: "release", license: l })}>Release PC</button> : null}
-                    {l.status !== "revoked" ? <button className="btn danger" onClick={() => setConfirm({ kind: "revoke", license: l })}><Ban size={14} /> Revoke</button> : null}
-                  </div></td>
-                </tr>
+                <Fragment key={l.id}>
+                  <tr>
+                    <td data-label="Customer" className="email">{l.email}</td>
+                    <td data-label="Access code" className="mono">{l.code}</td>
+                    <td data-label="Status"><span className={`badge ${st.key}`}>{st.label}</span></td>
+                    <td data-label="Devices">
+                      <span className="usage" data-testid={`usage-${l.id}`}><Monitor size={14} aria-hidden="true" /> {used} / {max} {max === 1 ? "device" : "devices"}</span>
+                      {over ? <> <span className="badge over" title="More devices are registered than the current limit. No new PC can activate until usage is below the limit.">Over limit</span></> : null}
+                    </td>
+                    <td data-label="Created">{fmtDate(l.created_at)}</td>
+                    <td className="actions"><div className="acts">
+                      <button className="btn" onClick={async () => notify((await copyText(l.code)) ? "Access code copied" : "Copy failed")}><Copy size={14} /> Copy</button>
+                      <button className="btn" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : l.id)}>
+                        {isOpen ? <ChevronUp size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />} Devices
+                      </button>
+                      {l.status !== "revoked" ? <button className="btn danger" onClick={() => setConfirm({ kind: "revoke", license: l })}><Ban size={14} /> Revoke</button> : null}
+                    </div></td>
+                  </tr>
+                  {isOpen ? (
+                    <tr className="details">
+                      <td colSpan={6}>
+                        <DeviceDetails license={l} onRelease={(device) => setConfirm({ kind: "release_device", license: l, device })} onChanged={onChanged} notify={notify} />
+                      </td>
+                    </tr>
+                  ) : null}
+                </Fragment>
               );
             })}
           </tbody>
@@ -253,10 +357,10 @@ function Licenses({ refreshKey, onChanged, notify }) {
           <p className="muted">The customer will no longer be able to use Tournament Operator with this license.</p>
         </Confirm>
       ) : null}
-      {confirm?.kind === "release" ? (
-        <Confirm title="Release this PC?" confirmLabel="Release PC" busy={busy} onCancel={() => setConfirm(null)} onConfirm={run}>
-          <p>Customer: <b>{confirm.license.email}</b><br />PC: <b>{confirm.license.device_label || confirm.license.device_id_short}</b></p>
-          <p className="muted">The license becomes unbound. The customer can then activate it on a replacement PC. The current PC will stop working.</p>
+      {confirm?.kind === "release_device" ? (
+        <Confirm title="Release this device?" confirmLabel="Release device" busy={busy} onCancel={() => setConfirm(null)} onConfirm={run}>
+          <p>Customer: <b>{confirm.license.email}</b><br />Device: <b>{confirm.device.label || confirm.device.device_id_short}</b></p>
+          <p className="muted">This PC stops working with the license and frees one device slot. The customer's other devices keep working.</p>
         </Confirm>
       ) : null}
     </section>

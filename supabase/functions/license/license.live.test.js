@@ -198,7 +198,7 @@ describe("LIVE: email -> one code -> one PC (production)", { skip: !live }, () =
     });
   });
 
-  describe("first PC binds; second PC is rejected", () => {
+  describe("first PC registers; a second PC is rejected at max_devices = 1", () => {
     it("PC #1 (this computer) activates with the correct code (case/spacing tolerated)", async () => {
       const messy = `  ${state.codeA.toLowerCase().replaceAll("-", " ")}  `;
       const r = await op(A).activate(messy, PC1);
@@ -226,11 +226,12 @@ describe("LIVE: email -> one code -> one PC (production)", { skip: !live }, () =
       assert.equal((await op(A).check(PC1_reinstalled)).status, "active");
     });
 
-    it("SAME email + SAME code on a SECOND PC is rejected with the exact message", async () => {
-      await rejects(op(A).activate(state.codeA, PC2), "ALREADY_ACTIVATED", 409, "This license is already activated on another PC.");
+    it("SAME email + SAME code on a SECOND PC is rejected with the exact message (license allows 1 device)", async () => {
+      await rejects(op(A).activate(state.codeA, PC2), "DEVICE_LIMIT", 409,
+        "This license has reached its device limit. Ask your provider to release a device or raise the limit.");
       const view = await op(A).check(PC2);
-      assert.equal(view.status, "other_device");
-      assert.equal(view.message, "This license is already activated on another PC.");
+      assert.equal(view.status, "not_registered");
+      assert.equal(view.message, undefined, "no message: installed Operator builds then show the Access Code form");
     });
 
     it("the rejected attempt did not move the binding", async () => {
@@ -241,25 +242,26 @@ describe("LIVE: email -> one code -> one PC (production)", { skip: !live }, () =
   });
 
   describe("admin release, then replacement PC", () => {
-    it("admin releases the PC binding", async () => {
+    it("admin releases the PC (legacy release = every device of the license)", async () => {
       const r = await asAdmin("release", { id: state.idA });
-      assert.equal(r.license.status, "unused");
+      assert.equal(r.license.status, "active", "the license stays activated; only its devices are released");
       assert.equal(r.license.activated, false);
+      assert.equal(r.license.active_devices, 0);
       assert.equal(r.license.device_label, null);
       assert.equal(r.license.code, state.codeA, "the code itself is unchanged");
-      await rejects(asAdmin("release", { id: state.idA }), "INVALID_STATE", 409); // nothing left to release
+      assert.equal((await asAdmin("release", { id: state.idA })).license.active_devices, 0); // nothing left to release
     });
 
     it("the old PC is now unlicensed and the customer can activate the replacement PC", async () => {
-      assert.equal((await op(A).check(PC1)).status, "unused");
+      assert.equal((await op(A).check(PC1)).status, "not_registered");
       const r = await op(A).activate(state.codeA, PC2);
       assert.equal(r.status, "active");
       assert.equal((await asAdmin("list", { search: emailOf("a") })).items[0].device_label, "REPLACEMENT-PC");
     });
 
-    it("...and the ORIGINAL PC is now rejected", async () => {
-      await rejects(op(A).activate(state.codeA, PC1), "ALREADY_ACTIVATED", 409, "This license is already activated on another PC.");
-      assert.equal((await op(A).check(PC1)).status, "other_device");
+    it("...and the ORIGINAL PC is now rejected (the one slot is taken)", async () => {
+      await rejects(op(A).activate(state.codeA, PC1), "DEVICE_LIMIT", 409);
+      assert.equal((await op(A).check(PC1)).status, "not_registered");
     });
   });
 
@@ -321,7 +323,7 @@ describe("LIVE: email -> one code -> one PC (production)", { skip: !live }, () =
       const made = await asAdmin("create", { email: emailOf("c") });
       const results = await Promise.allSettled([op(C).activate(made.code, PC2), op(C).activate(made.code, PC3)]);
       const wins = results.filter((r) => r.status === "fulfilled").length;
-      const losses = results.filter((r) => r.status === "rejected" && r.reason.code === "ALREADY_ACTIVATED").length;
+      const losses = results.filter((r) => r.status === "rejected" && r.reason.code === "DEVICE_LIMIT").length;
       assert.equal(wins, 1, JSON.stringify(results.map((r) => r.status)));
       assert.equal(losses, 1);
       state.idC = made.license.id;

@@ -3,8 +3,8 @@
   "private": true,
   "version": "1.2.32",
   "type": "module",
-  "description": "Tournament operator desktop application",
-  "author": "Tournament",
+  "description": "RESETIQ Operator desktop application",
+  "author": "RESETIQ",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite --port 5174",
@@ -40,8 +40,8 @@
   },
   "build": {
     "appId": "app.tournament.operator",
-    "productName": "Tournament Operator",
-    "copyright": "Tournament",
+    "productName": "RESETIQ Operator",
+    "copyright": "RESETIQ",
     "directories": {
       "output": "release"
     },
@@ -65,7 +65,7 @@
     },
     "protocols": [
       {
-        "name": "Tournament Operator",
+        "name": "RESETIQ Operator",
         "schemes": [
           "tournament-operator"
         ]
@@ -81,14 +81,14 @@
           ]
         }
       ],
-      "artifactName": "Tournament-Operator-Setup-${version}.${ext}"
+      "artifactName": "RESETIQ-Operator-Setup-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": "always",
       "createStartMenuShortcut": true,
-      "shortcutName": "Tournament Operator",
+      "shortcutName": "RESETIQ Operator",
       "include": "build/installer.nsh"
     }
   }

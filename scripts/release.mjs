@@ -1,5 +1,5 @@
-// One-command production release pipeline for Tournament Operator (Windows)
-// and Tournament Umpire (Android). Invoke via `npm run release` (patch bump)
+// One-command production release pipeline for RESETIQ Operator (Windows)
+// and RESETIQ Umpire (Android). Invoke via `npm run release` (patch bump)
 // or `npm run release -- minor` / `npm run release -- major`.
 //
 // Any working-tree change under a recognized Tournament source root (apps/,
@@ -859,7 +859,7 @@ console.log(`Signer:  ${apkResult.signerDn} SHA-256 ${apkResult.signerSha256 ?? 
 // The verified, signed Umpire APK is attached to the GitHub release under a
 // versioned name. The copy lives beside Gradle's output (gitignored build dir)
 // and is byte-identical to the APK verified just above.
-const umpireApkAsset = resolve(dirname(apkResult.path), `Tournament-Umpire-${ctx.nextUmpire}.apk`);
+const umpireApkAsset = resolve(dirname(apkResult.path), `RESETIQ-Umpire-${ctx.nextUmpire}.apk`);
 copyFileSync(apkResult.path, umpireApkAsset);
 if (sha256OfFile(umpireApkAsset) !== sha256OfFile(apkResult.path)) fail("Verify Android build", `Copy ${umpireApkAsset} does not match the verified APK.`);
 console.log(`Release asset: ${umpireApkAsset} (byte-identical copy of the verified APK)`);
@@ -989,8 +989,8 @@ if (run("node", [resolve(root, "scripts/publish-desktop-update.mjs"), `--extra-a
 
 logStep("Verify published release");
 const releaseFiles = [
-  resolve(operatorDir, `release/Tournament-Operator-Setup-${ctx.nextOperator}.exe`),
-  resolve(operatorDir, `release/Tournament-Operator-Setup-${ctx.nextOperator}.exe.blockmap`),
+  resolve(operatorDir, `release/RESETIQ-Operator-Setup-${ctx.nextOperator}.exe`),
+  resolve(operatorDir, `release/RESETIQ-Operator-Setup-${ctx.nextOperator}.exe.blockmap`),
   resolve(operatorDir, "release/latest.yml"),
   resolve(licenseAdminDir, `release/Tournament-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe`),
   resolve(licenseAdminDir, `release/Tournament-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe.blockmap`),

@@ -60,7 +60,7 @@ Release signing requires `apps/umpire/android/keystore.properties` (from `keysto
 
 - Operator web: `apps/operator/dist/`
 - Umpire web: `apps/umpire/dist/`
-- Windows installer: `apps/operator/release/Tournament-Operator-Setup-<version>.exe` (filename tracks `apps/operator/package.json`'s current version, e.g. `1.1.0` — do not hardcode a version here, it will drift again)
+- Windows installer: `apps/operator/release/RESETIQ-Operator-Setup-<version>.exe` (filename tracks `apps/operator/package.json`'s current version, e.g. `1.1.0` — do not hardcode a version here, it will drift again)
 - Android debug: `apps/umpire/android/app/build/outputs/apk/debug/app-debug.apk`
 - Android release (signed): `apps/umpire/android/app/build/outputs/apk/release/app-release.apk`, `apps/umpire/android/app/build/outputs/bundle/release/app-release.aab`
 

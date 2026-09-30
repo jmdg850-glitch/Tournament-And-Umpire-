@@ -29,7 +29,7 @@ const root = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 const operatorDir = resolve(root, "apps/operator");
 const checkOnly = process.argv.includes("--check");
 // Optional additional distributables for the same release (used by
-// scripts/release.mjs for the verified, signed Tournament Umpire APK). They are
+// scripts/release.mjs for the verified, signed RESETIQ Umpire APK). They are
 // uploaded while the release is still a draft, so the release is only ever
 // published with every asset present, and are verified like the others.
 const extraAssets = process.argv
@@ -65,7 +65,7 @@ const DESKTOP_APPS = [
     label: "Operator",
     workspace: "@tournament/operator",
     dir: operatorDir,
-    artifactPrefix: "Tournament-Operator-Setup",
+    artifactPrefix: "RESETIQ-Operator-Setup",
     channel: "latest",
   },
   {
@@ -304,7 +304,7 @@ const create = tryRun("gh", [
   "--repo", ghRepo,
   "--draft",
   "--title", tag,
-  "--notes", `Tournament Operator ${version} and Tournament License Admin ${licenseAdminApp.version} — Windows desktop updates.` +
+  "--notes", `RESETIQ Operator ${version} and Tournament License Admin ${licenseAdminApp.version} — Windows desktop updates.` +
     (extraAssets.length ? `\n\nAlso attached: ${extraAssets.map((f) => basename(f)).join(", ")}.` : ""),
 ]);
 if (!create.ok) {

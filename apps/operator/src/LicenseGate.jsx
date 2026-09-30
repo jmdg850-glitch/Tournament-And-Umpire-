@@ -80,6 +80,10 @@ export function useLicense({ commandUrl, publishableKey, session, userId: identi
 const INTRO = {
   none: "No license is linked to this email yet. Enter the Access Code you received for this email address.",
   unused: "Enter the Access Code you received for this email address to activate RESETIQ Operator on this PC.",
+  // The license is active on other PC(s) but this one isn't registered (new,
+  // or released by the admin). Activating uses a free device slot; when the
+  // license is full the server answers with its device-limit message.
+  not_registered: "This PC isn't activated for your license yet. Enter your Access Code to activate it on this PC.",
 };
 
 function ActivationScreen({ license, email, onSignOut }) {

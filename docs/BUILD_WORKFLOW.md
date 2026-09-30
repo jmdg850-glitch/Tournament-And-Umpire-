@@ -66,7 +66,7 @@ After it succeeds, resume normal builds with `npm run build:all` — do not run
 
 - Operator web: `apps/operator/dist/`
 - Umpire web: `apps/umpire/dist/`
-- Windows installer: `apps/operator/release/Tournament-Operator-Setup-<version>.exe`
+- Windows installer: `apps/operator/release/RESETIQ-Operator-Setup-<version>.exe`
 - Android APK: `apps/umpire/android/app/build/outputs/apk/release/app-release.apk`
 
 ## When a build fails

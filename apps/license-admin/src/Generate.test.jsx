@@ -26,8 +26,33 @@ describe("Generate", () => {
     fireEvent.click(screen.getByText("Generate"));
 
     await waitFor(() => expect(screen.getByTestId("access-code").textContent).toBe("AB2D-3FGH-JK4M"));
-    expect(mocks.callAdmin).toHaveBeenCalledWith("create", { email: "buyer@example.com" });
+    expect(mocks.callAdmin).toHaveBeenCalledWith("create", { email: "buyer@example.com", max_devices: 1 });
     expect(onCreated).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends the chosen Allowed devices (default 1) and says how many PCs the code covers", async () => {
+    mocks.callAdmin.mockResolvedValueOnce({ code: "AB2D-3FGH-JK4M", license: { email: "buyer@example.com", max_devices: 3 } });
+    render(<Generate onCreated={vi.fn()} notify={vi.fn()} />);
+    const devices = screen.getByLabelText("Allowed devices");
+    expect(devices.value).toBe("1");
+    fireEvent.change(screen.getByPlaceholderText("customer@example.com"), { target: { value: "buyer@example.com" } });
+    fireEvent.change(devices, { target: { value: "3" } });
+    fireEvent.click(screen.getByText("Generate"));
+    await waitFor(() => expect(screen.getByTestId("access-code")).not.toBeNull());
+    expect(mocks.callAdmin).toHaveBeenCalledWith("create", { email: "buyer@example.com", max_devices: 3 });
+    expect(screen.getByText(/on up to 3 PCs/)).not.toBeNull();
+    expect(screen.getByLabelText("Allowed devices").value).toBe("1");
+  });
+
+  it("refuses an Allowed devices value outside 1-100 without calling the server", async () => {
+    render(<Generate onCreated={vi.fn()} notify={vi.fn()} />);
+    fireEvent.change(screen.getByPlaceholderText("customer@example.com"), { target: { value: "buyer@example.com" } });
+    for (const bad of ["0", "101", "2.5", ""]) {
+      fireEvent.change(screen.getByLabelText("Allowed devices"), { target: { value: bad } });
+      fireEvent.submit(screen.getByText("Generate").closest("form"));
+      await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/whole number from 1 to 100/));
+    }
+    expect(mocks.callAdmin).not.toHaveBeenCalled();
   });
 
   it("shows the literal 'LICENSE GENERATION FAILED' message for a GENERATION_FAILED error", async () => {

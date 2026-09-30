@@ -1068,7 +1068,7 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
             {grouped.other.length > 0 && <MatchGroup title="Other" rows={grouped.other} onOpen={onOpen} nameFor={nameFor} />}
           </>
         )}
-        <div className="ump-footer app-version">Umpire version {APP_VERSION}</div>
+        <div className="ump-footer app-version">RESETIQ Umpire version {APP_VERSION}</div>
       </div>
     </div>
   );
@@ -1345,7 +1345,7 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
             <MatchGroup title="Completed" rows={grouped.done.slice(0, 8)} onOpen={onOpen} nameFor={nameFor} />
           </>
         )}
-        <div className="ump-footer app-version">Umpire version {APP_VERSION}</div>
+        <div className="ump-footer app-version">RESETIQ Umpire version {APP_VERSION}</div>
       </div>
     </div>
   );
