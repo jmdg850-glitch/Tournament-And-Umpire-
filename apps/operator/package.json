@@ -1,7 +1,7 @@
 {
   "name": "@tournament/operator",
   "private": true,
-  "version": "1.2.32",
+  "version": "1.2.33",
   "type": "module",
   "description": "RESETIQ Operator desktop application",
   "author": "RESETIQ",
