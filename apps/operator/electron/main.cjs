@@ -90,7 +90,7 @@ function createWindow() {
     height: 900,
     minWidth: 1024,
     minHeight: 720,
-    title: "Tournament Operator",
+    title: "RESETIQ Operator",
     icon: ICON,
     backgroundColor: "#101318",
     autoHideMenuBar: true,

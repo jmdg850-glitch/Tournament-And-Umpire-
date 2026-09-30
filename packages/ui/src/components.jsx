@@ -1,18 +1,151 @@
 import { createContext, forwardRef, useCallback, useContext, useEffect, useId, useRef, useState } from "react";
 import { matchStatusTone, tournamentStatusTone } from "./statusTone.js";
+import logoColor from "./brand/resetiq-logo-color.png";
+import logoWhite from "./brand/resetiq-logo-white.png";
+import stackedWhite from "./brand/resetiq-stacked-white.png";
+import symbolWhite from "./brand/resetiq-symbol-white.png";
+
+// RESETIQ artwork, cut from the official brand sheet at native resolution.
+// width/height are the files' intrinsic pixel sizes so the browser reserves
+// the right aspect ratio before the image loads (no layout shift); CSS sets
+// the rendered height. White variants are for dark backgrounds only.
+const BRAND_ART = {
+  "horizontal/color": { src: logoColor, width: 1083, height: 245 },
+  "horizontal/white": { src: logoWhite, width: 1083, height: 245 },
+  "stacked/white": { src: stackedWhite, width: 661, height: 381 },
+  "symbol/white": { src: symbolWhite, width: 238, height: 245 },
+};
+
+/** The RESETIQ logo. variant: "horizontal" | "stacked" | "symbol"; tone: "color" | "white". */
+export function BrandLogo({ variant = "horizontal", tone = "color", className = "", alt = "RESETIQ" }) {
+  const art = BRAND_ART[`${variant}/${tone}`] || BRAND_ART["horizontal/color"];
+  return (
+    <img
+      className={`brand-logo ${className}`.trim()}
+      src={art.src}
+      width={art.width}
+      height={art.height}
+      alt={alt}
+      draggable={false}
+      decoding="async"
+    />
+  );
+}
 
 export function Button({
   children,
   variant = "primary",
   className = "",
   type = "button",
+  busy = false,
+  disabled,
   ...props
 }) {
   const extra = variant === "primary" ? "" : variant;
+  // `busy` shows an inline spinner next to the caller's own label ("Signing
+  // in…", "Saving…") and blocks further clicks until the work settles.
   return (
-    <button type={type} className={`btn ${extra} ${className}`.trim()} {...props}>
+    <button
+      type={type}
+      className={`btn ${extra} ${className}`.trim()}
+      disabled={busy || disabled}
+      aria-busy={busy ? "true" : undefined}
+      data-busy={busy ? "true" : undefined}
+      {...props}
+    >
+      {busy ? <span className="btn-spinner" aria-hidden="true" /> : null}
       {children}
     </button>
+  );
+}
+
+// Replays a short "tick" only when the value changes after mount, so a score
+// update is noticeable at a glance but a list of scores mounting stays still.
+export function TickNumber({ value, className = "" }) {
+  const prev = useRef(value);
+  const [ticks, setTicks] = useState(0);
+  useEffect(() => {
+    if (prev.current !== value) {
+      prev.current = value;
+      setTicks((n) => n + 1);
+    }
+  }, [value]);
+  return (
+    <span key={ticks} className={`${ticks ? "tick" : ""} ${className}`.trim() || undefined}>
+      {value}
+    </span>
+  );
+}
+
+const REFRESH_ICON = (
+  <svg className="refresh-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+    <path d="M21 3v5h-5" />
+    <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+    <path d="M8 16H3v5" />
+  </svg>
+);
+
+/**
+ * Refresh control with built-in feedback: the icon spins while a refresh is in
+ * flight (its own, or an external `busy` such as an automatic reload), extra
+ * clicks are ignored meanwhile, and a brief "Updated" confirms a refresh that
+ * completed. `onRefresh` may resolve to `false` to signal a failed refresh —
+ * the caller's own error UI handles that case, and no "Updated" is shown.
+ * `confirmDone={false}` keeps only the spinner + duplicate-click guard, for
+ * callers whose reload can't report success.
+ */
+export function RefreshButton({ onRefresh, busy = false, label = "Refresh", iconOnly = false, confirmDone = true, className = "", variant = "secondary", disabled, ...props }) {
+  const [running, setRunning] = useState(false);
+  const [done, setDone] = useState(false);
+  const inFlight = useRef(false);
+  const mounted = useRef(true);
+  const doneTimer = useRef(0);
+  useEffect(() => () => {
+    mounted.current = false;
+    window.clearTimeout(doneTimer.current);
+  }, []);
+  const spinning = running || busy;
+  async function click() {
+    if (inFlight.current || busy) return;
+    inFlight.current = true;
+    setRunning(true);
+    setDone(false);
+    let ok = false;
+    try {
+      ok = (await onRefresh?.()) !== false;
+    } catch {
+      ok = false;
+    } finally {
+      inFlight.current = false;
+      if (mounted.current) {
+        setRunning(false);
+        if (ok && confirmDone) {
+          setDone(true);
+          window.clearTimeout(doneTimer.current);
+          doneTimer.current = window.setTimeout(() => { if (mounted.current) setDone(false); }, 1500);
+        }
+      }
+    }
+  }
+  const showDone = done && !spinning;
+  return (
+    <Button
+      variant={variant}
+      className={`refresh-btn ${iconOnly ? "icon" : ""} ${className}`.trim()}
+      data-spinning={spinning ? "true" : undefined}
+      data-done={showDone ? "true" : undefined}
+      aria-label={iconOnly || props["aria-label"] ? (props["aria-label"] || label) : undefined}
+      title={iconOnly ? (props.title || label) : props.title}
+      disabled={disabled}
+      aria-busy={spinning ? "true" : undefined}
+      onClick={click}
+      {...props}
+    >
+      {showDone ? <span className="refresh-done" aria-hidden="true">✓</span> : REFRESH_ICON}
+      {iconOnly ? null : <span className="refresh-label" aria-hidden={showDone ? "true" : undefined}>{showDone ? "Updated" : label}</span>}
+      <span className="sr-only" aria-live="polite">{showDone ? "Updated" : ""}</span>
+    </Button>
   );
 }
 
@@ -70,12 +203,12 @@ export function Scoreboard({ nameA, nameB, scoreA = 0, scoreB = 0, center, class
     <div className={`scoreboard ${className}`.trim()} aria-live="polite">
       <div>
         <div className="who" title={nameA}>{nameA}</div>
-        <div className="pts">{scoreA}</div>
+        <div className="pts"><TickNumber value={scoreA} /></div>
       </div>
       <div>{center}</div>
       <div>
         <div className="who" title={nameB}>{nameB}</div>
-        <div className="pts">{scoreB}</div>
+        <div className="pts"><TickNumber value={scoreB} /></div>
       </div>
     </div>
   );
@@ -368,12 +501,17 @@ export function LoadingState({ label = "Loading" }) {
  * stylesheet already applies everywhere else (see the bottom of this file's
  * companion styles.css) — no separate reduced-motion branch is needed here.
  */
-export function SplashScreen({ brand = "Tournament", tagline, status }) {
+export function SplashScreen({ brand, tagline, status, continued = false }) {
+  // `continued`: a second boot phase (e.g. the license check right after
+  // session restore) keeps the same splash on screen without replaying the
+  // entrance, so startup reads as one continuous step.
   return (
-    <div className="splash-screen" role="status" aria-live="polite">
+    <div className="splash-screen" role="status" aria-live="polite" data-continued={continued ? "true" : undefined}>
       <div className="splash-mark">
         <span className="splash-line" aria-hidden="true" />
-        <h1>{brand}</h1>
+        {brand
+          ? <h1>{brand}</h1>
+          : <h1 className="splash-logo"><BrandLogo variant="stacked" tone="white" /></h1>}
         {tagline ? <div className="splash-tagline">{tagline}</div> : null}
       </div>
       {status ? (
@@ -386,7 +524,19 @@ export function SplashScreen({ brand = "Tournament", tagline, status }) {
   );
 }
 
-export function Skeleton({ lines = 3 }) {
+export function Skeleton({ lines = 3, variant = "lines", count = 3 }) {
+  if (variant === "card") {
+    return (
+      <div className="stack skeleton-cards" aria-hidden="true">
+        {Array.from({ length: count }, (_, i) => (
+          <div key={i} className="skeleton skeleton-card">
+            <div className="skeleton skeleton-line" style={{ width: "58%" }} />
+            <div className="skeleton skeleton-line" style={{ width: "34%" }} />
+          </div>
+        ))}
+      </div>
+    );
+  }
   return (
     <div className="stack" aria-hidden="true">
       {Array.from({ length: lines }, (_, i) => (
@@ -438,7 +588,7 @@ export function ConfirmDialog({ title, body, confirmLabel = "Confirm", danger, b
     <Modal title={title} onClose={onCancel}>
       <p>{body}</p>
       <div className="row" style={{ marginTop: 16 }}>
-        <Button variant={danger ? "danger" : "primary"} disabled={busy} onClick={onConfirm}>
+        <Button variant={danger ? "danger" : "primary"} busy={busy} onClick={onConfirm}>
           {busy ? "Working…" : confirmLabel}
         </Button>
         <Button variant="secondary" onClick={onCancel} disabled={busy}>Cancel</Button>
@@ -449,13 +599,29 @@ export function ConfirmDialog({ title, body, confirmLabel = "Confirm", danger, b
 
 export function Dropdown({ label, children }) {
   const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+  // Standard menu dismissal: Escape or a press outside closes it (an item
+  // click still closes it too, as before).
+  useEffect(() => {
+    if (!open) return undefined;
+    function onKey(e) { if (e.key === "Escape") setOpen(false); }
+    function onDown(e) { if (!rootRef.current?.contains(e.target)) setOpen(false); }
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("touchstart", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("touchstart", onDown);
+    };
+  }, [open]);
   return (
-    <div className="dropdown" style={{ position: "relative" }}>
+    <div ref={rootRef} className="dropdown" style={{ position: "relative" }}>
       <Button variant="secondary" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
         {label}
       </Button>
       {open ? (
-        <div className="panel" style={{ position: "absolute", right: 0, top: "110%", zIndex: 20, minWidth: 180 }}>
+        <div className="panel dropdown-menu" style={{ position: "absolute", right: 0, top: "110%", zIndex: 20, minWidth: 180 }}>
           <div onClick={() => setOpen(false)}>{children}</div>
         </div>
       ) : null}
@@ -464,20 +630,25 @@ export function Dropdown({ label, children }) {
 }
 
 const ToastCtx = createContext(() => {});
+const TOAST_MAX = 4;
+const TOAST_EXIT_MS = 180;
 
 export function ToastProvider({ children }) {
   const [toasts, setToasts] = useState([]);
   const push = useCallback((message, tone = "ok") => {
     const id = crypto.randomUUID();
-    setToasts((list) => [...list, { id, message, tone }]);
+    // Same 4.2s total lifetime as before, split so the last 180ms can play a
+    // short exit instead of the toast vanishing. At most 4 stay stacked.
+    setToasts((list) => [...list, { id, message, tone }].slice(-TOAST_MAX));
+    window.setTimeout(() => setToasts((list) => list.map((t) => (t.id === id ? { ...t, leaving: true } : t))), 4200 - TOAST_EXIT_MS);
     window.setTimeout(() => setToasts((list) => list.filter((t) => t.id !== id)), 4200);
   }, []);
   return (
     <ToastCtx.Provider value={push}>
       {children}
-      <div className="toast-stack" aria-live="polite">
+      <div className="toast-stack" role="status" aria-live="polite">
         {toasts.map((t) => (
-          <div key={t.id} className={`toast ${t.tone}`.trim()}>{t.message}</div>
+          <div key={t.id} className={`toast ${t.tone}`.trim()} data-leaving={t.leaving ? "true" : undefined}>{t.message}</div>
         ))}
       </div>
     </ToastCtx.Provider>

@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Alert, Badge, Button, Card, Dropdown, EmptyState, GameTimer, Input, Modal, SectionHeader, Select, ServeIndicator, Stat, StatusBadge, Table, useNow } from "@tournament/ui";
+import { Alert, Badge, Button, Card, Dropdown, EmptyState, GameTimer, Input, Modal, SectionHeader, Select, ServeIndicator, Stat, StatusBadge, Table, TickNumber, useNow } from "@tournament/ui";
 import { ExternalLink } from "lucide-react";
 import { validateFinalScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
 import { openLiveMatchWindow, openMatchDisplayWindow } from "../useRealtimeChannel.js";
@@ -254,7 +254,7 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
           <div key={m.id} className="live-tile">
             <div className="kicker">{court?.name || "Unassigned court"}</div>
             <div className="live-tile-status">LIVE</div>
-            <div className="pts">{sa} – {sb}</div>
+            <div className="pts"><TickNumber value={sa} /> – <TickNumber value={sb} /></div>
             <div className="live-tile-names">{a.name} vs {b.name}</div>
             {division && <div className="muted live-tile-division">{division.name}</div>}
             <div className="muted live-tile-meta">
@@ -808,7 +808,7 @@ export function MatchesPanel({ data, busy, run, command, load }) {
               {showCompleted ? "Hide" : "Show"}
             </Button>
           </div>
-          {showCompleted && <MatchTable data={data} rows={completed} busy={busy} run={run} />}
+          {showCompleted && <div className="reveal"><MatchTable data={data} rows={completed} busy={busy} run={run} /></div>}
         </div>
       )}
     </div>

@@ -107,7 +107,7 @@ export function ActivationSetup({ supabase, commandUrl, publishableKey, onSignIn
     return (
       <form className="stack" onSubmit={submitCode}>
         <Steps current={0} />
-        <p className="muted setup-copy">Enter the Access Code you received after purchase. It activates Tournament Operator on this PC.</p>
+        <p className="muted setup-copy">Enter the Access Code you received after purchase. It activates RESETIQ Operator on this PC.</p>
         <Input
           label="Access code"
           value={code}
@@ -119,7 +119,7 @@ export function ActivationSetup({ supabase, commandUrl, publishableKey, onSignIn
           required
         />
         {error && <Alert>{error}</Alert>}
-        <Button type="submit" disabled={busy || !code.trim()}>{busy ? "Checking…" : "Activate license"}</Button>
+        <Button type="submit" busy={busy} disabled={!code.trim()}>{busy ? "Checking…" : "Activate license"}</Button>
       </form>
     );
   }
@@ -138,7 +138,7 @@ export function ActivationSetup({ supabase, commandUrl, publishableKey, onSignIn
         <Input label="New password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} maxLength={72} autoComplete="new-password" hint="8 to 72 characters." />
         <Input label="Confirm password" type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} required minLength={8} maxLength={72} autoComplete="new-password" />
         {error && <Alert>{error}</Alert>}
-        <Button type="submit" disabled={busy}>{busy ? "Creating account…" : "Create password"}</Button>
+        <Button type="submit" busy={busy}>{busy ? "Creating account…" : "Create password"}</Button>
       </form>
     );
   }

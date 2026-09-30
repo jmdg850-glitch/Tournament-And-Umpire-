@@ -1,6 +1,6 @@
 {
   "appId": "app.tournament.umpire",
-  "appName": "Tournament Umpire",
+  "appName": "RESETIQ Umpire",
   "webDir": "dist",
   "server": {
     "androidScheme": "https"

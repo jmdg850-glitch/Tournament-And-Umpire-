@@ -27,6 +27,38 @@
   --navy-text: #eef2f8;
   --navy-muted: #93a2ba;
   --gradient-brand: linear-gradient(135deg, #2563eb 0%, #0ea5a4 100%);
+  /* Light-workspace placeholders (the shared default is tuned for dark). */
+  --skeleton-base: #e8edf5;
+  --skeleton-shine: rgba(255, 255, 255, 0.75);
+}
+
+/* An in-flight desk action ("Assign court…", "Save settings…"): a small
+   floating pill instead of a line in the page, so starting an action never
+   shifts the content the operator is looking at. */
+.desk-busy {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  z-index: 45;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: #1c2432;
+  color: #eef1f4;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  box-shadow: var(--shadow-md);
+  transform: translateX(-50%);
+  animation: desk-busy-in var(--dur-base) var(--ease-out);
+  pointer-events: none;
+}
+.desk-busy .spinner { width: 14px; height: 14px; border-color: rgba(255, 255, 255, 0.25); border-top-color: #7fb0ff; }
+@keyframes desk-busy-in {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
 }
 body { background: var(--bg); }
 
@@ -208,6 +240,7 @@ input, select, textarea { background: #fff; }
   display: grid;
   gap: 10px;
   box-shadow: var(--shadow-lg);
+  animation: rise var(--dur-slow) var(--ease-out);
 }
 .update-banner-copy {
   display: grid;
@@ -315,6 +348,7 @@ input, select, textarea { background: #fff; }
   overflow-wrap: anywhere;
 }
 .spectator-header .kicker { color: var(--navy-muted); }
+.spectator-header .spectator-logo { height: 20px; margin-bottom: 10px; }
 .spectator-header-meta { gap: 8px; }
 .spectator-tabs {
   position: sticky;
@@ -370,6 +404,7 @@ input, select, textarea { background: #fff; }
     overflow: hidden;
   }
   .spectator-header .kicker { font-size: 0.7rem; }
+  .spectator-header .spectator-logo { height: 16px; margin-bottom: 4px; }
   .spectator-tabs { padding: 6px var(--space-3); }
 }
 

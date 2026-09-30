@@ -28,6 +28,15 @@ html, body, #root {
   padding-left: env(safe-area-inset-left);
   padding-right: env(safe-area-inset-right);
 }
+/* Screen changes: lists fade in; opening a match pushes the scoring desk in
+   from the right — the familiar mobile "go deeper" motion — and going back
+   fades the list in again. Short enough that it never delays scoring. */
+.ump-shell { animation: fade-in var(--dur-base) var(--ease-out); }
+.ump-shell.ump-desk { animation: ump-push-in var(--dur-slow) var(--ease-out); }
+@keyframes ump-push-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: none; }
+}
 .ump-shell .btn.secondary { color: var(--text); border-color: var(--border); }
 .ump-shell .btn.ghost { color: var(--muted); }
 .ump-shell .muted { color: var(--muted); }
@@ -47,7 +56,6 @@ html, body, #root {
 .ump-meta { color: var(--muted); font-size: var(--text-sm); }
 .ump-note { color: var(--muted); font-size: var(--text-sm); margin: 0; }
 .ump-center { flex: 1; display: grid; place-items: center; padding: var(--space-6) var(--ump-gutter); }
-.ump-spin { animation: spin 0.8s linear infinite; }
 
 /* ---- Top bar (lists + match) ---------------------------------------- */
 .ump-top {
@@ -60,6 +68,8 @@ html, body, #root {
   flex-shrink: 0;
   min-width: 0;
 }
+.ump-top-lead { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ump-top-logo { height: 28px; flex: none; }
 .ump-top-title { min-width: 0; }
 .ump-top-title .kicker { margin-bottom: 2px; }
 .ump-top h1 { font-size: var(--text-lg); }
@@ -89,6 +99,9 @@ html, body, #root {
   letter-spacing: 0.04em;
   color: var(--muted);
   margin-right: auto;
+  /* Saving → Syncing → Synced happens on every point: tint smoothly rather
+     than flashing a new colour each time. */
+  transition: color var(--dur-base) var(--ease-out), border-color var(--dur-base) var(--ease-out), background-color var(--dur-base) var(--ease-out);
 }
 .ump-chip-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
 .ump-chip[data-tone="ok"] { color: var(--success); border-color: color-mix(in srgb, var(--success) 35%, var(--border)); }
@@ -187,7 +200,7 @@ html, body, #root {
 }
 .btn.point.a { background: var(--team-a); }
 .btn.point.b { background: var(--team-b); }
-.btn.point:active:not(:disabled) { filter: brightness(0.82); transform: scale(0.98); }
+.btn.point:active:not(:disabled) { filter: brightness(0.82); transform: scale(0.98); box-shadow: inset 0 0 0 3px rgba(255, 255, 255, 0.28); }
 .btn.point:hover:not(:disabled) { transform: none; box-shadow: none; }
 /* While the tap is being written the lane refuses a second write anyway; the
    pad stays at full strength so scoring never flickers. */
@@ -300,6 +313,7 @@ html, body, #root {
 }
 .ump-auth .auth-panel { width: min(420px, 100%); box-shadow: none; }
 .ump-auth .tape { margin-bottom: 16px; }
+.ump-auth .auth-logo { height: 30px; }
 .ump-auth-lead { margin: 12px 0; }
 .ump-auth-form { margin-top: 4px; }
 .ump-segment {
@@ -319,7 +333,9 @@ html, body, #root {
   color: var(--muted);
   font-weight: 700;
   font-size: var(--text-sm);
+  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), transform var(--dur-press) var(--ease-out);
 }
+.ump-segment button:active { transform: scale(0.98); }
 .ump-segment button[aria-pressed="true"] { background: var(--elevated); color: var(--text); box-shadow: inset 0 -2px 0 var(--tape); }
 .ump-or {
   display: flex;
@@ -337,6 +353,7 @@ html, body, #root {
 @media (max-width: 400px) {
   :root { --ump-gutter: 12px; }
   .ump-hide-xs { display: none; }
+  .ump-refresh .refresh-label { display: none; }
   .ump-back, .ump-top-actions .btn.secondary:not(.ump-hold-btn) { min-width: var(--touch); padding: 0 12px; }
   .pads { gap: 8px; }
 }

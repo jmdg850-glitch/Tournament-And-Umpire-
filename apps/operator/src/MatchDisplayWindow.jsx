@@ -146,7 +146,7 @@ function DisplayMatchGroup({ title, tone, matches, data, empty, collapsedByDefau
         matches.length === 0 ? (
           empty ? <p className="muted display-match-empty">{empty}</p> : null
         ) : (
-          <div className="stack display-match-rows">
+          <div className="stack display-match-rows reveal">
             {matches.map((m) => (
               <DisplayMatchRow key={m.id} match={m} data={data} />
             ))}

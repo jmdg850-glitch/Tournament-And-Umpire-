@@ -79,7 +79,7 @@ export function useLicense({ commandUrl, publishableKey, session, userId: identi
 
 const INTRO = {
   none: "No license is linked to this email yet. Enter the Access Code you received for this email address.",
-  unused: "Enter the Access Code you received for this email address to activate Tournament Operator on this PC.",
+  unused: "Enter the Access Code you received for this email address to activate RESETIQ Operator on this PC.",
 };
 
 function ActivationScreen({ license, email, onSignOut }) {
@@ -122,7 +122,7 @@ function ActivationScreen({ license, email, onSignOut }) {
 }
 
 export function LicenseGate({ license, email, onSignOut, children }) {
-  if (license.phase === "checking") return <SplashScreen tagline="Operator Desk" status="Checking your license…" />;
+  if (license.phase === "checking") return <SplashScreen continued tagline="Operator Desk" status="Checking your license…" />;
   if (license.phase !== "active") return <ActivationScreen license={license} email={email} onSignOut={onSignOut} />;
   return children;
 }

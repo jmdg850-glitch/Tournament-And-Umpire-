@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createSpectatorClient, envConfig } from "@tournament/client";
 import { applyDeskRealtime } from "@tournament/engine";
-import { Alert, Badge, EmptyState, LoadingState, SplashScreen, StatusBadge, Tabs } from "@tournament/ui";
+import { Alert, Badge, BrandLogo, EmptyState, LoadingState, SplashScreen, StatusBadge, Tabs } from "@tournament/ui";
 import { useRealtimeChannel } from "../useRealtimeChannel.js";
 import { loadPublicTournamentData } from "./data.js";
 import { playableMatches } from "../lib.js";
@@ -99,7 +99,7 @@ export default function LiveTournamentPage({ slugOrId }) {
   }, [load]);
 
   if (status === "loading") {
-    return <SplashScreen brand="Tournament" tagline="Live" status="Loading tournament…" />;
+    return <SplashScreen tagline="Live" status="Loading tournament…" />;
   }
   if (status === "not_found") {
     return (
@@ -129,6 +129,7 @@ export default function LiveTournamentPage({ slugOrId }) {
   return (
     <div className="spectator-page">
       <header className="spectator-header">
+        <BrandLogo variant="horizontal" tone="white" className="spectator-logo" />
         <div className="kicker">Live Tournament</div>
         <h1>{data.tournament.name}</h1>
         <div className="row spectator-header-meta">

@@ -15,6 +15,7 @@ import {
   NavItem,
   PageShell,
   Select,
+  RefreshButton,
   Skeleton,
   SplashScreen,
   Stat,
@@ -23,7 +24,7 @@ import {
   ToastProvider,
   useToast,
 } from "@tournament/ui";
-import { ArrowRight, LayoutDashboard, LogOut, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { ArrowRight, LayoutDashboard, LogOut, Plus, Trash2 } from "lucide-react";
 import TournamentDesk from "./TournamentDesk.jsx";
 import LiveMatchWindow from "./LiveMatchWindow.jsx";
 import BracketWindow from "./BracketWindow.jsx";
@@ -501,8 +502,10 @@ function AuthScreen({ supabase, cfg, error, setError }) {
           )}
           {error && <Alert>{error}</Alert>}
           {info && <Alert tone="ok">{info}</Alert>}
-          <Button type="submit" disabled={busy}>
-            {busy ? "Working…" : mode === "login" ? "Sign in" : mode === "signup" ? "Create organizer account" : "Send reset"}
+          <Button type="submit" busy={busy}>
+            {busy
+              ? (mode === "login" ? "Signing in…" : mode === "signup" ? "Creating account…" : "Sending…")
+              : mode === "login" ? "Sign in" : mode === "signup" ? "Create organizer account" : "Send reset"}
           </Button>
         </form>
       )}
@@ -545,7 +548,7 @@ function RecoveryScreen({ supabase, title, onDone, onSignOut }) {
         <Input label="New password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} autoComplete="new-password" />
         <Input label="Confirm password" type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} required minLength={8} autoComplete="new-password" />
         {error && <Alert>{error}</Alert>}
-        <Button type="submit" disabled={busy}>{busy ? "Working…" : "Save password"}</Button>
+        <Button type="submit" busy={busy}>{busy ? "Working…" : "Save password"}</Button>
         <Button variant="secondary" type="button" onClick={onSignOut}>Cancel</Button>
       </form>
     </AuthLayout>
@@ -593,12 +596,14 @@ function SignedIn({ supabase, session, identityMode, repository, command, pendin
   const reloadList = useCallback(async () => {
     // Without a verified sign-in, queries would run as an anonymous visitor
     // and "succeed" with nothing — which must never replace saved data.
-    if (!verified) return;
+    // Resolves true only when fresh data was applied, so a manual Refresh can
+    // confirm "Updated" (a failed refresh is reported by the banners below).
+    if (!verified) return false;
     // An expired session makes supabase-js query anonymously (RLS → empty).
     const gate = await sessionGate(supabase);
     if (gate) {
       setDash((prev) => applyLoadOutcome(prev, gate));
-      return;
+      return false;
     }
     const queries = await Promise.all([
       supabase.from("tournaments").select("*").order("created_at", { ascending: false }),
@@ -612,6 +617,7 @@ function SignedIn({ supabase, session, identityMode, repository, command, pendin
     const outcome = dashboardFromQueries(queries);
     setDash((prev) => applyLoadOutcome(prev, outcome));
     if (outcome.ok) repository?.saveDashboard({ rows: outcome.rows, meta: outcome.meta }, outcome.at);
+    return Boolean(outcome.ok);
   }, [supabase, verified, repository]);
 
   useEffect(() => { reloadList(); }, [reloadList]);
@@ -757,7 +763,7 @@ function SignedIn({ supabase, session, identityMode, repository, command, pendin
             <p className="muted" style={{ margin: 0 }}>Next you'll add divisions, players, and courts — we'll walk you through each step.</p>
             {loadError && <Alert>{loadError}</Alert>}
             <div className="row">
-              <Button type="submit" disabled={creating || !newName.trim()}>{creating ? "Creating…" : "Create tournament"}</Button>
+              <Button type="submit" busy={creating} disabled={!newName.trim()}>{creating ? "Creating…" : "Create tournament"}</Button>
               <Button type="button" variant="secondary" disabled={creating} onClick={() => setShowCreate(false)}>Cancel</Button>
             </div>
           </form>
@@ -784,7 +790,7 @@ function SignedIn({ supabase, session, identityMode, repository, command, pendin
               <p>Everything happening across your tournaments, live courts, and staff.</p>
             </div>
             <div className="row">
-              <Button variant="secondary" className="hero-btn-ghost" onClick={reloadList}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>
+              <RefreshButton className="hero-btn-ghost" onRefresh={reloadList} busy={dash.status === "loading" && tournaments !== null} />
               <Button className="hero-btn-solid" onClick={() => setShowCreate(true)}><Plus size={15} aria-hidden="true" /> New tournament</Button>
             </div>
           </div>
@@ -792,7 +798,7 @@ function SignedIn({ supabase, session, identityMode, repository, command, pendin
           {loadError && (
             <div className="stack">
               <Alert>{loadError}</Alert>
-              <Button onClick={reloadList}>Retry</Button>
+              <RefreshButton variant="primary" label="Retry" onRefresh={reloadList} />
             </div>
           )}
           {!loadError && tournaments === null && dash.status === "loading" && (

@@ -6,6 +6,7 @@ import { pairingQrText, sideOf } from "../lib.js";
 export function CourtsPanel({ data, busy, run, onOpenLiveWindow }) {
   const [name, setName] = useState("");
   const [pairing, setPairing] = useState(null);
+  const [copied, setCopied] = useState(false);
   const liveMatchByCourtId = new Map(
     data.courtAssignments
       .map((a) => [a.court_id, data.matches.find((m) => m.id === a.match_id && m.status === "in_progress")])
@@ -30,7 +31,7 @@ export function CourtsPanel({ data, busy, run, onOpenLiveWindow }) {
       {pairing && (
         <Card className="stack">
           <h2>Pairing window — {pairing.court?.name || "Court"}</h2>
-          <p>Expires {new Date(pairing.expires_at).toLocaleTimeString()}. Scan with Tournament Umpire, or copy the pairing code as a fallback. This grant is one-time and short-lived.</p>
+          <p>Expires {new Date(pairing.expires_at).toLocaleTimeString()}. Scan with RESETIQ Umpire, or copy the pairing code as a fallback. This grant is one-time and short-lived.</p>
           <PairingQr payload={pairing.pairing_payload} />
           <div className="row">
             <Button
@@ -40,12 +41,14 @@ export function CourtsPanel({ data, busy, run, onOpenLiveWindow }) {
                 const text = pairingQrText(pairing.pairing_payload);
                 try {
                   await navigator.clipboard.writeText(text);
+                  setCopied(true);
+                  window.setTimeout(() => setCopied(false), 2000);
                 } catch {
                   window.prompt("Copy pairing code", text);
                 }
               }}
             >
-              Copy pairing code
+              {copied ? "Copied" : "Copy pairing code"}
             </Button>
             <Button variant="secondary" type="button" onClick={() => setPairing(null)}>Hide</Button>
           </div>

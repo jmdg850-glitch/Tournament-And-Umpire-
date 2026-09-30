@@ -397,7 +397,8 @@ export default function TournamentDesk({ supabase, session, identityMode, reposi
           <div className="tape" />
           <OfflineStatusBanner load={bannerLoad} identityMode={identityMode} onRetry={load} />
           {error ? <Alert>{error}</Alert> : null}
-          {busy ? <p className="muted" role="status">{busy}…</p> : null}
+          {/* Floating, so an action's progress never pushes the page down. */}
+          {busy ? <p className="desk-busy" role="status"><span className="spinner" aria-hidden="true" />{busy}…</p> : null}
 
           <div key={tab} className="tab-panel">
             {tab === "overview" && (

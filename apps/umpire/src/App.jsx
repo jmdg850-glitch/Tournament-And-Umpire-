@@ -10,7 +10,9 @@ import CoinTossPanel from "./CoinTossPanel.jsx";
 import {
   Alert,
   Badge,
+  BrandLogo,
   Button,
+  RefreshButton,
   Card,
   ClickableCard,
   ConfirmDialog,
@@ -20,11 +22,12 @@ import {
   LoadingState,
   Modal,
   Scoreboard,
+  Skeleton,
   SplashScreen,
   StatusBadge,
   useNow,
 } from "@tournament/ui";
-import { ArrowLeft, LogOut, PauseCircle, Pencil, QrCode, RefreshCw, Undo2 } from "lucide-react";
+import { ArrowLeft, LogOut, PauseCircle, Pencil, QrCode, Undo2 } from "lucide-react";
 import { version as APP_VERSION } from "../package.json";
 
 function isStationInactiveError(err) {
@@ -296,7 +299,9 @@ function useManualRefresh(load) {
     running.current = true;
     setRefreshing(true);
     try {
-      await load();
+      // Passes the load's own verdict through (true = fresh list applied), so
+      // the Refresh control can confirm "Updated" only when it really was.
+      return await load();
     } finally {
       running.current = false;
       setRefreshing(false);
@@ -768,7 +773,7 @@ function Auth({ cfg, supabase, store, error, setError, onPaired }) {
   return (
     <div className="auth-wrap ump-auth">
       <div className="auth-panel">
-        <div className="kicker">Tournament</div>
+        <BrandLogo variant="horizontal" tone="white" className="auth-logo" />
         <h1>Umpire</h1>
         <div className="tape" />
         <div className="ump-segment" role="group" aria-label="How this device is used">
@@ -824,7 +829,7 @@ function Auth({ cfg, supabase, store, error, setError, onPaired }) {
           )}
           {error && <Alert>{error}</Alert>}
           {info && <Alert tone="ok">{info}</Alert>}
-          <Button type="submit" variant={pairMode ? "secondary" : "primary"} className={pairMode ? "" : "cta"} disabled={busy || (pairMode && !pairText.trim())}>
+          <Button type="submit" variant={pairMode ? "secondary" : "primary"} className={pairMode ? "" : "cta"} busy={busy} disabled={pairMode && !pairText.trim()}>
             {busy
               ? (pairMode ? "Pairing…" : mode === "reset" ? "Sending…" : "Signing in…")
               : pairMode ? "Pair court" : mode === "reset" ? "Send reset link" : "Sign in"}
@@ -872,7 +877,7 @@ function RecoveryScreen({ supabase, onDone, onSignOut }) {
   return (
     <div className="auth-wrap ump-auth">
       <div className="auth-panel">
-        <div className="kicker">Tournament</div>
+        <BrandLogo variant="horizontal" tone="white" className="auth-logo" />
         <h1>Umpire</h1>
         <div className="tape" />
         <p className="muted">Choose a new password to finish the reset.</p>
@@ -880,7 +885,7 @@ function RecoveryScreen({ supabase, onDone, onSignOut }) {
           <Input label="New password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} autoComplete="new-password" />
           <Input label="Confirm password" type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} required minLength={8} autoComplete="new-password" />
           {error && <Alert>{error}</Alert>}
-          <Button type="submit" disabled={busy}>{busy ? "Working…" : "Save password"}</Button>
+          <Button type="submit" busy={busy}>{busy ? "Working…" : "Save password"}</Button>
           <Button variant="secondary" type="button" onClick={onSignOut}>Cancel</Button>
         </form>
       </div>
@@ -911,15 +916,17 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
 
   const load = useCallback(async () => {
     // A failed query only records WHY it failed; rows already on screen stay.
+    // Resolves true when a fresh list was applied, false otherwise.
     const fail = (res) => {
       setList((prev) => applyLoadOutcome(prev, { ok: false, kind: classifyQueryFailure(res), message: res.error?.message || res.message }));
+      return false;
     };
     // Without a real session supabase-js queries anonymously and RLS returns
     // no assignments — which would wipe the saved list. Keep it instead.
     const gate = await sessionGate(supabase);
     if (gate) {
       setList((prev) => applyLoadOutcome(prev, gate));
-      return;
+      return false;
     }
     const assigned = await supabase
       .from("umpire_assignments")
@@ -932,7 +939,7 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
       const snapshot = { rows: [], meta: { sides: [], participants: [] } };
       cache.write(snapshot);
       setList((prev) => applyLoadOutcome(prev, { ok: true, ...snapshot }));
-      return;
+      return true;
     }
     const [matches, courtsA, sides] = await Promise.all([
       supabase.from("matches").select("*").in("id", ids),
@@ -963,6 +970,7 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
     cache.write(snapshot);
     setList((prev) => applyLoadOutcome(prev, { ok: true, ...snapshot }));
     seedMatchContexts(store, owner, matches.data, sides.data, participants.data, courtFor).catch(() => {});
+    return true;
   }, [supabase, session.user.id, cache, store, owner]);
 
   // Also reloads when an offline identity becomes a verified sign-in.
@@ -1012,15 +1020,16 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
   return (
     <div className="ump-shell">
       <header className="ump-top">
-        <div className="ump-top-title">
-          <div className="kicker">Umpire</div>
-          <h1>My matches</h1>
-          <div className="ump-meta ump-ellipsis">{session.user.email}{session.offline ? " · offline" : ""}</div>
+        <div className="ump-top-lead">
+          <BrandLogo variant="symbol" tone="white" className="ump-top-logo" />
+          <div className="ump-top-title">
+            <div className="kicker">Umpire</div>
+            <h1>My matches</h1>
+            <div className="ump-meta ump-ellipsis">{session.user.email}{session.offline ? " · offline" : ""}</div>
+          </div>
         </div>
         <div className="ump-top-actions">
-          <Button variant="secondary" onClick={refresh} disabled={refreshing} aria-label="Refresh matches">
-            <RefreshCw size={16} aria-hidden="true" className={refreshing ? "ump-spin" : undefined} /> <span className="ump-hide-xs">Refresh</span>
-          </Button>
+          <RefreshButton className="ump-refresh" onRefresh={refresh} busy={refreshing} aria-label="Refresh matches" />
           <Button variant="ghost" onClick={onSignOut}><LogOut size={16} aria-hidden="true" /> Sign out</Button>
         </div>
       </header>
@@ -1028,7 +1037,12 @@ function MyMatches({ supabase, session, sync, onOpen, onSignOut }) {
         <SyncNotices sync={sync} who={session.user.email} />
         <ListStatusBanner state={list} onRetry={refresh} noun="your assigned matches" deviceOffline={deviceOffline} />
         <SavedMatches sync={sync} onOpen={onOpen} showAll={list.status !== "online" && list.status !== "loading"} />
-        {rows === null && list.status === "loading" && <LoadingState label="Loading your matches…" />}
+        {rows === null && list.status === "loading" && (
+          <>
+            <LoadingState label="Loading your matches…" />
+            <Skeleton variant="card" count={3} />
+          </>
+        )}
         {rows?.length === 0 && (
           <EmptyState title="No matches assigned yet">
             When the organizer assigns you to a match it shows up here. Tap Refresh if you were just assigned.
@@ -1147,7 +1161,7 @@ function GameTimeModal({ match, busy, onClose, onSend }) {
           {hasTimer && (
             <Button variant="secondary" disabled={busy} onClick={() => submit({ action: "clear" })}>Remove</Button>
           )}
-          <Button disabled={busy} onClick={submitSet}>{busy ? "Saving…" : "Set game time"}</Button>
+          <Button busy={busy} onClick={submitSet}>{busy ? "Saving…" : "Set game time"}</Button>
         </div>
       </div>
     </Modal>
@@ -1249,14 +1263,16 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
           stationRef.current = next;
         }
       }
+      return true;
     } catch (err) {
       if (isStationInactiveError(err)) {
         // A real answer, not an outage: this pairing is no longer valid.
         setRevoked("This court station was revoked. Pair again with a new QR.");
-        return;
+        return false;
       }
       // Network / server / other failures keep the list already on screen.
       setList((prev) => applyLoadOutcome(prev, { ok: false, kind: classifyQueryFailure(err), message: err.message }));
+      return false;
     }
   }, [cfg, getAuth, setStation, cache, store, owner]);
 
@@ -1286,15 +1302,16 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
   return (
     <div className="ump-shell">
       <header className="ump-top">
-        <div className="ump-top-title">
-          <div className="kicker">Court station</div>
-          <h1 className="ump-ellipsis">{court?.name || "Court"}</h1>
-          <div className="ump-meta">Tap the live or next match to score.</div>
+        <div className="ump-top-lead">
+          <BrandLogo variant="symbol" tone="white" className="ump-top-logo" />
+          <div className="ump-top-title">
+            <div className="kicker">Court station</div>
+            <h1 className="ump-ellipsis">{court?.name || "Court"}</h1>
+            <div className="ump-meta">Tap the live or next match to score.</div>
+          </div>
         </div>
         <div className="ump-top-actions">
-          <Button variant="secondary" onClick={refresh} disabled={refreshing} aria-label="Refresh matches">
-            <RefreshCw size={16} aria-hidden="true" className={refreshing ? "ump-spin" : undefined} /> <span className="ump-hide-xs">Refresh</span>
-          </Button>
+          <RefreshButton className="ump-refresh" onRefresh={refresh} busy={refreshing} aria-label="Refresh matches" />
           <Button variant="ghost" onClick={onUnpair}><LogOut size={16} aria-hidden="true" /> Unpair</Button>
         </div>
       </header>
@@ -1309,7 +1326,12 @@ function CourtQueue({ cfg, station, setStation, sync, onOpen, onUnpair }) {
           <ListStatusBanner state={list} onRetry={refresh} noun="this court's matches" deviceOffline={deviceOffline} />
         )}
         <SavedMatches sync={sync} onOpen={onOpen} showAll={Boolean(revoked) || (list.status !== "online" && list.status !== "loading")} />
-        {rows === null && list.status === "loading" && !revoked && <LoadingState label="Loading this court's matches…" />}
+        {rows === null && list.status === "loading" && !revoked && (
+          <>
+            <LoadingState label="Loading this court's matches…" />
+            <Skeleton variant="card" count={3} />
+          </>
+        )}
         {!revoked && rows?.length === 0 && (
           <EmptyState title="No matches on this court yet">
             When the organizer puts a match on this court it appears here — no new QR scan needed. Tap Refresh to check now.
@@ -1431,7 +1453,7 @@ function EditScoreModal({ match, nameA, nameB, sendCorrection, onClose, initialS
             </p>
             <div className="ump-modal-actions">
               <Button type="button" variant="secondary" onClick={() => setConfirming(false)} disabled={busy}>Back</Button>
-              <Button type="button" disabled={busy} onClick={submit}>{busy ? "Saving…" : "Apply correction"}</Button>
+              <Button type="button" busy={busy} onClick={submit}>{busy ? "Saving…" : "Apply correction"}</Button>
             </div>
           </>
         )}
@@ -1871,9 +1893,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
               <PauseCircle size={16} aria-hidden="true" /> Hold
             </Button>
           )}
-          <Button variant="secondary" className="ump-icon-btn" onClick={load} disabled={busy} aria-label="Reload match" title="Reload match">
-            <RefreshCw size={18} aria-hidden="true" />
-          </Button>
+          <RefreshButton iconOnly confirmDone={false} className="ump-icon-btn" onRefresh={load} disabled={busy} label="Reload match" />
         </div>
       </header>
 
@@ -2178,7 +2198,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
             {error && <Alert>{error}</Alert>}
             <div className="ump-modal-actions">
               <Button variant="secondary" onClick={() => setShowHold(false)} disabled={holding}>Cancel</Button>
-              <Button onClick={confirmHold} disabled={holding}>{holding ? "Holding…" : "Hold match"}</Button>
+              <Button onClick={confirmHold} busy={holding}>{holding ? "Holding…" : "Hold match"}</Button>
             </div>
           </div>
         </Modal>
