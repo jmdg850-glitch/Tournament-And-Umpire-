@@ -23,6 +23,19 @@ test("clean tree + nothing ahead is still skipped", () => {
   assert.match(r.message, /No changes in the working tree — release skipped/);
 });
 
+test("clean tree + nothing unpushed, but pushed commits since the last release tag, proceeds and lists them", () => {
+  const r = decideReleaseStart({ dirtyCount: 0, remoteSha: SHA, unpushed: [], unreleased: ["df6882d feat: rebrand license admin as RESETIQ"] });
+  assert.equal(r.proceed, true);
+  assert.match(r.message, /releasing 1 pushed commit\(s\) not in any release yet/);
+  assert.match(r.message, /df6882d feat: rebrand license admin as RESETIQ/);
+});
+
+test("clean tree + nothing unpushed + nothing since the last release tag is skipped", () => {
+  const r = decideReleaseStart({ dirtyCount: 0, remoteSha: SHA, unpushed: [], unreleased: [] });
+  assert.equal(r.proceed, false);
+  assert.match(r.message, /release skipped/);
+});
+
 test("clean tree + origin/main unreadable is skipped (nothing to prove there is work)", () => {
   const r = decideReleaseStart({ dirtyCount: 0, remoteSha: "", unpushed: null });
   assert.equal(r.proceed, false);

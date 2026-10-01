@@ -498,6 +498,7 @@ const initialEntries = readWorkingTree();
 {
   let remoteSha = "";
   let unpushed = null;
+  let unreleased = null;
   if (initialEntries.length === 0) {
     const remote = tryCapture("git", ["ls-remote", "origin", "refs/heads/main"], { cwd: root });
     remoteSha = remote.ok ? remote.output.trim().split(/\s+/)[0] || "" : "";
@@ -505,8 +506,14 @@ const initialEntries = readWorkingTree();
       const ahead = tryCapture("git", ["log", "--format=%h %s", `${remoteSha}..HEAD`], { cwd: root });
       unpushed = ahead.ok ? ahead.output.split(/\r?\n/).filter(Boolean) : null;
     }
+    // Pushed before the release ran: already on origin/main, but after the last release tag.
+    const lastTag = tryCapture("git", ["describe", "--tags", "--abbrev=0", "--match", "v*"], { cwd: root });
+    if (lastTag.ok && lastTag.output.trim()) {
+      const since = tryCapture("git", ["log", "--format=%h %s", `${lastTag.output.trim()}..HEAD`], { cwd: root });
+      unreleased = since.ok ? since.output.split(/\r?\n/).filter(Boolean) : null;
+    }
   }
-  const gate = decideReleaseStart({ dirtyCount: initialEntries.length, remoteSha, unpushed });
+  const gate = decideReleaseStart({ dirtyCount: initialEntries.length, remoteSha, unpushed, unreleased });
   if (!gate.proceed) {
     releaseUnlock();
     console.log(gate.message);

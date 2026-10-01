@@ -9,7 +9,10 @@
 //   remoteSha   origin/main from `git ls-remote` ("" if it could not be read)
 //   unpushed    ["<sha> <subject>", ...] for remoteSha..HEAD, or null when that
 //               range can't be computed (origin has a commit this checkout lacks)
-export function decideReleaseStart({ dirtyCount, remoteSha, unpushed }) {
+//   unreleased  ["<sha> <subject>", ...] for <latest v* tag>..HEAD, or null when
+//               unknown. Covers source that was pushed before `npm run release`
+//               ran: already on origin/main, but in no release yet.
+export function decideReleaseStart({ dirtyCount, remoteSha, unpushed, unreleased = null }) {
   if (dirtyCount > 0) return { proceed: true, message: "" };
   if (!remoteSha) {
     return {
@@ -23,6 +26,12 @@ export function decideReleaseStart({ dirtyCount, remoteSha, unpushed }) {
     return { proceed: true, message: "Working tree is clean; origin/main has commits this checkout lacks — continuing so the preflight can report it." };
   }
   if (unpushed.length === 0) {
+    if (unreleased && unreleased.length > 0) {
+      return {
+        proceed: true,
+        message: `Working tree is clean and main matches origin/main; releasing ${unreleased.length} pushed commit(s) not in any release yet:\n${unreleased.map((c) => `  ${c}`).join("\n")}`,
+      };
+    }
     return {
       proceed: false,
       message: "No changes in the working tree — release skipped. (Commit the source changes to ship first if they are not committed yet, or pass them via --allow=.)",
