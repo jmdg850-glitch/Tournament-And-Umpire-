@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "main": "electron/main.cjs",
-  "author": "Tournament",
-  "description": "Tournament License Admin - seller console: issue an access code per customer email, revoke, release a PC",
+  "author": "RESETIQ",
+  "description": "RESETIQ License Admin - seller console: issue an access code per customer email, revoke, release a PC",
   "scripts": {
     "dev": "vite --port 5176",
     "build": "vite build",
@@ -41,8 +41,8 @@
   },
   "build": {
     "appId": "app.tournament.licenseadmin",
-    "productName": "Tournament License Admin",
-    "copyright": "Tournament",
+    "productName": "RESETIQ License Admin",
+    "copyright": "RESETIQ",
     "directories": { "output": "release" },
     "files": ["dist/**/*", "electron/**/*", "build/icon.ico", "package.json"],
     "electronVersion": "38.8.6",
@@ -59,14 +59,15 @@
     "win": {
       "icon": "build/icon.ico",
       "target": [{ "target": "nsis", "arch": ["x64"] }],
-      "artifactName": "Tournament-License-Admin-Setup-${version}.${ext}"
+      "artifactName": "RESETIQ-License-Admin-Setup-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": "always",
       "createStartMenuShortcut": true,
-      "shortcutName": "Tournament License Admin"
+      "shortcutName": "RESETIQ License Admin",
+      "include": "build/installer.nsh"
     }
   }
 }

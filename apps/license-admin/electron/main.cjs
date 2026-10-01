@@ -46,7 +46,7 @@ function createWindow() {
     height: 760,
     minWidth: 720,
     minHeight: 560,
-    title: "Tournament License Admin",
+    title: "RESETIQ License Admin",
     icon: ICON,
     autoHideMenuBar: true,
     webPreferences: rendererPrefs(),

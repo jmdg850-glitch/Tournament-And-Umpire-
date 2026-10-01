@@ -870,7 +870,7 @@ logStep("Verify Windows build — License Admin");
 // covers both apps); running it twice would only repeat the same checks.
 const laWinResult = verifyWindowsInstaller({
   root, operatorDir: licenseAdminDir, version: ctx.nextLicenseAdmin, notOlderThanMs: buildStartMs,
-  artifactNamePattern: "Tournament-License-Admin-Setup", skipUpdateCheck: true,
+  artifactNamePattern: "RESETIQ-License-Admin-Setup", skipUpdateCheck: true,
 });
 if (!laWinResult.ok) fail("Verify Windows build (License Admin)", laWinResult.error);
 console.log(`Installer:            ${laWinResult.path} (${laWinResult.size} bytes, ${laWinResult.mtime.toISOString()})`);
@@ -992,8 +992,8 @@ const releaseFiles = [
   resolve(operatorDir, `release/RESETIQ-Operator-Setup-${ctx.nextOperator}.exe`),
   resolve(operatorDir, `release/RESETIQ-Operator-Setup-${ctx.nextOperator}.exe.blockmap`),
   resolve(operatorDir, "release/latest.yml"),
-  resolve(licenseAdminDir, `release/Tournament-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe`),
-  resolve(licenseAdminDir, `release/Tournament-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe.blockmap`),
+  resolve(licenseAdminDir, `release/RESETIQ-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe`),
+  resolve(licenseAdminDir, `release/RESETIQ-License-Admin-Setup-${ctx.nextLicenseAdmin}.exe.blockmap`),
   resolve(licenseAdminDir, "release/license-admin.yml"),
   umpireApkAsset,
 ];

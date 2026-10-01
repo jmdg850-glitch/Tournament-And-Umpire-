@@ -57,6 +57,8 @@ NSIS also writes `RESETIQ Operator.lnk` to the real user Desktop (`$DESKTOP`, in
 
 The app was renamed from "Tournament Operator" to "RESETIQ Operator" (`build.productName`). Electron's userData folder comes from the package `name` (`@tournament/operator` → `%APPDATA%\@tournament\operator`), not from `build.productName`, so the rename leaves the sign-in session, offline outbox and license state where they are — keep the package `name` unchanged. `appId`, the `tournament-operator://` scheme and the license device-id salt are also unchanged on purpose.
 
+License Admin was renamed the same way, from "Tournament License Admin" to "RESETIQ License Admin" (`npm run build:desktop -w @tournament/license-admin` → `apps/license-admin/release/RESETIQ-License-Admin-Setup-<version>.exe`). Its `appId`, package `name`, and `license-admin` update channel are unchanged; see docs/LICENSING.md.
+
 The Vite build bakes `VITE_SUPABASE_*` and `VITE_COMMAND_URL` from `apps/operator/.env.local`. Never put `SUPABASE_SERVICE_ROLE_KEY` in those files.
 
 Umpire Android (Capacitor) requires Android Studio / SDK **and JDK 17 or 21** (Gradle 8.14 does not run on JDK 25).

@@ -4,6 +4,22 @@ import { callAdmin, configured, supabase } from "./api.js";
 import {
   DEVICE_LIMIT_HINT, DEVICE_LIMIT_MAX, DEVICE_LIMIT_MIN, copyText, endOfDayIso, fmtDate, parseDeviceLimit, statusOf,
 } from "./format.js";
+import logoWhite from "./brand/resetiq-logo-white.png";
+import symbolWhite from "./brand/resetiq-symbol-white.png";
+
+// RESETIQ brand (same artwork as packages/ui/src/brand, used by RESETIQ Operator).
+function Brand() {
+  return (
+    <div className="brand">
+      <img className="brand-logo" src={logoWhite} width={1083} height={245} alt="RESETIQ" draggable={false} />
+      <b>License Admin</b>
+    </div>
+  );
+}
+
+function Loading() {
+  return <div className="center"><img className="brand-symbol" src={symbolWhite} width={238} height={245} alt="RESETIQ" draggable={false} /></div>;
+}
 
 function Login() {
   const [mode, setMode] = useState("login");
@@ -31,7 +47,7 @@ function Login() {
   return (
     <div className="center">
       <form className="card login" onSubmit={submit}>
-        <div className="brand"><span className="ball" aria-hidden="true" /><b>License Admin</b></div>
+        <Brand />
         <h1>{mode === "reset" ? "Reset password" : "Seller sign-in"}</h1>
         {msg ? <div className="alert bad" role="alert">{msg}</div> : null}
         {ok ? <div className="alert good" role="status">{ok}</div> : null}
@@ -354,7 +370,7 @@ function Licenses({ refreshKey, onChanged, notify }) {
       {confirm?.kind === "revoke" ? (
         <Confirm title="Revoke license?" confirmLabel="Revoke license" busy={busy} onCancel={() => setConfirm(null)} onConfirm={run}>
           <p>Customer: <b>{confirm.license.email}</b><br />Code: <b className="mono">{confirm.license.code}</b></p>
-          <p className="muted">The customer will no longer be able to use Tournament Operator with this license.</p>
+          <p className="muted">The customer will no longer be able to use RESETIQ Operator with this license.</p>
         </Confirm>
       ) : null}
       {confirm?.kind === "release_device" ? (
@@ -438,10 +454,10 @@ export default function App() {
   const signOut = () => supabase.auth.signOut({ scope: "local" });
 
   if (!configured) return <div className="center"><div className="card"><h2>Not configured</h2><p>VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY are missing from this build.</p></div></div>;
-  if (session === undefined) return <div className="center"><span className="ball" aria-hidden="true" /></div>;
+  if (session === undefined) return <Loading />;
   if (recovering && session) return <Recovery onDone={() => setRecovering(false)} />;
   if (!session) return <Login />;
-  if (gate === "checking") return <div className="center"><span className="ball" aria-hidden="true" /></div>;
+  if (gate === "checking") return <Loading />;
   if (gate !== "ok") {
     return (
       <div className="center">
@@ -457,7 +473,7 @@ export default function App() {
   return (
     <div className="page">
       <header>
-        <div className="brand"><span className="ball" aria-hidden="true" /><b>License Admin</b></div>
+        <Brand />
         <div className="row">
           <UpdateNotice />
           <span className="muted who">{session.user.email}</span>

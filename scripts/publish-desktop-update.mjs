@@ -72,7 +72,7 @@ const DESKTOP_APPS = [
     label: "License Admin",
     workspace: "@tournament/license-admin",
     dir: resolve(root, "apps/license-admin"),
-    artifactPrefix: "Tournament-License-Admin-Setup",
+    artifactPrefix: "RESETIQ-License-Admin-Setup",
     channel: "license-admin",
   },
 ];
@@ -304,7 +304,7 @@ const create = tryRun("gh", [
   "--repo", ghRepo,
   "--draft",
   "--title", tag,
-  "--notes", `RESETIQ Operator ${version} and Tournament License Admin ${licenseAdminApp.version} — Windows desktop updates.` +
+  "--notes", `RESETIQ Operator ${version} and RESETIQ License Admin ${licenseAdminApp.version} — Windows desktop updates.` +
     (extraAssets.length ? `\n\nAlso attached: ${extraAssets.map((f) => basename(f)).join(", ")}.` : ""),
 ]);
 if (!create.ok) {

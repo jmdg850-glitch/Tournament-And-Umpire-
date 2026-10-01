@@ -1,4 +1,4 @@
-/* License Admin - Tournament brand: courtTeal + ballChartreuse, Inter. */
+/* RESETIQ License Admin - courtTeal + ballChartreuse palette, Inter; RESETIQ logo artwork in src/brand. */
 :root {
   --courtTeal: #12a3a6;
   --courtTealDeep: #04191c;
@@ -27,6 +27,8 @@ h1 { font-size: 1.6rem; } h2 { font-size: 1.15rem; }
   background: radial-gradient(circle at 20% 10%, rgba(18,163,166,.28), transparent 45%), radial-gradient(circle at 85% 90%, rgba(201,243,29,.12), transparent 40%), var(--courtTealDeep); }
 .ball { display: inline-block; width: 30px; height: 30px; border-radius: 50%; background: radial-gradient(circle at 34% 30%, #eaff7a, var(--ballChartreuse) 45%, #93b80f); box-shadow: 0 0 0 3px rgba(201,243,29,.15); }
 .brand { display: flex; align-items: center; gap: 10px; font-size: 1.05rem; }
+.brand-logo { height: 22px; width: auto; display: block; }
+.brand-symbol { height: 40px; width: auto; display: block; }
 
 .card { background: var(--courtTealMid); border: 1px solid var(--courtTealLine); border-radius: 16px; padding: 20px; }
 .login { width: min(400px, 100%); display: grid; gap: 14px; }

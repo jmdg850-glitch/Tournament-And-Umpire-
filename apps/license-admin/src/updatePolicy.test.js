@@ -26,8 +26,18 @@ describe("License Admin update policy", () => {
     expect(pkg.build.publish.owner).toBe(operatorPkg.build.publish.owner);
     expect(pkg.build.publish.repo).toBe(operatorPkg.build.publish.repo);
     expect(operatorPkg.build.publish.channel).toBeUndefined();
-    expect(pkg.build.win.artifactName).toMatch(/^Tournament-License-Admin-Setup-/);
+    expect(pkg.build.win.artifactName).toMatch(/^RESETIQ-License-Admin-Setup-/);
     expect(pkg.dependencies["electron-updater"]).toBe(operatorPkg.dependencies["electron-updater"]);
+  });
+
+  it("keeps the install/update identity of earlier Tournament License Admin builds (RESETIQ rebrand)", () => {
+    // appId -> NSIS GUID / uninstall registry key; package name -> Electron userData
+    // (saved sign-in). Changing either would make 1.0.x installs a different app.
+    expect(pkg.build.appId).toBe("app.tournament.licenseadmin");
+    expect(pkg.name).toBe("@tournament/license-admin");
+    expect(pkg.build.publish.channel).toBe("license-admin");
+    expect(pkg.build.productName).toBe("RESETIQ License Admin");
+    expect(pkg.build.nsis.include).toBe("build/installer.nsh");
   });
 
   it("never checks in unpackaged/dev builds or when disabled", () => {
