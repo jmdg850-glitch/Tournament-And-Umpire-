@@ -31,6 +31,9 @@ export const PLAN_OPTIONS = [
   { value: "yearly", label: "Yearly" },
   { value: "trial_30", label: "30-Day Trial" },
 ];
+// Plans an existing legacy license may be moved onto (Change Plan). The server
+// enforces the same list; trials are for new licenses only.
+export const CONVERTIBLE_PLAN_OPTIONS = PLAN_OPTIONS.filter((p) => p.value === "monthly" || p.value === "yearly");
 const PLAN_LABELS = { monthly: "Monthly", yearly: "Yearly", trial_30: "30-Day Trial", legacy: "Legacy – no plan" };
 export const planLabel = (plan) => PLAN_LABELS[plan] || PLAN_LABELS.legacy;
 

@@ -185,3 +185,96 @@ describe("renew", () => {
     expect(notify).not.toHaveBeenCalled();
   });
 });
+
+describe("change plan (legacy -> Monthly / Yearly)", () => {
+  const legacy = (over) => row({ plan: "legacy", renewable: false, expires_at: null, ...over });
+  const MIXED = [
+    legacy({ id: "l", email: "legacy@example.com", active_devices: 1 }),
+    legacy({ id: "lu", email: "legacy-unused@example.com", status: "unused" }),
+    legacy({ id: "lr", email: "legacy-revoked@example.com", status: "revoked" }),
+    row({ id: "m", email: "monthly@example.com", plan: "monthly" }),
+    row({ id: "y", email: "yearly@example.com", plan: "yearly" }),
+    row({ id: "t", email: "trial@example.com", plan: "trial_30", renewable: false }),
+  ];
+
+  it("appears only on legacy licenses that are not revoked", async () => {
+    await renderList(MIXED);
+    const has = (email) => within(rowOf(email)).queryByText("Change Plan") !== null;
+    expect(has("legacy@example.com")).toBe(true);
+    expect(has("legacy-unused@example.com")).toBe(true);
+    expect(has("legacy-revoked@example.com")).toBe(false);
+    expect(has("monthly@example.com")).toBe(false);
+    expect(has("yearly@example.com")).toBe(false);
+    expect(has("trial@example.com")).toBe(false);
+    // Legacy licenses are still not renewable until they get a plan.
+    expect(within(rowOf("legacy@example.com")).queryByText("Renew")).toBeNull();
+  });
+
+  it("dialog shows email, current plan, Monthly/Yearly only, and current/new expiration; Cancel changes nothing", async () => {
+    await renderList([legacy({ id: "l", email: "legacy@example.com", expires_at: "2099-01-31T10:00:00Z" })]);
+    fireEvent.click(screen.getByText("Change Plan"));
+    const dialog = screen.getByRole("dialog", { name: "Change license plan?" });
+    expect(within(dialog).getByText("legacy@example.com")).not.toBeNull();
+    expect(within(dialog).getByText("Legacy – no plan")).not.toBeNull();
+    const select = within(dialog).getByLabelText("New plan");
+    expect([...select.options].map((o) => o.value)).toEqual(["monthly", "yearly"]);
+    expect(select.value).toBe("monthly");
+    expect(within(dialog).getByText(fmtDate("2099-01-31T10:00:00Z"))).not.toBeNull();
+    expect(within(dialog).getByTestId("change-plan-new-expiry").textContent).toBe(fmtDate("2099-02-28T10:00:00Z"));
+    fireEvent.change(select, { target: { value: "yearly" } });
+    expect(within(dialog).getByTestId("change-plan-new-expiry").textContent).toBe(fmtDate("2100-01-31T10:00:00Z"));
+    expect(within(dialog).getByText(/also sets a new expiration/)).not.toBeNull();
+    fireEvent.click(within(dialog).getByText("Cancel"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mocks.callAdmin).toHaveBeenCalledTimes(1);
+  });
+
+  it("success: calls change_plan with the chosen plan, updates the row, toasts, keeps the status filter", async () => {
+    const { notify, onChanged } = await renderList(MIXED);
+    filterTo("active");
+    fireEvent.click(within(rowOf("legacy@example.com")).getByText("Change Plan"));
+    fireEvent.change(screen.getByLabelText("New plan"), { target: { value: "yearly" } });
+    mocks.callAdmin.mockResolvedValueOnce({ license: { ...MIXED[0], plan: "yearly", renewable: true, expires_at: "2027-10-02T12:00:00Z" } });
+    fireEvent.click(within(screen.getByRole("dialog")).getByText("Change Plan"));
+    await waitFor(() => expect(notify).toHaveBeenCalledWith("Plan changed"));
+    expect(mocks.callAdmin).toHaveBeenCalledWith("change_plan", { id: "l", plan: "yearly" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    const updated = rowOf("legacy@example.com");
+    expect(within(updated).getByText("Yearly")).not.toBeNull();
+    expect(within(updated).getByText(fmtDate("2027-10-02T12:00:00Z"))).not.toBeNull();
+    expect(within(updated).queryByText("Change Plan")).toBeNull();
+    expect(within(updated).queryByText("Renew")).not.toBeNull();
+    expect(screen.getByLabelText("Filter by status").value).toBe("active");
+    expect(onChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("failure keeps the dialog open with the server error and leaves the row unchanged", async () => {
+    const { notify } = await renderList([legacy({ id: "l", email: "legacy@example.com" })]);
+    fireEvent.click(screen.getByText("Change Plan"));
+    mocks.callAdmin.mockRejectedValueOnce(Object.assign(new Error("That change is not allowed for this license's current status."), { code: "INVALID_STATE" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Change Plan"));
+    await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toMatch(/not allowed/));
+    expect(notify).not.toHaveBeenCalled();
+    const tableRow = within(screen.getByRole("table")).getByText("legacy@example.com").closest("tr");
+    expect(within(tableRow).getByText("Legacy – no plan")).not.toBeNull();
+    expect(within(dialog).getByText("Change Plan").disabled).toBe(false);
+  });
+
+  it("while saving, both buttons and the plan choice are disabled and a second click sends nothing", async () => {
+    const { notify } = await renderList([legacy({ id: "l", email: "legacy@example.com" })]);
+    let finish;
+    mocks.callAdmin.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    fireEvent.click(screen.getByText("Change Plan"));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Change Plan"));
+    const busyBtn = within(dialog).getByText("Working…");
+    expect(busyBtn.disabled).toBe(true);
+    expect(within(dialog).getByText("Cancel").disabled).toBe(true);
+    expect(within(dialog).getByLabelText("New plan").disabled).toBe(true);
+    fireEvent.click(busyBtn);
+    finish({ license: { plan: "monthly", renewable: true, expires_at: "2026-11-02T12:00:00Z" } });
+    await waitFor(() => expect(notify).toHaveBeenCalledWith("Plan changed"));
+    expect(mocks.callAdmin.mock.calls.filter(([action]) => action === "change_plan")).toHaveLength(1);
+  });
+});

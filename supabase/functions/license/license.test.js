@@ -792,6 +792,107 @@ test("12, 28: customers and anonymous callers cannot delete, renew or create pla
   assert.equal(admin.db.licenses[0].expires_at, iso(NOW + 5 * DAY));
 });
 
+// ---------------------------------------------------------------------------
+// change_plan: legacy -> Monthly / Yearly in place
+// ---------------------------------------------------------------------------
+
+const changePlan = (admin, plan, actor = ADMIN, id = LIC_ID) => as(actor, admin, { action: "change_plan", id, plan });
+const legacyAdmin = (over = {}, opts = {}) =>
+  fakeAdmin([lic({ email: BUYER.email, status: "active", plan: "legacy", max_devices: 3, ...over })], { admins: [ADMIN.id], ...opts });
+
+test("change_plan: an active legacy license extends from its current expiry (calendar clamp), on the server clock", async () => {
+  const m = legacyAdmin({ expires_at: "2027-01-31T10:00:00.000Z" });
+  const rm = await changePlan(m, "monthly");
+  assert.equal(rm.result.license.plan, "monthly");
+  assert.equal(rm.result.license.expires_at, "2027-02-28T10:00:00.000Z");
+  assert.equal(m.db.licenses[0].expires_at, "2027-02-28T10:00:00.000Z");
+  const y = legacyAdmin({ expires_at: "2026-10-01T12:00:00.000Z" });
+  const ry = await changePlan(y, "yearly");
+  assert.equal(ry.result.license.plan, "yearly");
+  assert.equal(ry.result.license.expires_at, "2027-10-01T12:00:00.000Z");
+});
+
+test("change_plan: an expired legacy license, or one with no expiry, starts from the server's now — never already expired", async () => {
+  for (const expires_at of [iso(NOW - 5 * DAY), null]) {
+    const m = legacyAdmin({ expires_at });
+    assert.equal((await changePlan(m, "monthly")).result.license.expires_at, "2026-10-22T12:00:00.000Z");
+    const y = legacyAdmin({ expires_at });
+    const r = await changePlan(y, "yearly");
+    assert.equal(r.result.license.expires_at, "2027-09-22T12:00:00.000Z");
+    assert.equal(r.result.license.expired, false);
+  }
+});
+
+test("change_plan: keeps code, email, devices, max_devices and other licenses untouched; the license becomes renewable", async () => {
+  const admin = legacyAdmin({}, {
+    devices: [{ id: "33333333-3333-4333-8333-333333333331", license_id: LIC_ID, device_id: pc(1).id }],
+  });
+  admin.db.licenses.push(lic({ id: OTHER_ID, email: "other@example.com", access_code: "BB2D-3FGH-JK4M", status: "active", plan: "legacy" }));
+  const before = { ...admin.db.licenses[0] };
+  const devicesBefore = JSON.stringify(admin.db.license_devices);
+  const r = await changePlan(admin, "monthly");
+  const after = admin.db.licenses[0];
+  for (const k of Object.keys(before)) if (k !== "plan" && k !== "expires_at") assert.deepEqual(after[k], before[k], k);
+  assert.equal(JSON.stringify(admin.db.license_devices), devicesBefore);
+  assert.equal(r.result.license.max_devices, 3);
+  assert.equal(r.result.license.active_devices, 1);
+  assert.equal(r.result.license.code, CODE);
+  assert.equal(r.result.license.email, BUYER.email);
+  assert.equal(r.result.license.renewable, true);
+  assert.equal(admin.db.licenses[1].plan, "legacy", "the other license is unchanged");
+  assert.equal(admin.db.licenses[1].expires_at, null);
+  // A converted license renews like any Monthly license.
+  const renewed = await as(ADMIN, admin, { action: "renew", id: LIC_ID });
+  assert.equal(renewed.result.license.expires_at, "2026-11-22T12:00:00.000Z");
+  assert.equal((await check(admin, pc(1))).status, "active");
+});
+
+test("change_plan: no trial, no legacy target, no client expiry, and only from a non-revoked legacy license", async () => {
+  const admin = legacyAdmin();
+  for (const bad of ["trial_30", "legacy", "weekly", "", null, 12]) await rejects(changePlan(admin, bad), "VALIDATION");
+  await rejects(as(ADMIN, admin, { action: "change_plan", id: LIC_ID, plan: "monthly", expires_at: iso(NOW + 999 * DAY) }), "VALIDATION");
+  await rejects(as(ADMIN, admin, { action: "change_plan", id: "nope", plan: "monthly" }), "VALIDATION");
+  await rejects(changePlan(admin, "monthly", ADMIN, "99999999-9999-4999-8999-999999999999"), "NOT_FOUND");
+  assert.equal(admin.db.licenses[0].plan, "legacy");
+  assert.equal(admin.db.licenses[0].expires_at, null);
+  for (const [over, target] of [
+    [{ status: "revoked" }, "monthly"],
+    [{ plan: "monthly", expires_at: iso(NOW + 9 * DAY) }, "yearly"],
+    [{ plan: "monthly", expires_at: iso(NOW + 9 * DAY) }, "monthly"],
+    [{ plan: "yearly", expires_at: iso(NOW + 9 * DAY) }, "monthly"],
+    [{ plan: "trial_30", expires_at: iso(NOW + 9 * DAY) }, "monthly"],
+  ]) {
+    const a = legacyAdmin(over);
+    const snapshot = JSON.stringify(a.db.licenses);
+    await rejects(changePlan(a, target), "INVALID_STATE");
+    assert.equal(JSON.stringify(a.db.licenses), snapshot, JSON.stringify(over));
+  }
+  // monthly/yearly -> trial is refused before the license is even looked at.
+  await rejects(changePlan(legacyAdmin({ plan: "yearly", expires_at: iso(NOW + 9 * DAY) }), "trial_30"), "VALIDATION");
+});
+
+test("change_plan: customers get FORBIDDEN and anonymous callers UNAUTHENTICATED; nothing changes", async () => {
+  const admin = legacyAdmin();
+  await rejects(changePlan(admin, "monthly", BUYER), "FORBIDDEN");
+  await rejects(call(admin, { action: "change_plan", id: LIC_ID, plan: "monthly" }), "UNAUTHENTICATED");
+  assert.equal(admin.db.licenses[0].plan, "legacy");
+  assert.equal(admin.db.licenses[0].expires_at, null);
+});
+
+test("change_plan: two simultaneous changes cannot both apply — the second sees the license is no longer legacy", async () => {
+  const admin = legacyAdmin();
+  const realFrom = admin.from;
+  let licenseQueries = 0;
+  admin.from = (table) => {
+    // Between this change's read and its write, another admin's change commits.
+    if (table === "licenses" && ++licenseQueries === 2) Object.assign(admin.db.licenses[0], { plan: "yearly", expires_at: "2027-09-22T12:00:00.000Z" });
+    return realFrom(table);
+  };
+  await rejects(changePlan(admin, "monthly"), "INVALID_STATE");
+  assert.equal(admin.db.licenses[0].plan, "yearly");
+  assert.equal(admin.db.licenses[0].expires_at, "2027-09-22T12:00:00.000Z", "the first change stands, unmixed");
+});
+
 test("maskEmail hides most of the local part", () => {
   assert.equal(maskEmail("a@x.com"), "a•@x.com");
   assert.equal(maskEmail("jo@x.com"), "j•@x.com");

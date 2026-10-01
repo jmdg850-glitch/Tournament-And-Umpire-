@@ -245,6 +245,23 @@ describe("multi-device licensing on real PostgreSQL (0015 -> 0016 -> 0020 -> 002
     assert.equal(activeCount(kept), 1, "another license's devices are untouched");
   });
 
+  test("change_plan: two sessions converting the same legacy license at once -> exactly one applies, devices untouched", async () => {
+    const id = newLicense(2);
+    register(id, "pc-plan-0001");
+    // The same conditional UPDATE the license function sends for change_plan.
+    const change = (plan, period) => `set role service_role; begin;
+      update public.licenses set plan = '${plan}', expires_at = now() + interval '${period}'
+        where id = '${id}' and plan = 'legacy' and status <> 'revoked' and expires_at is null returning plan;
+      select pg_sleep(0.5); commit;`;
+    const results = await Promise.all([psqlAsync(change("monthly", "1 month")), psqlAsync(change("yearly", "1 year"))]);
+    for (const r of results) assert.equal(r.code, 0, r.stderr);
+    const winners = results.map((r) => lines(r.stdout).filter((l) => l === "monthly" || l === "yearly")).flat();
+    assert.equal(winners.length, 1, `exactly one change applied: ${JSON.stringify(winners)}`);
+    const row = one(psql(`select plan || '|' || (expires_at > now()) || '|' || max_devices from public.licenses where id = '${id}';`));
+    assert.equal(row, `${winners[0]}|true|2`, "one consistent plan + expiry, limit unchanged");
+    assert.equal(activeCount(id), 1, "device registration unchanged");
+  });
+
   test("clients (anon/authenticated) cannot execute the function or touch the tables", () => {
     for (const role of ["anon", "authenticated"]) {
       assert.match(psql(`set role ${role}; select public.license_register_device('${L}', 'pc-evil-0001', null, null, false);`, { allowError: true }).error,

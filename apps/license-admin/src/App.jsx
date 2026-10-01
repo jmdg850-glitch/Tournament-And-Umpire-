@@ -1,8 +1,8 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
-import { Ban, CalendarPlus, ChevronDown, ChevronUp, Copy, LogOut, Monitor, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowRightLeft, Ban, CalendarPlus, ChevronDown, ChevronUp, Copy, LogOut, Monitor, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import { callAdmin, configured, supabase } from "./api.js";
 import {
-  DEVICE_LIMIT_HINT, DEVICE_LIMIT_MAX, DEVICE_LIMIT_MIN, PLAN_OPTIONS, STATUS_FILTERS, copyText, filterByStatus, fmtDate,
+  CONVERTIBLE_PLAN_OPTIONS, DEVICE_LIMIT_HINT, DEVICE_LIMIT_MAX, DEVICE_LIMIT_MIN, PLAN_OPTIONS, STATUS_FILTERS, copyText, filterByStatus, fmtDate,
   parseDeviceLimit, planLabel, previewRenewal, statusOf,
 } from "./format.js";
 import logoWhite from "./brand/resetiq-logo-white.png";
@@ -247,7 +247,7 @@ function Licenses({ refreshKey, onChanged, notify }) {
   const [search, setSearch] = useState("");
   const [items, setItems] = useState(null);
   const [error, setError] = useState("");
-  const [confirm, setConfirm] = useState(null); // { kind: "revoke" | "release_device" | "delete" | "renew", license, device? }
+  const [confirm, setConfirm] = useState(null); // { kind: "revoke" | "release_device" | "delete" | "renew" | "change_plan", license, device?, plan? }
   const [busy, setBusy] = useState(false);
   const [dialogError, setDialogError] = useState("");
   const [statusFilter, setStatusFilter] = useState("all"); // client-side; kept across reloads and actions
@@ -320,14 +320,18 @@ function Licenses({ refreshKey, onChanged, notify }) {
         if (open === target.id) setOpen(null);
       } else if (kind === "renew") {
         await callAdmin("renew", { id: target.id });
+      } else if (kind === "change_plan") {
+        const res = await callAdmin("change_plan", { id: target.id, plan: confirm.plan });
+        // Show the server's result right away; the refetch below confirms it.
+        if (res?.license) setItems((rows) => (rows ? rows.map((l) => (l.id === target.id ? { ...l, ...res.license } : l)) : rows));
       } else {
         await callAdmin("revoke", { id: target.id });
       }
-      notify({ revoke: "License revoked", release_device: "Device released", delete: "License deleted", renew: "License renewed" }[kind]);
+      notify({ revoke: "License revoked", release_device: "Device released", delete: "License deleted", renew: "License renewed", change_plan: "Plan changed" }[kind]);
       setConfirm(null);
       onChanged();
     } catch (err) {
-      if (kind === "delete" || kind === "renew") {
+      if (kind === "delete" || kind === "renew" || kind === "change_plan") {
         setDialogError(err.message);
       } else {
         setError(err.message);
@@ -395,6 +399,9 @@ function Licenses({ refreshKey, onChanged, notify }) {
                       <button className="btn" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : l.id)}>
                         {isOpen ? <ChevronUp size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />} Devices
                       </button>
+                      {l.plan === "legacy" && l.status !== "revoked" ? (
+                        <button className="btn" onClick={() => { setDialogError(""); setConfirm({ kind: "change_plan", license: l, plan: "monthly" }); }}><ArrowRightLeft size={14} /> Change Plan</button>
+                      ) : null}
                       {l.renewable ? <button className="btn" onClick={() => { setDialogError(""); setConfirm({ kind: "renew", license: l }); }}><CalendarPlus size={14} /> Renew</button> : null}
                       {l.status !== "revoked" ? <button className="btn danger" onClick={() => setConfirm({ kind: "revoke", license: l })}><Ban size={14} /> Revoke</button> : null}
                       <button className="btn danger" onClick={() => { setDialogError(""); setConfirm({ kind: "delete", license: l }); }}><Trash2 size={14} /> Delete</button>
@@ -446,6 +453,24 @@ function Licenses({ refreshKey, onChanged, notify }) {
             New expiry: <b data-testid="renew-new-expiry">{fmtDate(previewRenewal(confirm.license))}</b>
           </p>
           <p className="muted">{confirm.license.expired ? "This license has expired, so the new period starts today." : "The new period starts when the current one ends."} Devices and the device limit are not changed.</p>
+        </Confirm>
+      ) : null}
+      {confirm?.kind === "change_plan" ? (
+        <Confirm title="Change license plan?" confirmLabel="Change Plan" confirmClass="btn" busy={busy} error={dialogError} onCancel={closeConfirm} onConfirm={run}>
+          <p>
+            Email: <b>{confirm.license.email}</b><br />
+            Current plan: <b>{planLabel(confirm.license.plan)}</b>
+          </p>
+          <label>New plan
+            <select value={confirm.plan} disabled={busy} onChange={(e) => { const plan = e.target.value; setConfirm((c) => (c ? { ...c, plan } : c)); }}>
+              {CONVERTIBLE_PLAN_OPTIONS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+            </select>
+          </label>
+          <p>
+            Current expiration: <b>{fmtDate(confirm.license.expires_at, "Never")}</b><br />
+            New expiration: <b data-testid="change-plan-new-expiry">{fmtDate(previewRenewal({ ...confirm.license, plan: confirm.plan }))}</b>
+          </p>
+          <p className="muted">Changing the plan also sets a new expiration for the selected plan: one {confirm.plan === "yearly" ? "year" : "month"} from the current expiration, or from today if there is none or it has passed. The access code, email, devices and device limit stay the same, and the license can then be renewed.</p>
         </Confirm>
       ) : null}
     </section>

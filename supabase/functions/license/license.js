@@ -21,7 +21,8 @@
 //    never overwrites an existing account's password, and only from a device
 //    registered to the license.
 //  - Plans (Monthly / Yearly / 30-Day Trial): the browser only names the plan;
-//    the expiry is always computed here. Renew and delete are admin actions
+//    the expiry is always computed here. Renew, change_plan (legacy ->
+//    Monthly/Yearly) and delete are admin actions
 //    like revoke (delete cascades to license_devices in the database).
 //  - The database is only reachable through this function (RLS: no client grants).
 //  - Everyday /command actions are device-blind by design (packages/api
@@ -178,6 +179,18 @@ export function isRenewable(license) {
   return Boolean(license && license.status !== "revoked" && PLANS[license.plan]?.renewable);
 }
 
+// Plans an existing legacy license may be moved onto. Trials are for new
+// licenses only.
+export const CONVERTIBLE_PLANS = ["monthly", "yearly"];
+
+// The expiry after one more `plan` period: from the current expiry while it is
+// still in the future, otherwise (expired, or no expiry) from the server's now.
+// Shared by renew and change_plan so both follow one rule.
+export function nextExpiry(license, plan, now) {
+  const current = license.expires_at ? Date.parse(license.expires_at) : now;
+  return new Date(addPlanPeriod(Math.max(now, Number.isFinite(current) ? current : now), plan)).toISOString();
+}
+
 // ---------------------------------------------------------------------------
 // License validity (the device limit itself is decided by the database)
 // ---------------------------------------------------------------------------
@@ -232,6 +245,7 @@ const ADMIN_ACTIONS = {
   list: ["search"],
   revoke: ["id"],
   renew: ["id"],
+  change_plan: ["id", "plan"],
   delete: ["id"],
   release: ["id"], // legacy (License Admin <= 1.0.11): release every device of a license
   release_device: ["license_id", "device_id"],
@@ -577,11 +591,35 @@ async function renew({ admin, body, now }) {
   const license = await findById(admin, id);
   if (!license) throw new LicenseError("NOT_FOUND");
   if (!isRenewable(license)) throw new LicenseError("INVALID_STATE");
-  const current = license.expires_at ? Date.parse(license.expires_at) : now;
-  const next = new Date(addPlanPeriod(Math.max(now, Number.isFinite(current) ? current : now), license.plan)).toISOString();
+  const next = nextExpiry(license, license.plan, now);
   const { data, error } = await admin.from("licenses").update({ expires_at: next })
     .eq("id", id).eq("expires_at", license.expires_at).neq("status", "revoked").select("*");
   if (error) throw dbFail(error, "license renew");
+  if (!data || data.length !== 1) throw new LicenseError("INVALID_STATE");
+  return { license: await viewOne(admin, data[0], now) };
+}
+
+// Move an existing legacy license onto Monthly or Yearly in place: same code,
+// email, devices and max_devices; only plan and expires_at change. The expiry
+// is computed here (see nextExpiry) — never taken from the browser. One
+// conditional UPDATE: it applies only while the row is still the legacy,
+// non-revoked license with the expiry we read, so of two simultaneous changes
+// exactly one wins and the other gets INVALID_STATE.
+async function changePlan({ admin, body, now }) {
+  const id = requireUuid(body.id, "id");
+  const plan = body.plan;
+  if (typeof plan !== "string" || !CONVERTIBLE_PLANS.includes(plan)) {
+    throw new LicenseError("VALIDATION", `plan must be one of: ${CONVERTIBLE_PLANS.join(", ")}`);
+  }
+  const license = await findById(admin, id);
+  if (!license) throw new LicenseError("NOT_FOUND");
+  if ((license.plan || LEGACY_PLAN) !== LEGACY_PLAN || license.status === "revoked") throw new LicenseError("INVALID_STATE");
+  const expires_at = nextExpiry(license, plan, now);
+  let q = admin.from("licenses").update({ plan, expires_at })
+    .eq("id", id).eq("plan", LEGACY_PLAN).neq("status", "revoked");
+  q = license.expires_at ? q.eq("expires_at", license.expires_at) : q.is("expires_at", null);
+  const { data, error } = await q.select("*");
+  if (error) throw dbFail(error, "plan change");
   if (!data || data.length !== 1) throw new LicenseError("INVALID_STATE");
   return { license: await viewOne(admin, data[0], now) };
 }
@@ -630,7 +668,7 @@ async function whoami({ actor }) {
 }
 
 const HANDLERS = {
-  activate, check, whoami, create, list, revoke, release, renew, delete: deleteLicense,
+  activate, check, whoami, create, list, revoke, release, renew, change_plan: changePlan, delete: deleteLicense,
   release_device: releaseDevice, set_max_devices: setMaxDevices,
   claim, set_password: setPassword,
 };
