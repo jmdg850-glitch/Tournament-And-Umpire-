@@ -26,7 +26,7 @@ describe("Generate", () => {
     fireEvent.click(screen.getByText("Generate"));
 
     await waitFor(() => expect(screen.getByTestId("access-code").textContent).toBe("AB2D-3FGH-JK4M"));
-    expect(mocks.callAdmin).toHaveBeenCalledWith("create", { email: "buyer@example.com", max_devices: 1 });
+    expect(mocks.callAdmin).toHaveBeenCalledWith("create", { email: "buyer@example.com", plan: "monthly", max_devices: 1 });
     expect(onCreated).toHaveBeenCalledTimes(1);
   });
 
@@ -39,9 +39,25 @@ describe("Generate", () => {
     fireEvent.change(devices, { target: { value: "3" } });
     fireEvent.click(screen.getByText("Generate"));
     await waitFor(() => expect(screen.getByTestId("access-code")).not.toBeNull());
-    expect(mocks.callAdmin).toHaveBeenCalledWith("create", { email: "buyer@example.com", max_devices: 3 });
+    expect(mocks.callAdmin).toHaveBeenCalledWith("create", { email: "buyer@example.com", plan: "monthly", max_devices: 3 });
     expect(screen.getByText(/on up to 3 PCs/)).not.toBeNull();
     expect(screen.getByLabelText("Allowed devices").value).toBe("1");
+  });
+
+  it("Plan: Monthly by default, offers exactly Monthly / Yearly / 30-Day Trial, sends only the plan name (no date field)", async () => {
+    mocks.callAdmin.mockResolvedValueOnce({ code: "AB2D-3FGH-JK4M", license: { email: "t@example.com", plan: "trial_30", expires_at: "2026-10-31T12:00:00Z", max_devices: 1 } });
+    const { container } = render(<Generate onCreated={vi.fn()} notify={vi.fn()} />);
+    const plan = screen.getByLabelText("Plan");
+    expect(plan.value).toBe("monthly");
+    expect([...plan.options].map((o) => [o.value, o.textContent])).toEqual([["monthly", "Monthly"], ["yearly", "Yearly"], ["trial_30", "30-Day Trial"]]);
+    expect(container.querySelector("input[type=date]")).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("customer@example.com"), { target: { value: "t@example.com" } });
+    fireEvent.change(plan, { target: { value: "trial_30" } });
+    fireEvent.click(screen.getByText("Generate"));
+    await waitFor(() => expect(screen.getByTestId("access-code")).not.toBeNull());
+    expect(mocks.callAdmin).toHaveBeenCalledWith("create", { email: "t@example.com", plan: "trial_30", max_devices: 1 });
+    expect(screen.getByText(/30-Day Trial · expires/)).not.toBeNull();
+    expect(screen.getByLabelText("Plan").value).toBe("monthly");
   });
 
   it("refuses an Allowed devices value outside 1-100 without calling the server", async () => {

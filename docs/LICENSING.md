@@ -3,7 +3,7 @@
 Model: **one customer email / account -> one access code (license) -> up to `max_devices` registered PCs.**
 
 ```
-EMAIL / ACCOUNT ── LICENSE (access code, status, expires_at, max_devices)
+EMAIL / ACCOUNT ── LICENSE (access code, status, plan, expires_at, max_devices)
                        ├── DEVICE 1  (registered)
                        ├── DEVICE 2  (registered)
                        ├── DEVICE 3  (released — history, holds no slot)
@@ -12,7 +12,7 @@ EMAIL / ACCOUNT ── LICENSE (access code, status, expires_at, max_devices)
 
 | Piece | Where |
 |---|---|
-| Tables | `public.licenses` (`0016_simple_licensing.sql`, plus `max_devices` from `0020_multi_device_licensing.sql`) and `public.license_devices` (`0020`). `0015` is superseded history. |
+| Tables | `public.licenses` (`0016_simple_licensing.sql`, plus `max_devices` from `0020_multi_device_licensing.sql` and `plan` from `0021_license_plans.sql`) and `public.license_devices` (`0020`). `0015` is superseded history. |
 | Atomic registration | `public.license_register_device(...)` (`0020`) — the only way a device gets a slot |
 | Server | Edge Function `supabase/functions/license/` (`license.js` = rules, `index.ts` = JWT + CORS) |
 | Admin app | `apps/license-admin` (web / Windows / Android) |
@@ -32,6 +32,11 @@ EMAIL / ACCOUNT ── LICENSE (access code, status, expires_at, max_devices)
 - **Raising the limit:** new devices may register until the new limit is reached.
 - **Lowering the limit:** never releases or deletes a device. If more devices are registered than the new limit, the license is **over limit**: those devices keep working, License Admin shows *Over limit*, and no NEW device can register until the admin releases devices so usage is below the limit.
 - A revoked license's limit cannot be changed.
+- **Plans (0021):** Generate offers **Monthly**, **Yearly** or **30-Day Trial** (`plan`: `monthly` / `yearly` / `trial_30`). The browser only names the plan; the server rejects any other value, rejects a plan together with a browser-chosen `expires_at`, and computes `expires_at` from its own clock in UTC — Monthly = +1 calendar month, Yearly = +1 calendar year (day clamped to the month's end, e.g. Jan 31 → Feb 28/29), Trial = exactly +30 days. A plan license always has an expiry (`licenses_plan_has_expiry`). Expiry is enforced exactly as before (activation, `license_register_device`, `check`, `requireLicense`); there is no second expiry system.
+- **Legacy licenses:** every license issued before 0021 has `plan = legacy` with its expiry (none, for all production licenses at migration time), status and devices unchanged. Plan-less `create` calls from License Admin ≤ 1.0.13 are still accepted and stored as legacy with their optional date, as before. Legacy licenses are not renewable.
+- **Renew (admin, manual — no payments):** `renew { id }` extends a Monthly/Yearly license by one plan period, from its current expiry if it is still valid, or from now if it has expired (a renewal never yields an already-expired license). Trials, legacy and revoked licenses are refused (`INVALID_STATE`). It changes only `expires_at` — never `max_devices` or device registrations — and is conditional on the expiry it read, so two simultaneous renewals extend once, not twice. Nothing renews automatically.
+- **Delete (admin):** `delete { id }` permanently removes the license; its `license_devices` rows (active and released) go with it through the foreign key's `ON DELETE CASCADE`, so no device row is orphaned. The customer's PCs lose the license (`check` → `none`, `/command` → `LICENSE_REQUIRED`) and the email can be issued a new code. Use **Revoke** instead to stop a license but keep its history.
+- License Admin's **Status** filter (All / Activated / Not activated / Expired / Revoked) filters the already-loaded list in the app; it never changes a license.
 - Password reset uses the normal Supabase Auth flow and never touches a license (licenses are keyed by email, not password).
 
 ## Existing licenses (migration 0020)
@@ -98,6 +103,8 @@ insert into public.license_admins (user_id) select id from auth.users where emai
 ```
 
 Deploy the function: `npx supabase functions deploy license --project-ref <ref> --no-verify-jwt --use-api`.
+
+Deploy order for plans: apply `0021_license_plans.sql` **before** deploying the `license` function that writes `plan` (the column is additive, so the currently deployed function and License Admin ≤ 1.0.13 keep working against it).
 
 Live test (creates and leaves `+lictest-` data to delete afterwards): see the header of `license.live.test.js`.
 

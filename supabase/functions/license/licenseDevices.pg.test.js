@@ -67,7 +67,7 @@ const newLicense = (max, extra = "") => {
   return id;
 };
 
-describe("multi-device licensing on real PostgreSQL (0015 -> 0016 -> 0020)", { skip: !PG_BIN && "set LOCAL_PG_BIN to run" }, () => {
+describe("multi-device licensing on real PostgreSQL (0015 -> 0016 -> 0020 -> 0021)", { skip: !PG_BIN && "set LOCAL_PG_BIN to run" }, () => {
   before(() => {
     dir = mkdtempSync(join(tmpdir(), "lic-pg-"));
     const data = join(dir, "data");
@@ -92,7 +92,10 @@ describe("multi-device licensing on real PostgreSQL (0015 -> 0016 -> 0020)", { s
           insert into public.licenses (email, access_code, status, revoked_at) values ('gone@example.com', 'YYYY-YYYY-YYYY', 'revoked', now());`);
     psql(readFileSync(join(migrations, "0020_multi_device_licensing.sql"), "utf8"));
     psql(`grant all on public.license_devices to service_role;
-          insert into public.licenses (id, email, access_code, max_devices) values ('${L}', 'multi@example.com', 'MMMM-MMMM-MMMM', 3);`);
+          insert into public.licenses (id, email, access_code, max_devices) values ('${L}', 'multi@example.com', 'MMMM-MMMM-MMMM', 3);
+          insert into public.licenses (email, access_code, expires_at) values ('dated@example.com', 'DDDD-DDDD-DDDD', '2031-05-06T07:08:09Z');`);
+    // 0021 (plans) on top of the populated 0020 schema, as in production.
+    psql(readFileSync(join(migrations, "0021_license_plans.sql"), "utf8"));
   });
 
   after(() => {
@@ -210,12 +213,47 @@ describe("multi-device licensing on real PostgreSQL (0015 -> 0016 -> 0020)", { s
     assert.equal(activeCount(id), 1);
   });
 
+  test("0021: every existing license becomes 'legacy' with its expiry, status and devices untouched", () => {
+    assert.deepEqual(lines(psql(`select distinct plan from public.licenses;`)), ["legacy"]);
+    assert.equal(one(psql(`select coalesce(to_char(expires_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'), 'none') from public.licenses where email = 'dated@example.com';`)),
+      "2031-05-06T07:08:09");
+    assert.equal(one(psql(`select count(*) from public.licenses where email in ('old@example.com', 'multi@example.com') and expires_at is null;`)), "2");
+    assert.equal(one(psql(`select status from public.licenses where email = 'gone@example.com';`)), "revoked");
+    assert.equal(register(OLD, "win-oldpc-1234567890").outcome, "already_here", "registration is unchanged by 0021");
+  });
+
+  test("0021: plan values are constrained, and a plan license must have an expiry", () => {
+    const ok = randomUUID();
+    psql(`insert into public.licenses (id, email, access_code, plan, expires_at) values ('${ok}', 'p-${ok}@example.com', '${code()}', 'trial_30', now() + interval '30 days');`);
+    assert.equal(one(psql(`select plan from public.licenses where id = '${ok}';`)), "trial_30");
+    assert.match(psql(`insert into public.licenses (email, access_code, plan, expires_at) values ('bad1@example.com', '${code()}', 'weekly', now());`, { allowError: true }).error,
+      /licenses_plan_valid/);
+    assert.match(psql(`insert into public.licenses (email, access_code, plan) values ('bad2@example.com', '${code()}', 'monthly');`, { allowError: true }).error,
+      /licenses_plan_has_expiry/);
+    assert.match(psql(`update public.licenses set expires_at = null where id = '${ok}';`, { allowError: true }).error, /licenses_plan_has_expiry/);
+  });
+
+  test("13: deleting a license deletes its device rows (ON DELETE CASCADE) and nothing else", () => {
+    const gone = newLicense(3);
+    const kept = newLicense(2);
+    for (const d of ["pc-del-0001", "pc-del-0002"]) register(gone, d);
+    psql(`update public.license_devices set released_at = now() where license_id = '${gone}' and device_id = 'pc-del-0002';`);
+    register(kept, "pc-keep-0001");
+    assert.equal(one(psql(`set role service_role; delete from public.licenses where id = '${gone}' returning id;`)), gone);
+    assert.equal(one(psql(`select count(*) from public.license_devices where license_id = '${gone}';`)), "0", "no orphaned device rows (active or released)");
+    assert.equal(one(psql(`select count(*) from public.license_devices d left join public.licenses l on l.id = d.license_id where l.id is null;`)), "0");
+    assert.equal(activeCount(kept), 1, "another license's devices are untouched");
+  });
+
   test("clients (anon/authenticated) cannot execute the function or touch the tables", () => {
     for (const role of ["anon", "authenticated"]) {
       assert.match(psql(`set role ${role}; select public.license_register_device('${L}', 'pc-evil-0001', null, null, false);`, { allowError: true }).error,
         /permission denied for function license_register_device/, role);
       assert.match(psql(`set role ${role}; select count(*) from public.license_devices;`, { allowError: true }).error, /permission denied/, role);
       assert.match(psql(`set role ${role}; update public.licenses set max_devices = 100;`, { allowError: true }).error, /permission denied/, role);
+      assert.match(psql(`set role ${role}; update public.licenses set plan = 'yearly', expires_at = now() + interval '99 years';`, { allowError: true }).error, /permission denied/, role);
+      assert.match(psql(`set role ${role}; delete from public.licenses;`, { allowError: true }).error, /permission denied/, role);
+      assert.match(psql(`set role ${role}; delete from public.license_devices;`, { allowError: true }).error, /permission denied/, role);
       assert.match(psql(`set role ${role}; insert into public.license_devices (license_id, device_id) values ('${L}', 'pc-evil-0002');`, { allowError: true }).error,
         /permission denied/, role);
     }

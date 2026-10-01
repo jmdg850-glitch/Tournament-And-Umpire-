@@ -20,6 +20,9 @@
 //    account for the license's email (password hashed by Supabase Auth) — but
 //    never overwrites an existing account's password, and only from a device
 //    registered to the license.
+//  - Plans (Monthly / Yearly / 30-Day Trial): the browser only names the plan;
+//    the expiry is always computed here. Renew and delete are admin actions
+//    like revoke (delete cascades to license_devices in the database).
 //  - The database is only reachable through this function (RLS: no client grants).
 //  - Everyday /command actions are device-blind by design (packages/api
 //    requireLicense checks account + license only).
@@ -138,6 +141,43 @@ export function validateMaxDevices(value) {
   return value;
 }
 
+// License plans (migration 0021). The server alone turns a plan into an expiry;
+// the browser only names the plan. `legacy` = licenses issued before plans
+// existed (and plan-less creates from older License Admin builds): their
+// expiry is whatever was chosen at issue, or none, and they are not renewable.
+export const PLANS = {
+  monthly: { months: 1, renewable: true },
+  yearly: { months: 12, renewable: true },
+  trial_30: { days: 30, renewable: false },
+};
+export const LEGACY_PLAN = "legacy";
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export function validatePlan(value) {
+  if (typeof value !== "string" || !Object.hasOwn(PLANS, value)) {
+    throw new LicenseError("VALIDATION", `plan must be one of: ${Object.keys(PLANS).join(", ")}`);
+  }
+  return value;
+}
+
+// One plan period after `fromMs`, in UTC. Calendar months/years keep the time of
+// day and clamp the day to the target month's end (Jan 31 + 1 month = Feb 28/29);
+// the trial is exactly 30 x 24 h.
+export function addPlanPeriod(fromMs, plan) {
+  const p = PLANS[plan];
+  if (p.days) return fromMs + p.days * DAY_MS;
+  const d = new Date(fromMs);
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth() + p.months;
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  return Date.UTC(year, month, Math.min(d.getUTCDate(), lastDay),
+    d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds());
+}
+
+export function isRenewable(license) {
+  return Boolean(license && license.status !== "revoked" && PLANS[license.plan]?.renewable);
+}
+
 // ---------------------------------------------------------------------------
 // License validity (the device limit itself is decided by the database)
 // ---------------------------------------------------------------------------
@@ -188,9 +228,11 @@ export const PASSWORD_MIN = 8;
 export const PASSWORD_MAX = 72; // bcrypt's input limit in Supabase Auth
 const ADMIN_ACTIONS = {
   whoami: [],
-  create: ["email", "expires_at", "max_devices"],
+  create: ["email", "expires_at", "max_devices", "plan"],
   list: ["search"],
   revoke: ["id"],
+  renew: ["id"],
+  delete: ["id"],
   release: ["id"], // legacy (License Admin <= 1.0.11): release every device of a license
   release_device: ["license_id", "device_id"],
   set_max_devices: ["id", "max_devices"],
@@ -411,6 +453,8 @@ function adminView(l, devices, now) {
   return {
     id: l.id, email: l.email, code: l.access_code, status: l.status,
     expired: isExpired(l, now), expires_at: l.expires_at,
+    plan: l.plan || LEGACY_PLAN,
+    renewable: isRenewable({ ...l, plan: l.plan || LEGACY_PLAN }),
     max_devices: max,
     active_devices: active.length,
     over_limit: active.length > max,
@@ -443,8 +487,16 @@ async function viewOne(admin, license, now) {
 async function create({ admin, actor, body, now }) {
   const email = normalizeEmail(body.email);
   if (!email) throw new LicenseError("VALIDATION", "a valid customer email is required");
+  const hasExpiry = body.expires_at !== undefined && body.expires_at !== null && body.expires_at !== "";
   let expires_at = null;
-  if (body.expires_at !== undefined && body.expires_at !== null && body.expires_at !== "") {
+  let plan;
+  if (body.plan !== undefined) {
+    // Plan license: the expiry is computed here, never taken from the browser.
+    plan = validatePlan(body.plan);
+    if (hasExpiry) throw new LicenseError("VALIDATION", "expires_at is set by the plan");
+    expires_at = new Date(addPlanPeriod(now, plan)).toISOString();
+  } else if (hasExpiry) {
+    // Plan-less create (License Admin <= 1.0.13): stored as legacy, as before.
     const t = Date.parse(body.expires_at);
     if (!Number.isFinite(t) || t <= now) throw new LicenseError("VALIDATION", "expiry must be a future date");
     expires_at = new Date(t).toISOString();
@@ -454,7 +506,7 @@ async function create({ admin, actor, body, now }) {
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateCode();
     const { data: row, error } = await admin.from("licenses")
-      .insert({ email, access_code: code, expires_at, max_devices, created_by: actor.id }).select("*").single();
+      .insert({ email, access_code: code, expires_at, max_devices, created_by: actor.id, ...(plan ? { plan } : {}) }).select("*").single();
     if (error) {
       if (error.code === "23505") {
         if (String(error.message).includes("licenses_one_live_per_email")) throw new LicenseError("EMAIL_HAS_LICENSE");
@@ -514,6 +566,38 @@ const revoke = (ctx) => changeLicense(ctx, { status: "revoked", revoked_at: new 
 // current usage only stops NEW registrations until usage is back under it.
 const setMaxDevices = (ctx) => changeLicense(ctx, { max_devices: validateMaxDevices(ctx.body.max_devices) }, "not_revoked");
 
+// Manual renewal (no payments): extends a Monthly/Yearly license by one plan
+// period from its current expiry, or from now if it has already expired, so a
+// renewal never yields an already-expired license. Trials and legacy licenses
+// are not renewable. Touches only expires_at — never devices or max_devices.
+// The update is conditional on the expiry we read, so two renewals racing each
+// other extend the license once, never twice.
+async function renew({ admin, body, now }) {
+  const id = requireUuid(body.id, "id");
+  const license = await findById(admin, id);
+  if (!license) throw new LicenseError("NOT_FOUND");
+  if (!isRenewable(license)) throw new LicenseError("INVALID_STATE");
+  const current = license.expires_at ? Date.parse(license.expires_at) : now;
+  const next = new Date(addPlanPeriod(Math.max(now, Number.isFinite(current) ? current : now), license.plan)).toISOString();
+  const { data, error } = await admin.from("licenses").update({ expires_at: next })
+    .eq("id", id).eq("expires_at", license.expires_at).neq("status", "revoked").select("*");
+  if (error) throw dbFail(error, "license renew");
+  if (!data || data.length !== 1) throw new LicenseError("INVALID_STATE");
+  return { license: await viewOne(admin, data[0], now) };
+}
+
+// Permanent delete. license_devices rows go with it through the foreign key's
+// ON DELETE CASCADE (0020), in the same statement, so no device row is left
+// behind. The customer's PCs lose the license (check -> none; /command ->
+// LICENSE_REQUIRED). Use revoke to stop a license but keep its history.
+async function deleteLicense({ admin, body }) {
+  const id = requireUuid(body.id, "id");
+  const { data, error } = await admin.from("licenses").delete().eq("id", id).select("id");
+  if (error) throw dbFail(error, "license delete");
+  if (!data || data.length !== 1) throw new LicenseError("NOT_FOUND");
+  return { deleted: id };
+}
+
 // Release ONE device of ONE license. Both ids must match, so a device of
 // another license can never be released through this license.
 async function releaseDevice({ admin, body, now }) {
@@ -546,7 +630,7 @@ async function whoami({ actor }) {
 }
 
 const HANDLERS = {
-  activate, check, whoami, create, list, revoke, release,
+  activate, check, whoami, create, list, revoke, release, renew, delete: deleteLicense,
   release_device: releaseDevice, set_max_devices: setMaxDevices,
   claim, set_password: setPassword,
 };

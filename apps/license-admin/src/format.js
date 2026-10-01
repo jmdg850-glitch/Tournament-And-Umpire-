@@ -12,6 +12,41 @@ export function statusOf(l) {
   return { key: "unused", label: "Not activated" };
 }
 
+// Status filter for the license list: exactly the statuses statusOf() produces.
+export const STATUS_FILTERS = [
+  { key: "all", label: "All" },
+  { key: "active", label: "Activated" },
+  { key: "unused", label: "Not activated" },
+  { key: "expired", label: "Expired" },
+  { key: "revoked", label: "Revoked" },
+];
+
+export function filterByStatus(items, key) {
+  return key === "all" ? items : items.filter((l) => statusOf(l).key === key);
+}
+
+// License plans. The server validates the plan and computes every expiry.
+export const PLAN_OPTIONS = [
+  { value: "monthly", label: "Monthly" },
+  { value: "yearly", label: "Yearly" },
+  { value: "trial_30", label: "30-Day Trial" },
+];
+const PLAN_LABELS = { monthly: "Monthly", yearly: "Yearly", trial_30: "30-Day Trial", legacy: "Legacy – no plan" };
+export const planLabel = (plan) => PLAN_LABELS[plan] || PLAN_LABELS.legacy;
+
+// Preview only (renew dialog): mirrors addPlanPeriod in
+// supabase/functions/license/license.js. The server's result is what is saved.
+export function previewRenewal(license, now = Date.now()) {
+  const months = { monthly: 1, yearly: 12 }[license.plan];
+  if (!months) return null;
+  const current = license.expires_at ? Date.parse(license.expires_at) : now;
+  const d = new Date(Math.max(now, Number.isFinite(current) ? current : now));
+  const month = d.getUTCMonth() + months;
+  const lastDay = new Date(Date.UTC(d.getUTCFullYear(), month + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(d.getUTCFullYear(), month, Math.min(d.getUTCDate(), lastDay),
+    d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds())).toISOString();
+}
+
 // Allowed devices per license. The server validates the same range.
 export const DEVICE_LIMIT_MIN = 1;
 export const DEVICE_LIMIT_MAX = 100;

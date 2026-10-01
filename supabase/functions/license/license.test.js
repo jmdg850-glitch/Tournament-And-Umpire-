@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  LicenseError, MAX_DEVICES_MAX, customerView, decideActivation, generateCode, handleLicense, maskEmail,
-  normalizeCode, normalizeEmail, validateDevice, validateMaxDevices,
+  LicenseError, MAX_DEVICES_MAX, addPlanPeriod, customerView, decideActivation, generateCode, handleLicense, maskEmail,
+  normalizeCode, normalizeEmail, validateDevice, validateMaxDevices, validatePlan,
 } from "./license.js";
 
 const CODE_RE = /^[2-9A-HJKMNP-TV-Z]{4}(-[2-9A-HJKMNP-TV-Z]{4}){2}$/;
@@ -129,13 +129,19 @@ function fakeAdmin(rows, { devices = [], admins = [], existingEmails = [], dbNow
             return { data: null, error: { code: "23505", message: "duplicate key value violates unique constraint \"licenses_access_code_key\"" } };
           }
         }
-        const row = { id: uuid(), status: "unused", max_devices: 1, created_at: iso(NOW), activated_user_id: null, device_id: null, ...insertRow };
+        const row = { id: uuid(), status: "unused", max_devices: 1, plan: "legacy", created_at: iso(NOW), activated_user_id: null, device_id: null, ...insertRow };
         db[table].push(row);
         return { data: [{ ...row }], error: null };
       }
       const hit = db[table].filter(match);
       if (remove) {
         db[table] = db[table].filter((r) => !hit.includes(r));
+        // license_devices.license_id ... ON DELETE CASCADE (0020); the real
+        // cascade is proven in licenseDevices.pg.test.js.
+        if (table === "licenses") {
+          const gone = new Set(hit.map((r) => r.id));
+          db.license_devices = db.license_devices.filter((d) => !gone.has(d.license_id));
+        }
         return { data: hit, error: null };
       }
       if (patch) for (const r of hit) Object.assign(r, patch);
@@ -623,6 +629,167 @@ test("legacy release (License Admin <= 1.0.11) releases every device of that lic
   await activate(admin, pc(3));
   assert.equal(admin.activeDevices(LIC_ID).length, 1);
   await rejects(as(ADMIN, fakeAdmin([lic()], { admins: [ADMIN.id] }), { action: "release", id: LIC_ID }), "INVALID_STATE");
+});
+
+// ---------------------------------------------------------------------------
+// Plans (0021), renewal and delete
+// ---------------------------------------------------------------------------
+
+const OTHER_ID = "22222222-2222-4222-8222-222222222222";
+const created = async (admin, plan, email = "plan@example.com") =>
+  (await as(ADMIN, admin, { action: "create", email, plan })).result.license;
+
+test("plan periods: calendar months/years in UTC with month-end clamping; the trial is exactly 30 days", () => {
+  const at = (s) => Date.parse(s);
+  assert.equal(iso(addPlanPeriod(at("2026-09-22T12:00:00Z"), "monthly")), "2026-10-22T12:00:00.000Z");
+  assert.equal(iso(addPlanPeriod(at("2026-12-15T08:30:00Z"), "monthly")), "2027-01-15T08:30:00.000Z");
+  assert.equal(iso(addPlanPeriod(at("2027-01-31T10:00:00Z"), "monthly")), "2027-02-28T10:00:00.000Z");
+  assert.equal(iso(addPlanPeriod(at("2028-01-31T10:00:00Z"), "monthly")), "2028-02-29T10:00:00.000Z");
+  assert.equal(iso(addPlanPeriod(at("2026-09-22T12:00:00Z"), "yearly")), "2027-09-22T12:00:00.000Z");
+  assert.equal(iso(addPlanPeriod(at("2028-02-29T00:00:00Z"), "yearly")), "2029-02-28T00:00:00.000Z");
+  assert.equal(addPlanPeriod(at("2027-01-31T10:00:00Z"), "trial_30") - at("2027-01-31T10:00:00Z"), 30 * DAY);
+  for (const p of ["monthly", "yearly", "trial_30"]) assert.equal(validatePlan(p), p);
+  for (const bad of ["legacy", "weekly", "MONTHLY", "", 30, null, undefined, {}]) assert.throws(() => validatePlan(bad), LicenseError);
+});
+
+test("14-16, 19-21: create Monthly / Yearly / 30-Day Trial — expiry is computed by the server from its own clock", async () => {
+  const admin = fakeAdmin([], { admins: [ADMIN.id] });
+  const m = await created(admin, "monthly", "m@example.com");
+  assert.equal(m.plan, "monthly");
+  assert.equal(m.expires_at, "2026-10-22T12:00:00.000Z");
+  assert.equal(m.renewable, true);
+  const y = await created(admin, "yearly", "y@example.com");
+  assert.equal(y.plan, "yearly");
+  assert.equal(y.expires_at, "2027-09-22T12:00:00.000Z");
+  assert.equal(y.renewable, true);
+  const t = await created(admin, "trial_30", "t@example.com");
+  assert.equal(t.plan, "trial_30");
+  assert.equal(Date.parse(t.expires_at) - NOW, 30 * DAY);
+  assert.equal(t.renewable, false);
+  assert.equal(admin.db.licenses.find((l) => l.email === "t@example.com").plan, "trial_30");
+});
+
+test("17: invalid plans are rejected server-side, and a plan license cannot carry a browser-chosen expiry", async () => {
+  const admin = fakeAdmin([], { admins: [ADMIN.id] });
+  for (const bad of ["weekly", "legacy", "MONTHLY", "", 30, null, ["monthly"]]) {
+    await rejects(as(ADMIN, admin, { action: "create", email: "x@example.com", plan: bad }), "VALIDATION");
+  }
+  await rejects(as(ADMIN, admin, { action: "create", email: "x@example.com", plan: "monthly", expires_at: iso(NOW + 999 * DAY) }), "VALIDATION");
+  await rejects(as(ADMIN, admin, { action: "create", email: "x@example.com", plan: "trial_30", duration_days: 365 }), "VALIDATION");
+  assert.equal(admin.db.licenses.length, 0, "nothing was created");
+});
+
+test("18: existing / plan-less licenses stay legacy with their own expiry behaviour and are not renewable", async () => {
+  // A row as it was before 0021 (no plan property) and a plan-less create from License Admin <= 1.0.13.
+  const old = lic({ email: BUYER.email, status: "active" });
+  delete old.plan;
+  const admin = fakeAdmin([old], { admins: [ADMIN.id] });
+  const created13 = (await as(ADMIN, admin, { action: "create", email: "older@example.com", expires_at: iso(NOW + 10 * DAY) })).result.license;
+  assert.equal(created13.plan, "legacy");
+  assert.equal(created13.expires_at, iso(NOW + 10 * DAY));
+  const items = await listed(admin);
+  const before = items.find((l) => l.id === LIC_ID);
+  assert.equal(before.plan, "legacy");
+  assert.equal(before.expires_at, null, "no expiry is invented for an existing license");
+  assert.equal(before.renewable, false);
+  await rejects(as(ADMIN, admin, { action: "renew", id: LIC_ID }), "INVALID_STATE");
+  assert.equal(admin.db.licenses[0].expires_at, null);
+  assert.equal((await check(admin, PC1)).status, "not_registered", "expiry checks are unchanged for legacy licenses");
+});
+
+test("23-24: renewing an active Monthly / Yearly license extends from its current expiry", async () => {
+  for (const [plan, want] of [["monthly", "2026-11-01T12:00:00.000Z"], ["yearly", "2027-10-01T12:00:00.000Z"]]) {
+    const admin = fakeAdmin([lic({ status: "active", plan, expires_at: iso(NOW + 9 * DAY) })], { admins: [ADMIN.id] });
+    const r = await as(ADMIN, admin, { action: "renew", id: LIC_ID });
+    assert.equal(r.result.license.expires_at, want, plan);
+    assert.equal(admin.db.licenses[0].expires_at, want);
+    assert.equal(r.result.license.expired, false);
+  }
+});
+
+test("25-26: renewing an expired Monthly / Yearly license extends from now, never to an already-expired date", async () => {
+  for (const [plan, want] of [["monthly", "2026-10-22T12:00:00.000Z"], ["yearly", "2027-09-22T12:00:00.000Z"]]) {
+    const admin = fakeAdmin([lic({ status: "active", plan, expires_at: iso(NOW - 40 * DAY) })], { admins: [ADMIN.id] });
+    const r = await as(ADMIN, admin, { action: "renew", id: LIC_ID });
+    assert.equal(r.result.license.expires_at, want, plan);
+    assert.equal(r.result.license.expired, false);
+  }
+});
+
+test("22: trials, revoked and unknown licenses cannot be renewed", async () => {
+  const admin = fakeAdmin([
+    lic({ status: "active", plan: "trial_30", expires_at: iso(NOW + 5 * DAY) }),
+    lic({ id: OTHER_ID, email: "r@example.com", access_code: "BB2D-3FGH-JK4M", status: "revoked", plan: "monthly", expires_at: iso(NOW + 5 * DAY) }),
+  ], { admins: [ADMIN.id] });
+  await rejects(as(ADMIN, admin, { action: "renew", id: LIC_ID }), "INVALID_STATE");
+  await rejects(as(ADMIN, admin, { action: "renew", id: OTHER_ID }), "INVALID_STATE");
+  await rejects(as(ADMIN, admin, { action: "renew", id: "99999999-9999-4999-8999-999999999999" }), "NOT_FOUND");
+  await rejects(as(ADMIN, admin, { action: "renew", id: "nope" }), "VALIDATION");
+  assert.equal(admin.db.licenses[0].expires_at, iso(NOW + 5 * DAY), "trial expiry unchanged");
+  assert.equal(admin.db.licenses[1].expires_at, iso(NOW + 5 * DAY), "revoked expiry unchanged");
+});
+
+test("29-30: renewal changes only the expiry — never the device limit or device registrations", async () => {
+  const admin = buyerLicense(3, { plan: "monthly", expires_at: iso(NOW + 3 * DAY) });
+  for (const n of [1, 2]) await activate(admin, pc(n));
+  const devicesBefore = JSON.stringify(admin.db.license_devices);
+  const r = await as(ADMIN, admin, { action: "renew", id: LIC_ID });
+  assert.equal(r.result.license.max_devices, 3);
+  assert.equal(r.result.license.active_devices, 2);
+  assert.equal(JSON.stringify(admin.db.license_devices), devicesBefore);
+  assert.equal((await check(admin, pc(1))).status, "active");
+});
+
+test("two renewals racing on the same expiry extend the license once, not twice", async () => {
+  const admin = fakeAdmin([lic({ status: "active", plan: "monthly", expires_at: iso(NOW + 9 * DAY) })], { admins: [ADMIN.id] });
+  const otherRenewal = "2026-11-01T12:00:00.000Z";
+  const realFrom = admin.from;
+  let licenseQueries = 0;
+  admin.from = (table) => {
+    // Between this renewal's read and its write, another renewal commits.
+    if (table === "licenses" && ++licenseQueries === 2) admin.db.licenses[0].expires_at = otherRenewal;
+    return realFrom(table);
+  };
+  await rejects(as(ADMIN, admin, { action: "renew", id: LIC_ID }), "INVALID_STATE");
+  assert.equal(admin.db.licenses[0].expires_at, otherRenewal, "only the first renewal applied");
+});
+
+test("13: delete removes the license and all of its device rows; other licenses and devices are untouched", async () => {
+  const admin = fakeAdmin([
+    lic({ email: BUYER.email, status: "active", max_devices: 3 }),
+    lic({ id: OTHER_ID, email: "other@example.com", access_code: "BB2D-3FGH-JK4M", status: "active" }),
+  ], {
+    admins: [ADMIN.id],
+    devices: [
+      { id: "33333333-3333-4333-8333-333333333331", license_id: LIC_ID, device_id: pc(1).id },
+      { id: "33333333-3333-4333-8333-333333333332", license_id: LIC_ID, device_id: pc(2).id, released_at: iso(NOW - DAY) },
+      { id: "33333333-3333-4333-8333-333333333333", license_id: OTHER_ID, device_id: pc(3).id },
+    ],
+  });
+  const r = await as(ADMIN, admin, { action: "delete", id: LIC_ID });
+  assert.deepEqual(r.result, { deleted: LIC_ID });
+  assert.deepEqual(admin.db.licenses.map((l) => l.id), [OTHER_ID]);
+  assert.deepEqual(admin.db.license_devices.map((d) => d.license_id), [OTHER_ID], "no orphaned device rows");
+  assert.equal((await check(admin, pc(1))).status, "none", "the deleted license no longer serves the customer's PC");
+  await rejects(activate(admin, pc(1)), "INVALID_CODE");
+  await rejects(as(ADMIN, admin, { action: "delete", id: LIC_ID }), "NOT_FOUND");
+  await rejects(as(ADMIN, admin, { action: "delete", id: "99999999-9999-4999-8999-999999999999" }), "NOT_FOUND");
+  await rejects(as(ADMIN, admin, { action: "delete", id: "not-a-uuid" }), "VALIDATION");
+  assert.equal(admin.activeDevices(OTHER_ID).length, 1);
+});
+
+test("12, 28: customers and anonymous callers cannot delete, renew or create plan licenses", async () => {
+  const admin = fakeAdmin([lic({ email: BUYER.email, status: "active", plan: "monthly", expires_at: iso(NOW + 5 * DAY) })], { admins: [ADMIN.id] });
+  for (const body of [
+    { action: "delete", id: LIC_ID },
+    { action: "renew", id: LIC_ID },
+    { action: "create", email: "x@example.com", plan: "yearly" },
+  ]) {
+    await rejects(as(BUYER, admin, body), "FORBIDDEN");
+    await rejects(call(admin, body), "UNAUTHENTICATED");
+  }
+  assert.equal(admin.db.licenses.length, 1);
+  assert.equal(admin.db.licenses[0].expires_at, iso(NOW + 5 * DAY));
 });
 
 test("maskEmail hides most of the local part", () => {

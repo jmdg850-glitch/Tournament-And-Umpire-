@@ -33,8 +33,8 @@ h1 { font-size: 1.6rem; } h2 { font-size: 1.15rem; }
 .card { background: var(--courtTealMid); border: 1px solid var(--courtTealLine); border-radius: 16px; padding: 20px; }
 .login { width: min(400px, 100%); display: grid; gap: 14px; }
 label { display: grid; gap: 6px; font-size: .85rem; font-weight: 600; color: var(--muted); }
-input { min-height: 46px; padding: 8px 14px; border-radius: 12px; border: 1px solid var(--courtTealLine); background: var(--courtTealDeep); color: var(--ink); font: inherit; }
-input:focus, button:focus-visible { outline: 2px solid var(--ballChartreuse); outline-offset: 1px; }
+input, select { min-height: 46px; padding: 8px 14px; border-radius: 12px; border: 1px solid var(--courtTealLine); background: var(--courtTealDeep); color: var(--ink); font: inherit; }
+input:focus, select:focus, button:focus-visible { outline: 2px solid var(--ballChartreuse); outline-offset: 1px; }
 
 .cta { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; padding: 0 22px; border: 0; border-radius: 12px; background: var(--ballChartreuse); color: #0b1c06; font: 700 1rem var(--font); cursor: pointer; }
 .cta:disabled { opacity: .55; cursor: not-allowed; }
@@ -68,6 +68,8 @@ td.email { word-break: break-all; }
 .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: .72rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; border: 1px solid currentColor; }
 .badge.active { color: var(--good); } .badge.unused { color: var(--info); } .badge.expired { color: var(--warn); } .badge.revoked { color: var(--bad); }
 .badge.over { color: var(--warn); }
+.badge.trial { color: var(--ballChartreuse); }
+.status-filter { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: .9rem; }
 .usage { white-space: nowrap; }
 .devices-input input { width: 7.5rem; }
 tr.details > td { background: var(--courtTealDeep); }
