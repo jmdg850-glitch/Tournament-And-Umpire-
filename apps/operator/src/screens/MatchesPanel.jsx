@@ -3,6 +3,7 @@ import { Alert, Badge, Button, Card, Dropdown, EmptyState, GameTimer, Input, Mod
 import { ExternalLink } from "lucide-react";
 import { validateFinalScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
 import { openLiveMatchWindow, openMatchDisplayWindow } from "../useRealtimeChannel.js";
+import { CollapsibleSection, ExpandCollapseAll, useCollapsedSections } from "../CollapsibleSection.jsx";
 import {
   courtFor,
   memberName,
@@ -576,7 +577,7 @@ function OverrideStartModal({ match, data, command, onClose, onSaved }) {
   );
 }
 
-function MatchTable({ data, rows, busy, run, command, load }) {
+function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
   const [editingPlayersId, setEditingPlayersId] = useState(null);
   const editingPlayersMatch = editingPlayersId ? rows.find((m) => m.id === editingPlayersId) : null;
   const [overrideStartId, setOverrideStartId] = useState(null);
@@ -588,11 +589,11 @@ function MatchTable({ data, rows, busy, run, command, load }) {
     <Table
       responsive
       columns={[
-        {
+        ...(hideDivision ? [] : [{
           key: "division",
           header: "Division",
           render: (m) => data.divisions.find((d) => d.id === m.division_id)?.name || "—",
-        },
+        }]),
         {
           key: "match",
           header: "Match",
@@ -760,6 +761,48 @@ function DivisionMatchWindows({ data }) {
   );
 }
 
+const OTHER_GROUP_ID = "__other__";
+
+// Splits rows into per-division groups in the Divisions tab's order; rows
+// whose division isn't known (shouldn't happen, but never drop a match) go
+// into a trailing "Other" group. Empty groups are omitted.
+function groupByDivision(rows, divisions) {
+  const known = new Set(divisions.map((d) => d.id));
+  const groups = divisions
+    .map((d) => ({ id: d.id, name: d.name, rows: rows.filter((m) => m.division_id === d.id) }))
+    .filter((g) => g.rows.length > 0);
+  const orphans = rows.filter((m) => !known.has(m.division_id));
+  if (orphans.length) groups.push({ id: OTHER_GROUP_ID, name: "Other", rows: orphans });
+  return groups;
+}
+
+function countLabel(n, label) {
+  return n ? `${n} ${label}` : null;
+}
+
+// One collapsible section per division, each holding the same MatchTable the
+// flat view uses (minus the now-redundant Division column). With a single
+// division there's nothing to navigate between, so the flat table is kept.
+function DivisionMatchGroups({ data, rows, sections, summaryFor, tableProps }) {
+  const groups = groupByDivision(rows, data.divisions);
+  if (groups.length <= 1) return <MatchTable data={data} rows={rows} {...tableProps} />;
+  return (
+    <div className="collapsible-list">
+      {groups.map((g) => (
+        <CollapsibleSection
+          key={g.id}
+          title={g.name}
+          summary={summaryFor(g)}
+          open={sections.isOpen(g.id)}
+          onToggle={() => sections.toggle(g.id)}
+        >
+          <MatchTable data={data} rows={g.rows} hideDivision {...tableProps} />
+        </CollapsibleSection>
+      ))}
+    </div>
+  );
+}
+
 export function MatchesPanel({ data, busy, run, command, load }) {
   const [showCompleted, setShowCompleted] = useState(false);
   const rows = playableMatches(data.matches);
@@ -768,6 +811,18 @@ export function MatchesPanel({ data, busy, run, command, load }) {
   const completed = rows.filter((m) => m.status === "completed" || m.status === "bye");
   const held = rows.filter((m) => m.status === "postponed");
   const other = rows.filter((m) => !live.includes(m) && !upcoming.includes(m) && !completed.includes(m));
+  const queued = upcoming.concat(other);
+  const tournamentId = data.tournament?.id || "";
+  const queuedSections = useCollapsedSections(`resetiq:collapsed:matches-upcoming:${tournamentId}`);
+  const completedSections = useCollapsedSections(`resetiq:collapsed:matches-completed:${tournamentId}`);
+  const queuedIds = groupByDivision(queued, data.divisions).map((g) => g.id);
+  const completedIds = groupByDivision(completed, data.divisions).map((g) => g.id);
+  const queuedSummary = (g) => [
+    countLabel(g.rows.filter((m) => m.status !== "postponed").length, "upcoming"),
+    countLabel(g.rows.filter((m) => m.status === "postponed").length, "on hold"),
+    countLabel(live.filter((m) => m.division_id === g.id).length, "live"),
+  ].filter(Boolean).join(" · ");
+  const completedSummary = (g) => `${g.rows.length} completed`;
 
   return (
     <div className="stack">
@@ -792,23 +847,45 @@ export function MatchesPanel({ data, busy, run, command, load }) {
       )}
 
       <div>
-        <div className="section-label">Upcoming</div>
-        {upcoming.length + other.length === 0 ? (
+        <div className="row section-label-row">
+          <div className="section-label" style={{ margin: 0 }}>Upcoming</div>
+          <ExpandCollapseAll ids={queuedIds} sections={queuedSections} />
+        </div>
+        {queued.length === 0 ? (
           <EmptyState title="Nothing queued">Generate a bracket and assign courts and umpires to schedule matches.</EmptyState>
         ) : (
-          <MatchTable data={data} rows={upcoming.concat(other)} busy={busy} run={run} command={command} load={load} />
+          <DivisionMatchGroups
+            data={data}
+            rows={queued}
+            sections={queuedSections}
+            summaryFor={queuedSummary}
+            tableProps={{ busy, run, command, load }}
+          />
         )}
       </div>
 
       {completed.length > 0 && (
         <div>
-          <div className="row" style={{ justifyContent: "space-between" }}>
+          <div className="row section-label-row">
             <div className="section-label" style={{ margin: 0 }}>Completed ({completed.length})</div>
-            <Button variant="ghost" className="compact" onClick={() => setShowCompleted((v) => !v)}>
-              {showCompleted ? "Hide" : "Show"}
-            </Button>
+            <div className="row" style={{ gap: 6 }}>
+              {showCompleted && <ExpandCollapseAll ids={completedIds} sections={completedSections} />}
+              <Button variant="ghost" className="compact" onClick={() => setShowCompleted((v) => !v)}>
+                {showCompleted ? "Hide" : "Show"}
+              </Button>
+            </div>
           </div>
-          {showCompleted && <div className="reveal"><MatchTable data={data} rows={completed} busy={busy} run={run} /></div>}
+          {showCompleted && (
+            <div className="reveal">
+              <DivisionMatchGroups
+                data={data}
+                rows={completed}
+                sections={completedSections}
+                summaryFor={completedSummary}
+                tableProps={{ busy, run }}
+              />
+            </div>
+          )}
         </div>
       )}
     </div>

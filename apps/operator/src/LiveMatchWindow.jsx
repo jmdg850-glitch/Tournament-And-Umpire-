@@ -108,6 +108,11 @@ export default function LiveMatchWindow({ supabase, session, tournamentId, match
     };
   }, [load]);
 
+  // Name the window by its match, so several open pop-outs are distinguishable
+  // in the taskbar (the page <title> otherwise reads "RESETIQ Operator").
+  const windowTitle = match ? `Live · ${sideOf(match.id, "A", data).name} vs ${sideOf(match.id, "B", data).name}` : "Live match";
+  useEffect(() => { document.title = windowTitle; }, [windowTitle]);
+
   if (!session) {
     return (
       <div className="live-window">

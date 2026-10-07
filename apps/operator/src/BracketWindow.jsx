@@ -6,6 +6,8 @@ import { useRealtimeChannel } from "./useRealtimeChannel.js";
 import { useSavedDeskData } from "./useSavedDeskData.js";
 import OfflineStatusBanner from "./OfflineStatusBanner.jsx";
 import { DivisionBracketCard } from "./brackets.jsx";
+import { ExpandCollapseAll, useCollapsedSections } from "./CollapsibleSection.jsx";
+import { playableMatches } from "./lib.js";
 
 // A read-only, display-first bracket view opened in its own window (see
 // useRealtimeChannel.js's openBracketWindow and TournamentDesk's Live window
@@ -47,6 +49,14 @@ export default function BracketWindow({ supabase, session, repository, tournamen
     };
   }, [load]);
 
+  // Divisions can be collapsed to their header so a large tournament doesn't
+  // mean scrolling past every bracket to reach the next division.
+  const sections = useCollapsedSections(`resetiq:collapsed:bracket-window:${tournamentId}`);
+  const tournamentName = data?.tournament?.name;
+  useEffect(() => {
+    document.title = tournamentName ? `Bracket · ${tournamentName}` : "Bracket";
+  }, [tournamentName]);
+
   if (!session) {
     return (
       <div className="live-window">
@@ -76,13 +86,24 @@ export default function BracketWindow({ supabase, session, repository, tournamen
     );
   }
 
+  const divisionIds = data.divisions.map((d) => d.id);
+  const liveCount = playableMatches(data.matches).filter((m) => m.status === "in_progress").length;
+  const summary = [
+    `${data.divisions.length} ${data.divisions.length === 1 ? "division" : "divisions"}`,
+    liveCount ? `${liveCount} live` : null,
+  ].filter(Boolean).join(" · ");
+
   return (
-    <div className="live-window" data-readonly="true">
-      <header className="live-window-top">
-        <div className="kicker" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-          <Trophy size={13} aria-hidden="true" /> Bracket
+    <div className="live-window" data-readonly="true" data-view="bracket">
+      <header className="live-window-top display-window-header">
+        <div className="display-window-heading">
+          <div className="kicker" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <Trophy size={13} aria-hidden="true" /> Bracket
+          </div>
+          <h1>{data.tournament.name}</h1>
+          <p className="display-window-summary">{summary}</p>
         </div>
-        <h1>{data.tournament.name}</h1>
+        <ExpandCollapseAll ids={divisionIds} sections={sections} />
       </header>
       <OfflineStatusBanner load={bannerLoad} identityMode={identityMode} onRetry={load} />
       {error ? <Alert>{error}</Alert> : null}
@@ -91,7 +112,7 @@ export default function BracketWindow({ supabase, session, repository, tournamen
       ) : (
         <div className="stack">
           {data.divisions.map((d) => (
-            <DivisionBracketCard key={d.id} division={d} data={data} />
+            <DivisionBracketCard key={d.id} division={d} data={data} open={sections.isOpen(d.id)} onToggle={() => sections.toggle(d.id)} />
           ))}
         </div>
       )}

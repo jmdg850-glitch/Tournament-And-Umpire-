@@ -1,9 +1,10 @@
 import { useRef, useState } from "react";
 import { Alert, Badge, Button, Card, EmptyState, SectionHeader, StandingsTable, StatusBadge, useToast } from "@tournament/ui";
 import { ExternalLink } from "lucide-react";
-import { courtFor, isTeamMatchup, membersOfParticipant, personLabel, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor, unresolvedTieGroups } from "./lib.js";
+import { courtFor, isTeamMatchup, membersOfParticipant, personLabel, playableMatches, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor, unresolvedTieGroups } from "./lib.js";
 import BracketImportModal from "./BracketImportModal.jsx";
 import { openBracketWindow } from "./useRealtimeChannel.js";
+import { CollapsibleSection, ExpandCollapseAll, useCollapsedSections } from "./CollapsibleSection.jsx";
 
 // A pair's `name` (from sideOf) is a single flat string, e.g. "Alice Smith /
 // Bob Jones" — shows the individual members on a small muted sub-line below
@@ -101,6 +102,7 @@ function TeamEliminationBoard({ division, data }) {
         </div>
       )}
 
+      {standings.length > 0 && <h3>Standings</h3>}
       {standings.length > 0 && (
         <StandingsTable
           rows={standings.map((row) => ({
@@ -179,20 +181,53 @@ function SingleElimBoard({ division, data }) {
 // (BracketsPanel below) and the standalone BracketWindow display (opened in
 // its own window/monitor, see useRealtimeChannel.js's openBracketWindow) show
 // the exact same bracket rendering/data logic. Never duplicate this.
-export function DivisionBracketCard({ division, data }) {
+//
+// Optionally collapsible: pass `open`/`onToggle` and the header (name,
+// format, match progress) stays visible while the board itself is hidden.
+// Without them the card is always expanded, exactly as before.
+export function DivisionBracketCard({ division, data, open, onToggle }) {
+  const formatBadge = <Badge>{division.format === "team_elimination" ? "Team elimination" : division.format === "single_elim" ? "Single elimination" : "Round robin"}</Badge>;
+  const board = division.format === "team_elimination" ? (
+    <TeamEliminationBoard division={division} data={data} />
+  ) : (
+    <SingleElimBoard division={division} data={data} />
+  );
+  if (!onToggle) {
+    return (
+      <Card className="stack">
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <h2>{division.name}</h2>
+          {formatBadge}
+        </div>
+        {board}
+      </Card>
+    );
+  }
   return (
-    <Card className="stack">
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <h2>{division.name}</h2>
-        <Badge>{division.format === "team_elimination" ? "Team elimination" : division.format === "single_elim" ? "Single elimination" : "Round robin"}</Badge>
-      </div>
-      {division.format === "team_elimination" ? (
-        <TeamEliminationBoard division={division} data={data} />
-      ) : (
-        <SingleElimBoard division={division} data={data} />
-      )}
+    <Card className="bracket-division-card">
+      <CollapsibleSection
+        title={division.name}
+        headingLevel={2}
+        summary={bracketProgress(division, data)}
+        actions={formatBadge}
+        open={open}
+        onToggle={onToggle}
+      >
+        {board}
+      </CollapsibleSection>
     </Card>
   );
+}
+
+// Header summary only — a count of what's already in data.matches for this
+// division (no bracket logic), using the same playableMatches filter as the
+// Matches tab (team matchups are containers for their pair matches).
+function bracketProgress(division, data) {
+  const matches = playableMatches(data.matches).filter((m) => m.division_id === division.id && m.status !== "bye");
+  if (!matches.length) return "No matches yet";
+  const done = matches.filter((m) => m.status === "completed").length;
+  const live = matches.filter((m) => m.status === "in_progress").length;
+  return [`${done}/${matches.length} matches complete`, live ? `${live} live` : null].filter(Boolean).join(" · ");
 }
 
 export function BracketsPanel({ data, command, load }) {
@@ -200,6 +235,8 @@ export function BracketsPanel({ data, command, load }) {
   const [importAnalysis, setImportAnalysis] = useState(null);
   const [importError, setImportError] = useState("");
   const toast = useToast();
+  const sections = useCollapsedSections(`resetiq:collapsed:brackets:${data.tournament?.id || ""}`);
+  const divisionIds = data.divisions.map((d) => d.id);
 
   async function exportBracket() {
     const { buildBracketExportWorkbook, downloadWorkbook, safeFileNamePart } = await import("./excelImportExport.js");
@@ -240,6 +277,7 @@ export function BracketsPanel({ data, command, load }) {
         description="Export to Excel, edit players manually, then import the changes back."
         actions={(
           <>
+            <ExpandCollapseAll ids={divisionIds} sections={sections} />
             <Button type="button" variant="secondary" onClick={() => openBracketWindow(data.tournament?.id)}>
               Open Bracket Window <ExternalLink size={15} aria-hidden="true" />
             </Button>
@@ -273,7 +311,7 @@ export function BracketsPanel({ data, command, load }) {
         />
       )}
       {data.divisions.map((d) => (
-        <DivisionBracketCard key={d.id} division={d} data={data} />
+        <DivisionBracketCard key={d.id} division={d} data={data} open={sections.isOpen(d.id)} onToggle={() => sections.toggle(d.id)} />
       ))}
     </div>
   );

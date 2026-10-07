@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Alert, Badge, EmptyState, LoadingState, StatusBadge } from "@tournament/ui";
 import { ClipboardList } from "lucide-react";
 import { applyDeskRealtime, divisionDisplayChannelName, removeById, upsertById } from "@tournament/engine";
@@ -6,6 +6,7 @@ import { useRealtimeChannel } from "./useRealtimeChannel.js";
 import { useSavedDeskData } from "./useSavedDeskData.js";
 import OfflineStatusBanner from "./OfflineStatusBanner.jsx";
 import { courtFor, resultFor, scoreLine, sideOf, stageTitle, umpireFor } from "./lib.js";
+import { CollapsibleSection, useCollapsedSections } from "./CollapsibleSection.jsx";
 
 // A read-only, division-scoped match display — see useRealtimeChannel.js's
 // openMatchDisplayWindow. Every division can have its own one of these open at
@@ -72,6 +73,15 @@ export default function MatchDisplayWindow({ supabase, session, repository, tour
     };
   }, [load]);
 
+  // Completed starts collapsed (as before); any group the operator opens or
+  // closes is remembered for this division's window on this computer.
+  const sections = useCollapsedSections(`resetiq:collapsed:match-window:${divisionId}`, ["completed"]);
+  const divisionName = division?.name;
+  const tournamentName = data?.tournament?.name;
+  useEffect(() => {
+    document.title = [divisionName, "Matches", tournamentName].filter(Boolean).join(" · ");
+  }, [divisionName, tournamentName]);
+
   if (!session) {
     return (
       <div className="live-window">
@@ -100,13 +110,22 @@ export default function MatchDisplayWindow({ supabase, session, repository, tour
   const held = matches.filter((m) => m.status === "postponed");
   const completed = matches.filter((m) => m.status === "completed" || m.status === "bye");
 
+  const summary = [
+    `${upcoming.length} upcoming`,
+    held.length ? `${held.length} on hold` : null,
+    `${completed.length} completed`,
+  ].filter(Boolean).join(" · ");
+
   return (
-    <div className="live-window" data-readonly="true">
-      <header className="live-window-top">
-        <div className="kicker" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-          <ClipboardList size={13} aria-hidden="true" /> {data.tournament?.name}
+    <div className="live-window" data-readonly="true" data-view="matches">
+      <header className="live-window-top display-window-header">
+        <div className="display-window-heading">
+          <div className="kicker" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <ClipboardList size={13} aria-hidden="true" /> Matches{data.tournament?.name ? ` · ${data.tournament.name}` : ""}
+          </div>
+          <h1>{division.name}</h1>
+          <p className="display-window-summary">{summary}</p>
         </div>
-        <h1>{division.name}</h1>
         {live.length > 0 ? <Badge tone="live">{live.length} live</Badge> : null}
       </header>
       <OfflineStatusBanner load={bannerLoad} identityMode={identityMode} onRetry={load} />
@@ -117,43 +136,37 @@ export default function MatchDisplayWindow({ supabase, session, repository, tour
       ) : (
         <div className="stack display-match-groups">
           {live.length > 0 && (
-            <DisplayMatchGroup title="Live now" tone="live" matches={live} data={data} />
+            <DisplayMatchGroup id="live" sections={sections} title="Live now" tone="live" matches={live} data={data} />
           )}
           {held.length > 0 && (
-            <DisplayMatchGroup title="On hold" tone="warn" matches={held} data={data} />
+            <DisplayMatchGroup id="held" sections={sections} title="On hold" tone="warn" matches={held} data={data} />
           )}
-          <DisplayMatchGroup title="Upcoming" matches={upcoming} data={data} empty="Nothing queued right now." />
-          <DisplayMatchGroup title="Completed" matches={completed} data={data} empty="No completed matches yet." collapsedByDefault />
+          <DisplayMatchGroup id="upcoming" sections={sections} title="Upcoming" matches={upcoming} data={data} empty="Nothing queued right now." />
+          <DisplayMatchGroup id="completed" sections={sections} title="Completed" matches={completed} data={data} empty="No completed matches yet." />
         </div>
       )}
     </div>
   );
 }
 
-function DisplayMatchGroup({ title, tone, matches, data, empty, collapsedByDefault }) {
-  const [open, setOpen] = useState(!collapsedByDefault);
+function DisplayMatchGroup({ id, sections, title, tone, matches, data, empty }) {
   return (
-    <section className="display-match-group">
-      <button
-        type="button"
-        className="display-match-group-toggle"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-      >
-        <span className={`section-label${tone ? ` tone-${tone}` : ""}`} style={{ margin: 0 }}>{title} ({matches.length})</span>
-      </button>
-      {open && (
-        matches.length === 0 ? (
-          empty ? <p className="muted display-match-empty">{empty}</p> : null
-        ) : (
-          <div className="stack display-match-rows reveal">
-            {matches.map((m) => (
-              <DisplayMatchRow key={m.id} match={m} data={data} />
-            ))}
-          </div>
-        )
+    <CollapsibleSection
+      className={`display-match-group${tone ? ` tone-${tone}` : ""}`}
+      title={`${title} (${matches.length})`}
+      open={sections.isOpen(id)}
+      onToggle={() => sections.toggle(id)}
+    >
+      {matches.length === 0 ? (
+        empty ? <p className="muted display-match-empty">{empty}</p> : null
+      ) : (
+        <div className="display-match-rows">
+          {matches.map((m) => (
+            <DisplayMatchRow key={m.id} match={m} data={data} />
+          ))}
+        </div>
       )}
-    </section>
+    </CollapsibleSection>
   );
 }
 

@@ -156,12 +156,91 @@ input, select, textarea { background: #fff; }
   font-weight: 700;
   margin-bottom: var(--space-2);
 }
+.section-label-row {
+  justify-content: space-between;
+  margin-bottom: var(--space-2);
+  min-height: 34px;
+}
+
+/* ── Collapsible sections (CollapsibleSection.jsx) ─────────────────────────
+   Per-division groups on the Matches/Brackets tabs and in the pop-out
+   windows. The whole header row is the toggle; a chevron shows the state.
+   Colours inherit, so the same rules work on the light workspace and inside
+   the always-dark .live-window. */
+.collapsible-list { display: grid; gap: var(--space-2); }
+.collapsible-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.collapsible-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 8px 4px 8px 26px;
+  position: relative;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius);
+  text-align: left;
+  color: inherit;
+}
+.collapsible-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.collapsible-chevron {
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  margin-top: -8px;
+  color: var(--muted);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.collapsible[data-open="true"] > .collapsible-head .collapsible-chevron { transform: rotate(90deg); }
+.collapsible-title { font-size: 1rem; overflow-wrap: anywhere; }
+.collapsible-summary { color: var(--muted); font-size: var(--text-sm); }
+.collapsible-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.collapsible-body { padding-top: var(--space-2); }
+@media (hover: hover) {
+  .collapsible-toggle:hover .collapsible-chevron { color: var(--text); }
+}
+/* Matches tab: a quiet divider between division groups. */
+.collapsible-list > .collapsible + .collapsible { border-top: 1px solid var(--border); padding-top: var(--space-2); }
+
+/* Brackets: the division card's header is the toggle. */
+.bracket-division-card .collapsible-title { font-size: var(--text-md); margin: 0; }
+.bracket-division-card .collapsible-body { display: grid; gap: 14px; padding-top: var(--space-3); }
+/* Rounds share the available width (up to a readable max) instead of
+   leaving empty space beside a short bracket; still scroll sideways when a
+   bracket has more rounds than fit. */
+.bracket > .round { flex: 1 0 220px; max-width: 320px; }
+
+/* Pop-out window header: title block on the left, window-level controls on
+   the right; summary line gives the at-a-glance counts. */
+.display-window-header { justify-content: space-between; align-items: flex-start; }
+.display-window-heading { min-width: 0; }
+.display-window-summary { margin: 6px 0 0; color: #9099a8; font-size: var(--text-sm); }
+.live-window .collapsible-chevron,
+.live-window .collapsible-summary { color: #9099a8; }
+@media (hover: hover) {
+  .live-window .collapsible-toggle:hover .collapsible-chevron { color: #eef1f4; }
+  .live-window .panel .collapsible-toggle:hover .collapsible-chevron { color: var(--text); }
+}
+.live-window > .display-window-header .btn.ghost { color: #c9d0db; }
+.live-window > .display-window-header .btn.ghost:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); }
+/* Bracket cards are light surfaces inside the dark window — restore the
+   light-theme colours for anything inside them. */
+.live-window .panel .collapsible-chevron,
+.live-window .panel .collapsible-summary { color: var(--muted); }
+.live-window .panel { color: var(--text); }
 
 .live-window {
   min-height: 100dvh;
   background: var(--shell-bg);
   color: #eef1f4;
-  padding: 24px 20px 36px;
+  padding: clamp(20px, 3vw, 36px) clamp(16px, 3vw, 40px) 36px;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -269,20 +348,33 @@ input, select, textarea { background: #fff; }
    dark, "stadium" styling) rather than pulling --surface/--border, which are
    light in the operator app's own theme. */
 .display-match-groups { gap: 22px; }
-.display-match-group-toggle {
-  background: transparent;
-  border: 0;
-  padding: 0;
-  margin: 0 0 10px;
-  cursor: pointer;
-  width: 100%;
-  text-align: left;
+/* Group headings keep the small uppercase section-label look; tone colours
+   the label for Live / On hold. */
+.display-match-group .collapsible-title {
+  font-family: inherit;
+  font-size: var(--text-xs);
+  letter-spacing: 0.14em;
+  color: #9099a8;
 }
-.display-match-group-toggle .section-label { color: #9099a8; }
-.display-match-group-toggle .section-label.tone-live { color: var(--live); }
-.display-match-group-toggle .section-label.tone-warn { color: var(--warn); }
+.display-match-group.tone-live .collapsible-title { color: var(--live); }
+.display-match-group.tone-warn .collapsible-title { color: var(--warn); }
 .display-match-empty { margin: 0; color: #8b93a1; }
-.display-match-rows { gap: 10px; }
+/* Rows flow into 2–3 columns on wide windows/TVs instead of stretching into
+   long bars; a single column on narrow windows. */
+.display-match-rows {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 440px), 1fr));
+  gap: 10px;
+}
+/* As grid cards, every row uses the same layout (names + meta, then score
+   and status) rather than wrapping differently by name length. */
+.display-match-rows .display-match-row {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 10px;
+}
+.display-match-rows .display-match-row-side { justify-content: space-between; }
 .display-match-row {
   display: flex;
   align-items: center;
