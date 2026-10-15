@@ -5,6 +5,7 @@ import { clearStation, parsePairingInput, readStation, writeStation, stationDevi
 import { canUmpireSetGameTime, markLocalCompletion, timerDisplayMatch } from "./timerDisplay.js";
 import { friendlyError, syncChipState } from "./umpireText.js";
 import { hasUndoablePoint, matchPointPreview } from "./scoringGuards.js";
+import { TIMEOUT_DURATIONS_MIN, clearMatchTimeout, readTimeout, startTimeout, timeoutView, writeTimeout } from "./timeoutClock.js";
 import PairingScanner from "./PairingScanner.jsx";
 import CoinTossPanel from "./CoinTossPanel.jsx";
 import {
@@ -27,7 +28,7 @@ import {
   StatusBadge,
   useNow,
 } from "@tournament/ui";
-import { ArrowLeft, LogOut, PauseCircle, Pencil, QrCode, Undo2 } from "lucide-react";
+import { ArrowLeft, LogOut, PauseCircle, Pencil, QrCode, Timer, Undo2 } from "lucide-react";
 import { version as APP_VERSION } from "../package.json";
 
 function isStationInactiveError(err) {
@@ -1116,6 +1117,61 @@ function MatchGameTimer({ match, onExpire }) {
   return <GameTimer view={view} clock={formatClock(view.remainingMs)} />;
 }
 
+// The device storage used for the umpire timeout (see timeoutClock.js). Any
+// access failure (private mode, blocked storage) means "not persisted".
+function timeoutStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+// Running timeout countdown. Remaining time is endsAt − now (useNow ticks and
+// re-reads on visibility), so backgrounding or sleep never resets or extends
+// it. `onExpire` fires once when it reaches 0:00. Score and play controls
+// are not affected.
+function TimeoutBanner({ rec, onEnd, onExpire }) {
+  const now = useNow(timeoutView(rec, Date.now()).active, 500);
+  const view = timeoutView(rec, now);
+  const wasActive = useRef(view.active);
+  useEffect(() => {
+    if (wasActive.current && !view.active) onExpire();
+    wasActive.current = view.active;
+  }, [view.active, onExpire]);
+  if (!view.active) return null;
+  return (
+    <div className="ump-timeout" role="status" aria-live="polite">
+      <span className="ump-timeout-label">
+        <Timer size={16} aria-hidden="true" /> <strong>TIMEOUT</strong>
+        <span className="ump-timeout-clock">{formatClock(view.remainingMs)}</span>
+        <span className="muted"> left</span>
+      </span>
+      <Button variant="secondary" className="compact" onClick={onEnd}>End timeout</Button>
+    </div>
+  );
+}
+
+function TimeoutModal({ onClose, onStart }) {
+  return (
+    <Modal title="Start a timeout" onClose={onClose}>
+      <div className="stack">
+        <p className="muted ump-modal-text">
+          Choose the length. The countdown runs on this device only — the score, the game timer and the match are not changed.
+        </p>
+        <div className="ump-timeout-choices">
+          {TIMEOUT_DURATIONS_MIN.map((min) => (
+            <Button key={min} variant="secondary" onClick={() => onStart(min)}>{min} min</Button>
+          ))}
+        </div>
+        <div className="ump-modal-actions">
+          <Button variant="ghost" onClick={onClose}>Cancel</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // Game-time setup for the assigned umpire, before the match has ever started.
 // Online only (set_match_timer is authorized and validated on the server);
 // setting a time never starts the countdown — start_match does.
@@ -1525,6 +1581,43 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const participants = base?.participants || [];
   const court = base?.court || null;
 
+  // Device-local umpire timeout for this match (timeoutClock.js).
+  const [timeoutRec, setTimeoutRec] = useState(() => {
+    const saved = readTimeout(timeoutStorage(), owner, matchId);
+    if (saved && timeoutView(saved, Date.now()).active) return saved;
+    if (saved) clearMatchTimeout(timeoutStorage(), owner, matchId); // ended while away
+    return null;
+  });
+  const [showTimeout, setShowTimeout] = useState(false);
+  const [timeoutOver, setTimeoutOver] = useState(false);
+  const startMatchTimeout = useCallback((minutes) => {
+    setShowTimeout(false);
+    setTimeoutOver(false);
+    setTimeoutRec((current) => {
+      const next = startTimeout(current, minutes, Date.now());
+      if (!next || next === current) return current;
+      writeTimeout(timeoutStorage(), owner, matchId, next);
+      return next;
+    });
+  }, [owner, matchId]);
+  const endMatchTimeout = useCallback(({ expired = false } = {}) => {
+    clearMatchTimeout(timeoutStorage(), owner, matchId);
+    setTimeoutRec(null);
+    setTimeoutOver(expired);
+  }, [owner, matchId]);
+  const onTimeoutExpire = useCallback(() => endMatchTimeout({ expired: true }), [endMatchTimeout]);
+  // A timeout only belongs to a match in play: drop it once the match is
+  // held, completed or otherwise leaves in_progress.
+  const liveStatus = match?.status;
+  useEffect(() => {
+    if (liveStatus && liveStatus !== "in_progress" && timeoutRec) endMatchTimeout();
+  }, [liveStatus, timeoutRec, endMatchTimeout]);
+  useEffect(() => {
+    if (!timeoutOver) return undefined;
+    const t = window.setTimeout(() => setTimeoutOver(false), 5000);
+    return () => window.clearTimeout(t);
+  }, [timeoutOver]);
+
   // Keep the allocator at or above everything known for this match (confirmed
   // lastSeq and every seq already in the queue) — it never goes backwards.
   useEffect(() => {
@@ -1928,6 +2021,12 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
             )}
           </p>
         )}
+        {scoring && timeoutRec && (
+          <TimeoutBanner rec={timeoutRec} onEnd={() => endMatchTimeout()} onExpire={onTimeoutExpire} />
+        )}
+        {scoring && timeoutOver && !timeoutRec && (
+          <div className="ump-timeout ump-timeout-over" role="status">Timeout over — resume play.</div>
+        )}
         {showPendingNote && (
           <div className="ump-pending-note">
             <span>
@@ -2107,6 +2206,13 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
               <Button variant="secondary" className="ump-undo" disabled={busy || actionsLocked || nothingToUndo} onClick={() => setConfirmUndo(true)}>
                 <Undo2 size={18} aria-hidden="true" /> Undo last point
               </Button>
+              <Button
+                variant="secondary"
+                disabled={timeoutView(timeoutRec, Date.now()).active}
+                onClick={() => setShowTimeout(true)}
+              >
+                <Timer size={16} aria-hidden="true" /> Timeout
+              </Button>
               {canCorrect && (
                 <Button variant="ghost" disabled={actionsLocked} onClick={() => setShowEditScore(true)}>
                   <Pencil size={16} aria-hidden="true" /> Edit score
@@ -2147,6 +2253,10 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
           </Card>
         )}
       </div>
+
+      {showTimeout && scoring && (
+        <TimeoutModal onClose={() => setShowTimeout(false)} onStart={startMatchTimeout} />
+      )}
 
       {showEditScore && (
         <EditScoreModal

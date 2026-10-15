@@ -6,7 +6,7 @@
 // of resolvePersonByName/normalizePersonName, fully exercised below.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizePersonName, resolvePersonByName, liveShareUrl, resolveShareOrigin, PUBLIC_LIVE_PRODUCTION_ORIGIN, scoringTargetFor, nextSeqAfterOutOfOrder, teamStandings, unresolvedTieGroups } from "./lib.js";
+import { normalizePersonName, resolvePersonByName, liveShareUrl, resolveShareOrigin, PUBLIC_LIVE_PRODUCTION_ORIGIN, scoringTargetFor, nextSeqAfterOutOfOrder, teamStandings, unresolvedTieGroups, doubleEntryIndex, doubleEntryNameKey } from "./lib.js";
 
 const persons = [
   { id: "p1", display_name: "Rem" },
@@ -215,4 +215,33 @@ test("unresolvedTieGroups: names only the pairs the engine flagged as tied on ev
   const row = (registrationId, wins, pointDiff, pointsFor, tieUnresolved) => ({ registrationId, wins, losses: 4 - wins, pointDiff, pointsFor, tieUnresolved });
   assert.deepEqual(unresolvedTieGroups([row("k", 4, 15, 44, false), row("j", 3, 2, 40, true), row("g", 3, 2, 40, true)], data), [["JEFFREY / REM", "GRACE / REIN"]]);
   assert.deepEqual(unresolvedTieGroups([row("k", 4, 15, 44, false), row("j", 3, 2, 40, false), row("g", 3, 2, 38, false)], data), []);
+});
+
+test("doubleEntryIndex: flags names registered in 2+ distinct divisions only", () => {
+  const data = {
+    divisions: [{ id: "md", name: "Men's Doubles" }, { id: "xd", name: "Mixed Doubles" }],
+    persons: [
+      { id: "p1", display_name: "Juan Dela Cruz" },
+      { id: "p2", display_name: "Pedro Santos" },
+      { id: "p3", display_name: "Maria" },
+      { id: "p4", display_name: " JUAN  dela cruz" }, // separate record, same normalized name
+    ],
+    participants: [
+      { id: "e1", division_id: "md" },
+      { id: "e2", division_id: "xd" },
+      { id: "e3", division_id: "md" },
+    ],
+    participantMembers: [
+      { participant_id: "e1", person_id: "p1" },
+      { participant_id: "e1", person_id: "p2" },
+      { participant_id: "e2", person_id: "p4" },
+      { participant_id: "e2", person_id: "p3" },
+      { participant_id: "e3", person_id: "p2" }, // Pedro twice in md: same division, not a double entry
+    ],
+  };
+  const index = doubleEntryIndex(data);
+  assert.deepEqual(index.get(doubleEntryNameKey("Juan Dela Cruz")), ["Men's Doubles", "Mixed Doubles"]);
+  assert.equal(index.has(doubleEntryNameKey("Pedro Santos")), false);
+  assert.equal(index.has(doubleEntryNameKey("Maria")), false);
+  assert.equal(index.size, 1);
 });

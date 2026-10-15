@@ -7,11 +7,14 @@
 import * as XLSX from "xlsx";
 import {
   courtFor,
+  doubleEntryNameKey,
   finalMatchOf,
+  findDoubleEntries,
   membersOfParticipant,
   personLabel,
   placementsForDivision,
   playableMatches,
+  registrationEntries,
   resultFor,
   scoreLine,
   sideOf,
@@ -224,7 +227,28 @@ export function parsePlayerWorkbook(arrayBuffer) {
 // (Add New / Update Existing / Skip Existing) at import time.
 export function analyzePlayerRows(rows, data, { hasEntryTypeColumn = false } = {}) {
   const existingById = new Map(data.persons.map((p) => [p.id, p]));
-  const existingByName = new Map(data.persons.map((p) => [normKey(p.display_name), p]));
+  // Names are matched case-insensitively with whitespace collapsed (the same
+  // key the DOUBLE ENTRY badge uses). A name shared by several existing
+  // players is ambiguous: such a row must carry a Player ID, never be
+  // attached to one of them silently.
+  const existingByName = new Map(data.persons.map((p) => [doubleEntryNameKey(p.display_name), p]));
+  const existingNameCount = new Map();
+  for (const p of data.persons) {
+    const key = doubleEntryNameKey(p.display_name);
+    existingNameCount.set(key, (existingNameCount.get(key) || 0) + 1);
+  }
+  const ambiguousNameError = (name) => {
+    const n = existingNameCount.get(doubleEntryNameKey(name)) || 0;
+    return n > 1 ? `${n} players are named "${name}" — add their Player ID (from Export Players) to choose one` : null;
+  };
+  // Persons already registered per division, for "register existing into a
+  // new division" (Add New mode) and to skip ones already entered there.
+  const participantDivision = new Map((data.participants || []).map((p) => [p.id, p.division_id]));
+  const registeredInDivision = new Set(
+    (data.participantMembers || [])
+      .filter((m) => participantDivision.has(m.participant_id))
+      .map((m) => `${participantDivision.get(m.participant_id)}|${m.person_id}`),
+  );
   const divisionsByName = new Map(data.divisions.map((d) => [normKey(d.name), d]));
   const seenNamesInFile = new Map();
   const seenIdsInFile = new Map();
@@ -261,7 +285,7 @@ export function analyzePlayerRows(rows, data, { hasEntryTypeColumn = false } = {
         errors.push(`Could not read two player names from "${row.playerName}" — use the format "Name 1 / Name 2"`);
       } else if (split?.names) {
         const [n1, n2] = split.names;
-        if (normKey(n1) === normKey(n2)) {
+        if (doubleEntryNameKey(n1) === doubleEntryNameKey(n2)) {
           errors.push("The same player cannot be selected twice in one pair");
         } else {
           pairNames = [n1, n2];
@@ -269,32 +293,49 @@ export function analyzePlayerRows(rows, data, { hasEntryTypeColumn = false } = {
       }
     }
 
+    // Within-file duplicates are scoped by division: the same player may
+    // appear once per division (cross-division participation is allowed —
+    // see DOUBLE ENTRY below), but twice in one division is still an error.
+    const divisionScope = normKey(row.division);
+
     let existingPerson = null;
     if (pairNames) {
       // Each half is resolved exactly like an ordinary single-name row would
       // be (case-insensitive match against existing players; unmatched
       // names are simply new players, not errors).
-      pairPersons = pairNames.map((name) => ({ name, existingPerson: existingByName.get(normKey(name)) || null }));
+      pairPersons = pairNames.map((name) => {
+        const ambiguous = ambiguousNameError(name);
+        if (ambiguous) errors.push(ambiguous);
+        return { name, existingPerson: ambiguous ? null : existingByName.get(doubleEntryNameKey(name)) || null };
+      });
     } else {
       if (row.playerId) {
-        const dup = seenIdsInFile.get(row.playerId);
+        const idKey = `${row.playerId}|${divisionScope}`;
+        const dup = seenIdsInFile.get(idKey);
         if (dup) errors.push(`Duplicate Player ID within file (also row ${dup})`);
-        seenIdsInFile.set(row.playerId, row.rowNumber);
+        else seenIdsInFile.set(idKey, row.rowNumber);
         if (!existingById.has(row.playerId)) errors.push("Player ID does not match any existing player in this tournament");
       }
       existingPerson = row.playerId ? existingById.get(row.playerId) || null : null;
-      if (!existingPerson && row.playerName) {
-        const byName = existingByName.get(normKey(row.playerName));
-        if (byName) existingPerson = byName;
+      if (!existingPerson && row.playerName && !row.playerId) {
+        const ambiguous = ambiguousNameError(row.playerName);
+        if (ambiguous) errors.push(ambiguous);
+        else existingPerson = existingByName.get(doubleEntryNameKey(row.playerName)) || null;
       }
     }
 
     // Duplicate-within-file detection covers both plain names and each half
     // of a pair, in the same map, so "Rem" as its own row and "Rem" as half
-    // of a later pair row are still caught as the same person.
-    const namesToTrack = pairNames || (row.playerName ? [row.playerName] : []);
-    for (const name of namesToTrack) {
-      const nameKey = normKey(name);
+    // of a later pair row are still caught as the same person. Identity is
+    // the resolved existing player when there is one (so two different
+    // players who share a name, told apart by Player ID, are not
+    // duplicates), otherwise the normalized name of the new player.
+    const identities = pairPersons
+      ? pairPersons.map((p) => ({ name: p.name, person: p.existingPerson }))
+      : row.playerName ? [{ name: row.playerName, person: existingPerson }] : [];
+    for (const { name, person } of identities) {
+      const identity = person ? `id:${person.id}` : `name:${doubleEntryNameKey(name)}`;
+      const nameKey = `${identity}|${divisionScope}`;
       const dupRow = seenNamesInFile.get(nameKey);
       if (dupRow && dupRow !== row.rowNumber) errors.push(`Duplicate player name within file (also row ${dupRow}): "${name}"`);
       if (!dupRow) seenNamesInFile.set(nameKey, row.rowNumber);
@@ -323,11 +364,14 @@ export function analyzePlayerRows(rows, data, { hasEntryTypeColumn = false } = {
       else seed = n;
     }
 
+    const resolvedPersons = pairPersons ? pairPersons.map((p) => p.existingPerson).filter(Boolean) : existingPerson ? [existingPerson] : [];
     return {
       ...row,
       errors,
       isEmptyRow: false,
       existingPerson,
+      // Some resolved existing player is already entered in this division.
+      alreadyInDivision: Boolean(division) && resolvedPersons.some((p) => registeredInDivision.has(`${division.id}|${p.id}`)),
       pairNames,
       pairPersons,
       // For a pair, "duplicate" means at least one half already exists —
@@ -340,6 +384,24 @@ export function analyzePlayerRows(rows, data, { hasEntryTypeColumn = false } = {
       seed,
     };
   });
+
+  // DOUBLE ENTRY (information only): a name entered in two or more
+  // divisions, across this file's valid rows plus existing registrations.
+  const fileEntryNames = (r) => r.pairNames || (r.playerName ? [r.playerName] : []);
+  const doubleEntries = findDoubleEntries([
+    ...registrationEntries(data),
+    ...analyzed
+      .filter((r) => !r.isEmptyRow && r.errors.length === 0 && r.division)
+      .flatMap((r) => fileEntryNames(r).map((name) => ({ name, divisionId: r.division.id, divisionName: r.division.name }))),
+  ]);
+  for (const r of analyzed) {
+    r.registerExisting = !r.isEmptyRow && r.errors.length === 0 && isRegistrableExisting(r);
+    r.doubleEntries = r.isEmptyRow || r.errors.length
+      ? []
+      : fileEntryNames(r)
+        .map((name) => ({ name, divisions: doubleEntries.get(doubleEntryNameKey(name)) }))
+        .filter((d) => d.divisions);
+  }
 
   const usable = analyzed.filter((r) => !r.isEmptyRow);
   const valid = usable.filter((r) => r.errors.length === 0);
@@ -355,8 +417,19 @@ export function analyzePlayerRows(rows, data, { hasEntryTypeColumn = false } = {
       invalid: invalid.length,
       newCount: newRows.length,
       duplicateCount: duplicateRows.length,
+      doubleEntryCount: valid.filter((r) => r.doubleEntries.length > 0).length,
+      // Existing players that Add New registers into a division they are not
+      // in yet (single-name Pair rows still need manual pairing).
+      registerExistingCount: duplicateRows.filter(isRegistrableExisting).length,
     },
   };
+}
+
+// An existing player (or pair with an existing half) whose row names a
+// division they are not entered in yet: Add New registers it, reusing the
+// existing player record(s) without renaming them.
+export function isRegistrableExisting(row) {
+  return Boolean(row.isDuplicate && row.division && !row.alreadyInDivision && (row.pairNames || row.entryType !== "Pair"));
 }
 
 // Builds the exact list of commands to run for a chosen duplicate-handling mode.

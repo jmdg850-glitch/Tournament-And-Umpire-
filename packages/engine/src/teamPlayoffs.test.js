@@ -466,3 +466,92 @@ describe("generateQualifierBracketShell — 3 qualifiers (regression)", () => {
     expect(pairMatches.length).toBe(1);
   });
 });
+
+// ---- Two-team semifinal crossover: SF1 = T1 R1 vs T2 R2, SF2 = T1 R2 vs T2 R1 ----
+describe("two-team semifinal crossover (2 teams x 2 qualifiers)", () => {
+  const build = pattern => {
+    const n = { A: 0, B: 0 };
+    return pattern.split("").map(t => q(`${t}${++n[t]}`, t));
+  };
+  const semiPair = (shell, pos) => {
+    const m = shell.teamMatchups.find(x => x.stage === "semifinal" && x.bracketPosition === pos);
+    return [m.pairAId, m.pairBId];
+  };
+
+  test("sample data: SF1 T1-A vs T2-B, SF2 T1-B vs T2-A", () => {
+    const qualifiers = [q("T1-A", "team1"), q("T2-A", "team2"), q("T1-B", "team1"), q("T2-B", "team2")];
+    const shell = generateQualifierBracketShell(qualifiers, { makeId: idGen(), sameTeamPolicy: "avoid_semis" });
+    expect(semiPair(shell, 0)).toEqual(["T1-A", "T2-B"]);
+    expect(semiPair(shell, 1)).toEqual(["T1-B", "T2-A"]);
+    expect(shell.conflicts).toEqual([]);
+  });
+
+  for (const policy of ["avoid_semis", "avoid_until_final"]) {
+    test.each(["AABB", "ABAB", "ABBA", "BAAB", "BABA", "BBAA"])(`${policy}, rank order %s: rank 1 always meets the other team's rank 2`, pattern => {
+      const qualifiers = build(pattern);
+      const t1 = qualifiers[0].teamId;
+      const t2 = t1 === "A" ? "B" : "A";
+      const shell = generateQualifierBracketShell(qualifiers, { makeId: idGen(), sameTeamPolicy: policy });
+      expect(semiPair(shell, 0)).toEqual([`${t1}1`, `${t2}2`]);
+      expect(semiPair(shell, 1)).toEqual([`${t1}2`, `${t2}1`]);
+      const placed = [...semiPair(shell, 0), ...semiPair(shell, 1)];
+      expect(new Set(placed).size).toBe(4);
+      expect(placed.slice().sort()).toEqual(ids(qualifiers).sort());
+    });
+  }
+
+  test("reversed input ordering and arbitrary ids: pairings follow each team's own rank order", () => {
+    // Team 2's pairs rank above Team 1's overall, so team2 becomes "Team 1".
+    const qualifiers = [q("uuid-9", "team2"), q("uuid-3", "team2"), q("uuid-7", "team1"), q("uuid-1", "team1")];
+    const shell = generateQualifierBracketShell(qualifiers, { makeId: idGen(), sameTeamPolicy: "avoid_semis" });
+    expect(semiPair(shell, 0)).toEqual(["uuid-9", "uuid-1"]);
+    expect(semiPair(shell, 1)).toEqual(["uuid-3", "uuid-7"]);
+  });
+
+  test("tie-break outcome from the existing ranking decides who is rank 1 within a team", () => {
+    // A2 beats A1 on +/- (same wins); B1 beats B2 on wins.
+    const ranked = scenario({ A: [[3,1,40,38], [3,1,42,35]], B: [[4,0,44,20], [1,3,30,40]] });
+    const qualifiers = selectQualifiers(ranked, "top_x_per_team", 2);
+    const shell = generateQualifierBracketShell(qualifiers, { makeId: idGen(), sameTeamPolicy: "avoid_semis" });
+    // B1 is the overall top qualifier -> team B is "Team 1".
+    expect(semiPair(shell, 0)).toEqual(["B1", "A1"]);
+    expect(semiPair(shell, 1)).toEqual(["B2", "A2"]);
+  });
+
+  test("incomplete / other shapes keep the existing generic placement", () => {
+    for (const qs of [
+      [q("A1","A"), q("B1","B"), q("A2","A")],               // 3 qualifiers
+      [q("A1","A"), q("A2","A"), q("A3","A"), q("B1","B")],   // 3 + 1 split
+      [q("A1","A"), q("B1",null), q("A2","A"), q("B2","B")], // missing team
+      [q("A1","A"), q("B1","B"), q("C1","C"), q("D1","D")],   // 4 teams
+    ]) {
+      for (const policy of ["avoid_semis", "avoid_until_final"]) {
+        const size = qs.length <= 4 ? 4 : 8;
+        expect(placeQualifiersWithPolicy(qs, policy).size).toBe(size);
+      }
+    }
+    // allow_anywhere is untouched: plain 1v4 / 2v3 seeding.
+    const plain = placeQualifiersWithPolicy(build("ABBA"), "allow_anywhere");
+    expect(plain.order.map(o => o.registrationId)).toEqual(["A1", "A2", "B1", "B2"]);
+    // 3+1 split falls back to the generic path; pinned to its pre-crossover result.
+    const split = placeQualifiersWithPolicy([q("A1","A"), q("A2","A"), q("A3","A"), q("B1","B")], "avoid_semis");
+    expect(split.order.map(o => o.registrationId)).toEqual(["A1", "B1", "A2", "A3"]);
+  });
+
+  test("winner advancement: SF winners fill the final, SF losers fill the bronze match", () => {
+    const qualifiers = build("ABBA");
+    const { teamMatchups } = generateQualifierBracketShell(qualifiers, { makeId: idGen(), sameTeamPolicy: "avoid_semis" });
+    const sf1 = teamMatchups.find(m => m.stage === "semifinal" && m.bracketPosition === 0);
+    const sf2 = teamMatchups.find(m => m.stage === "semifinal" && m.bracketPosition === 1);
+    let matchups = teamMatchups;
+    const apply = patch => { if (patch) matchups = matchups.map(m => m.id === patch.matchupId ? { ...m, ...patch.patch } : m); };
+    apply(advanceIndividualMatchup(matchups, sf1.id, "A1", "A"));
+    apply(advanceBronzeIndividualMatchup(matchups, sf1.id, "B2", "B"));
+    apply(advanceIndividualMatchup(matchups, sf2.id, "B1", "B"));
+    apply(advanceBronzeIndividualMatchup(matchups, sf2.id, "A2", "A"));
+    const final = matchups.find(m => m.stage === "final");
+    const bronze = matchups.find(m => m.stage === "bronze");
+    expect([final.pairAId, final.pairBId]).toEqual(["A1", "B1"]);
+    expect([bronze.pairAId, bronze.pairBId]).toEqual(["B2", "A2"]);
+  });
+});

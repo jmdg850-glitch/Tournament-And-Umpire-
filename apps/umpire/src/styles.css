@@ -173,6 +173,25 @@ html, body, #root {
   font-size: var(--text-sm);
 }
 
+/* Umpire timeout countdown (device-local, timeoutClock.js). */
+.ump-timeout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--gold-accent) 55%, var(--border));
+  color: var(--gold-accent);
+  font-size: var(--text-md);
+}
+.ump-timeout-label { display: inline-flex; align-items: center; gap: 6px; }
+.ump-timeout-clock { font-variant-numeric: tabular-nums; font-weight: 800; font-size: var(--text-lg, 1.25rem); }
+.ump-timeout-over { justify-content: center; }
+.ump-timeout-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: var(--space-2); }
+
 /* ---- Actions ---------------------------------------------------------- */
 .ump-actions {
   padding: 12px var(--ump-gutter) 16px;

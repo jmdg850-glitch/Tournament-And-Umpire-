@@ -910,9 +910,27 @@ function detectConflicts(order, qualifiers, podSize) {
   }
   return conflicts;
 }
+function twoTeamCrossoverOrder(qualifiers) {
+  if (qualifiers.length !== 4) return null;
+  const byTeam = /* @__PURE__ */ new Map();
+  for (const q of qualifiers) {
+    if (q?.teamId == null) return null;
+    if (!byTeam.has(q.teamId)) byTeam.set(q.teamId, []);
+    byTeam.get(q.teamId).push(q);
+  }
+  if (byTeam.size !== 2) return null;
+  const t1 = byTeam.get(qualifiers[0].teamId);
+  const t2 = [...byTeam.values()].find((list) => list !== t1);
+  if (t1.length !== 2 || t2.length !== 2) return null;
+  return [t1[0], t2[1], t1[1], t2[0]];
+}
 function placeQualifiersWithPolicy(qualifiers, policy) {
   const size = nextPow2(qualifiers.length);
   const podSize = podSizeForPolicy(policy, size);
+  if (podSize > 1) {
+    const crossover = twoTeamCrossoverOrder(qualifiers);
+    if (crossover) return { order: crossover, conflicts: [], size };
+  }
   let seedSlots = seedOrder(size);
   if (podSize > 1) seedSlots = repairPods(seedSlots, qualifiers, podSize);
   const conflicts = detectConflicts(seedSlots, qualifiers, podSize);

@@ -1033,3 +1033,212 @@ test("Existing Player Excel import is unaffected by the Bracket additions", () =
   assert.equal(analyzed[0].isDuplicate, true);
   assert.equal(analyzed[1].isDuplicate, false);
 });
+
+// ---------------------------------------------------------------------------
+// Cross-division participation + DOUBLE ENTRY indicator
+// ---------------------------------------------------------------------------
+
+function divisionsData(extra = {}) {
+  return baseTournamentData({
+    divisions: [
+      { id: "md", name: "Men's Doubles" },
+      { id: "xd", name: "Mixed Doubles" },
+      { id: "ms", name: "Men's Singles" },
+    ],
+    ...extra,
+  });
+}
+
+test("double entry: same player in two divisions is valid and BOTH rows are flagged", () => {
+  const { rows, summary } = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan Dela Cruz", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerName: "Juan Dela Cruz", division: "Mixed Doubles" }),
+    row({ rowNumber: 4, playerName: "Pedro Santos", division: "Men's Singles" }),
+  ], divisionsData());
+  assert.deepEqual(rows.map((r) => r.errors), [[], [], []]);
+  assert.deepEqual(rows[0].doubleEntries, [{ name: "Juan Dela Cruz", divisions: ["Men's Doubles", "Mixed Doubles"] }]);
+  assert.deepEqual(rows[1].doubleEntries, rows[0].doubleEntries);
+  assert.deepEqual(rows[2].doubleEntries, []);
+  assert.equal(summary.valid, 3);
+  assert.equal(summary.doubleEntryCount, 2);
+});
+
+test("double entry: three divisions, every entry flagged with all three divisions", () => {
+  const { rows } = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerName: "Juan", division: "Mixed Doubles" }),
+    row({ rowNumber: 4, playerName: "Juan", division: "Men's Singles" }),
+  ], divisionsData());
+  for (const r of rows) {
+    assert.deepEqual(r.errors, []);
+    assert.deepEqual(r.doubleEntries[0].divisions, ["Men's Doubles", "Mixed Doubles", "Men's Singles"]);
+  }
+});
+
+test("double entry: case and whitespace differences do not bypass the indicator", () => {
+  const { rows } = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan Dela Cruz", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerName: " JUAN  DELA CRUZ ", division: "Mixed Doubles" }),
+  ], divisionsData());
+  assert.deepEqual(rows.map((r) => r.errors), [[], []]);
+  assert.equal(rows[0].doubleEntries.length, 1);
+  assert.equal(rows[1].doubleEntries.length, 1);
+});
+
+test("double entry: unrelated players with similar names are not flagged", () => {
+  const { rows } = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan Dela Cruz", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerName: "Juan Dela Cruz Jr.", division: "Mixed Doubles" }),
+    row({ rowNumber: 4, playerName: "Juan DelaCruz", division: "Men's Singles" }),
+  ], divisionsData());
+  assert.deepEqual(rows.map((r) => r.doubleEntries), [[], [], []]);
+});
+
+test("double entry: same-division duplicate is still an error and is not a double entry", () => {
+  const { rows, summary } = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerName: " juan ", division: "men's doubles" }),
+  ], divisionsData());
+  assert.deepEqual(rows[0].errors, []);
+  assert.ok(rows[1].errors.some((e) => /Duplicate player name within file \(also row 2\)/.test(e)));
+  assert.deepEqual(rows[0].doubleEntries, []);
+  assert.equal(summary.doubleEntryCount, 0);
+});
+
+test("double entry: pair half + singles row across divisions; same player in two pairs of one division is rejected", () => {
+  const ok = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan / Pedro", entryTypeRaw: "Pair", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerName: "Juan", entryTypeRaw: "Individual", division: "Men's Singles" }),
+  ], divisionsData(), { hasEntryTypeColumn: true });
+  assert.deepEqual(ok.rows.map((r) => r.errors), [[], []]);
+  assert.deepEqual(ok.rows[0].doubleEntries, [{ name: "Juan", divisions: ["Men's Doubles", "Men's Singles"] }]);
+  assert.equal(ok.rows[1].doubleEntries.length, 1);
+
+  const bad = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan / Pedro", entryTypeRaw: "Pair", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerName: "Juan / Marco", entryTypeRaw: "Pair", division: "Men's Doubles" }),
+  ], divisionsData(), { hasEntryTypeColumn: true });
+  assert.ok(bad.rows[1].errors.some((e) => /Duplicate player name within file/.test(e)));
+});
+
+test("double entry: the same Player ID in different divisions is allowed, same division is not", () => {
+  const data = divisionsData({ persons: [{ id: "p1", tournament_id: "t1", display_name: "Juan" }] });
+  const cross = analyzePlayerRows([
+    row({ rowNumber: 2, playerId: "p1", playerName: "Juan", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerId: "p1", playerName: "Juan", division: "Mixed Doubles" }),
+  ], data);
+  assert.deepEqual(cross.rows.map((r) => r.errors), [[], []]);
+  assert.equal(cross.rows[0].existingPerson.id, "p1"); // existing ID preserved, not re-created
+  assert.equal(cross.rows[1].existingPerson.id, "p1");
+
+  const same = analyzePlayerRows([
+    row({ rowNumber: 2, playerId: "p1", playerName: "Juan", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerId: "p1", playerName: "Juan", division: "Men's Doubles" }),
+  ], data);
+  assert.ok(same.rows[1].errors.some((e) => /Duplicate Player ID/.test(e)));
+});
+
+test("double entry: an existing registration in another division flags the new file row", () => {
+  const data = divisionsData({
+    persons: [{ id: "p1", tournament_id: "t1", display_name: "Juan Dela Cruz" }],
+    participants: [{ id: "e1", division_id: "md", kind: "singles", display_name: "Juan Dela Cruz" }],
+    participantMembers: [{ participant_id: "e1", person_id: "p1" }],
+  });
+  const { rows } = analyzePlayerRows([row({ playerName: "juan dela cruz", division: "Mixed Doubles" })], data);
+  assert.deepEqual(rows[0].errors, []);
+  assert.deepEqual(rows[0].doubleEntries[0].divisions, ["Men's Doubles", "Mixed Doubles"]);
+  // Re-importing into the division they are already in is not a double entry.
+  const again = analyzePlayerRows([row({ playerName: "Juan Dela Cruz", division: "Men's Doubles" })], data);
+  assert.deepEqual(again.rows[0].doubleEntries, []);
+});
+
+test("double entry: genuinely invalid rows are still rejected and never flagged", () => {
+  const { rows } = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerName: "Juan", division: "Nonexistent" }),
+    row({ rowNumber: 4, playerName: "", division: "Mixed Doubles" }),
+    row({ rowNumber: 5, playerName: "Juan", division: "Mixed Doubles", seedRaw: "abc" }),
+  ], divisionsData());
+  assert.ok(rows[1].errors.some((e) => /does not exist/.test(e)));
+  assert.ok(rows[2].errors.some((e) => /Player Name is required/.test(e)));
+  assert.ok(rows[3].errors.some((e) => /Seed must be/.test(e)));
+  assert.deepEqual(rows.map((r) => r.doubleEntries.length), [0, 0, 0, 0]);
+});
+
+// ---------------------------------------------------------------------------
+// Player identity: same names, Player IDs, spacing, and Add New registration
+// ---------------------------------------------------------------------------
+
+function twoJuansData(extra = {}) {
+  return divisionsData({
+    persons: [
+      { id: "p1", tournament_id: "t1", display_name: "Juan Cruz" },
+      { id: "p2", tournament_id: "t1", display_name: "Juan Cruz" },
+    ],
+    ...extra,
+  });
+}
+
+test("identity: two different players with the same name, told apart by Player ID, in one division are both valid", () => {
+  const { rows } = analyzePlayerRows([
+    row({ rowNumber: 2, playerId: "p1", playerName: "Juan Cruz", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerId: "p2", playerName: "Juan Cruz", division: "Men's Doubles" }),
+  ], twoJuansData());
+  assert.deepEqual(rows.map((r) => r.errors), [[], []]);
+  assert.deepEqual(rows.map((r) => r.existingPerson.id), ["p1", "p2"]);
+});
+
+test("identity: a name shared by several existing players without a Player ID is rejected, never merged", () => {
+  const { rows } = analyzePlayerRows([row({ playerName: "juan  cruz", division: "Men's Doubles" })], twoJuansData());
+  assert.ok(rows[0].errors.some((e) => /2 players are named "juan {2}cruz" — add their Player ID/.test(e)));
+  assert.equal(rows[0].existingPerson, null);
+});
+
+test("identity: an ambiguous pair half is rejected too", () => {
+  const { rows } = analyzePlayerRows(
+    [row({ playerName: "Juan Cruz / Pedro", entryTypeRaw: "Pair", division: "Men's Doubles" })],
+    twoJuansData(),
+    { hasEntryTypeColumn: true },
+  );
+  assert.ok(rows[0].errors.some((e) => /2 players are named "Juan Cruz"/.test(e)));
+});
+
+test("identity: the same existing player by name and by Player ID in one division is still a duplicate", () => {
+  const data = divisionsData({ persons: [{ id: "p1", tournament_id: "t1", display_name: "Juan" }] });
+  const { rows } = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan", division: "Men's Doubles" }),
+    row({ rowNumber: 3, playerId: "p1", playerName: "Juan", division: "Men's Doubles" }),
+  ], data);
+  assert.deepEqual(rows[0].errors, []);
+  assert.ok(rows[1].errors.some((e) => /Duplicate player name within file \(also row 2\)/.test(e)));
+});
+
+test("identity: extra inner spaces and capitals match the existing player instead of creating a new one", () => {
+  const data = divisionsData({ persons: [{ id: "p1", tournament_id: "t1", display_name: "Juan Cruz" }] });
+  const { rows } = analyzePlayerRows([row({ playerName: "  JUAN   cruz ", division: "Men's Doubles" })], data);
+  assert.deepEqual(rows[0].errors, []);
+  assert.equal(rows[0].isDuplicate, true);
+  assert.equal(rows[0].existingPerson.id, "p1");
+});
+
+test("Add New: an existing player is registered only into divisions they are not entered in yet", () => {
+  const data = divisionsData({
+    persons: [
+      { id: "p1", tournament_id: "t1", display_name: "Juan" },
+      { id: "p2", tournament_id: "t1", display_name: "Pedro" },
+    ],
+    participants: [{ id: "e1", division_id: "md", kind: "doubles", display_name: "Juan / Pedro" }],
+    participantMembers: [{ participant_id: "e1", person_id: "p1" }, { participant_id: "e1", person_id: "p2" }],
+  });
+  const { rows, summary } = analyzePlayerRows([
+    row({ rowNumber: 2, playerName: "Juan", entryTypeRaw: "Individual", division: "Men's Singles" }), // new division
+    row({ rowNumber: 3, playerName: "Juan / Pedro", entryTypeRaw: "Pair", division: "Men's Doubles" }), // already entered
+    row({ rowNumber: 4, playerName: "Pedro / Ana", entryTypeRaw: "Pair", division: "Mixed Doubles" }), // existing half, new division
+    row({ rowNumber: 5, playerName: "Pedro", entryTypeRaw: "Individual" }), // no division: nothing to register
+    row({ rowNumber: 6, playerName: "Juan", entryTypeRaw: "Pair", division: "Mixed Doubles" }), // single-name pair: manual pairing
+  ], data, { hasEntryTypeColumn: true });
+  assert.deepEqual(rows.map((r) => r.errors), [[], [], [], [], []]);
+  assert.deepEqual(rows.map((r) => r.alreadyInDivision), [false, true, false, false, false]);
+  assert.deepEqual(rows.map((r) => r.registerExisting), [true, false, true, false, false]);
+  assert.equal(summary.registerExistingCount, 2);
+});

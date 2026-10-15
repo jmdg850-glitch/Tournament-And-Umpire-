@@ -2,7 +2,17 @@ import { useEffect, useRef, useState } from "react";
 import { Alert, Badge, Button, Card, Checkbox, ConfirmDialog, Dropdown, EmptyState, Input, SectionHeader, Select, Table, Tabs, useToast } from "@tournament/ui";
 import { Trash2 } from "lucide-react";
 import PlayerImportModal from "../PlayerImportModal.jsx";
-import { assignedPersonIdsInDivision, isPairEntry, membersOfParticipant, personLabel } from "../lib.js";
+import { assignedPersonIdsInDivision, doubleEntryIndex, doubleEntryNameKey, isPairEntry, membersOfParticipant, personLabel } from "../lib.js";
+
+// Information label (never an error) for a name registered in 2+ divisions.
+function DoubleEntryBadge({ divisions }) {
+  if (!divisions) return null;
+  return (
+    <span title={`Entered in: ${divisions.join(", ")}`}>
+      <Badge tone="warn">DOUBLE ENTRY</Badge>
+    </span>
+  );
+}
 
 export function PlayersPanel({ data, busy, run, command, load }) {
   const [section, setSection] = useState("roster");
@@ -32,6 +42,8 @@ export function PlayersPanel({ data, busy, run, command, load }) {
   const [editingPersonId, setEditingPersonId] = useState(null);
   const [editName, setEditName] = useState("");
 
+  const doubleEntries = doubleEntryIndex(data);
+  const doubleEntryFor = (name) => doubleEntries.get(doubleEntryNameKey(name));
   const entryCountFor = (personId) => (data.participantMembers || []).filter((m) => m.person_id === personId).length;
   const removableFiltered = filtered.filter((p) => entryCountFor(p.id) === 0);
   const allPlayersChecked = removableFiltered.length > 0 && removableFiltered.every((p) => checkedPlayerIds.has(p.id));
@@ -293,12 +305,25 @@ export function PlayersPanel({ data, busy, run, command, load }) {
                   key: "division_team",
                   header: "Division / Team",
                   render: (p) => {
-                    const member = (data.participantMembers || []).find((m) => m.person_id === p.id);
-                    const participant = member ? data.participants.find((pt) => pt.id === member.participant_id) : null;
-                    if (!participant) return <span className="muted">Not registered</span>;
-                    const division = data.divisions.find((d) => d.id === participant.division_id)?.name || "—";
-                    const team = data.teams.find((t) => t.id === participant.team_id)?.name;
-                    return team ? `${division} · ${team}` : division;
+                    // Every registration, not just the first — a player may
+                    // be entered in several divisions.
+                    const labels = (data.participantMembers || [])
+                      .filter((m) => m.person_id === p.id)
+                      .map((m) => data.participants.find((pt) => pt.id === m.participant_id))
+                      .filter(Boolean)
+                      .map((participant) => {
+                        const division = data.divisions.find((d) => d.id === participant.division_id)?.name || "—";
+                        const team = data.teams.find((t) => t.id === participant.team_id)?.name;
+                        return team ? `${division} · ${team}` : division;
+                      });
+                    if (!labels.length) return <span className="muted">Not registered</span>;
+                    const divisions = doubleEntryFor(p.display_name);
+                    return (
+                      <div className="stack" style={{ gap: 4 }}>
+                        {labels.map((label, i) => <span key={i}>{label}</span>)}
+                        <DoubleEntryBadge divisions={divisions} />
+                      </div>
+                    );
                   },
                 },
                 {
@@ -379,17 +404,24 @@ export function PlayersPanel({ data, busy, run, command, load }) {
                   header: "Name",
                   render: (p) => {
                     const members = membersOfParticipant(p.id, data.participantMembers);
+                    const doubled = members
+                      .map((m) => personLabel(m.person_id, data.persons))
+                      .map((name) => ({ name, divisions: doubleEntryFor(name) }))
+                      .filter((d) => d.divisions);
+                    const badge = doubled.length > 0 && (
+                      <DoubleEntryBadge divisions={[...new Set(doubled.flatMap((d) => d.divisions.map((div) => `${div} (${d.name})`)))]} />
+                    );
                     if (members.length >= 2) {
                       return (
                         <div>
-                          <div>{p.display_name}</div>
+                          <div>{p.display_name} {badge}</div>
                           <div className="muted">
                             {members.map((m) => personLabel(m.person_id, data.persons)).join(" · ")}
                           </div>
                         </div>
                       );
                     }
-                    return p.display_name;
+                    return badge ? <span>{p.display_name} {badge}</span> : p.display_name;
                   },
                 },
                 { key: "seed", header: "Seed", render: (p) => p.seed ?? "—" },

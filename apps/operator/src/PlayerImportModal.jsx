@@ -1,14 +1,16 @@
 import { useMemo, useState } from "react";
 import { Alert, Badge, Button, Modal, Select, Table } from "@tournament/ui";
+import { doubleEntryNameKey } from "./lib.js";
 
 const MODE_OPTIONS = [
-  { value: "add_new", label: "Add New (only new players)" },
+  { value: "add_new", label: "Add New (new players + new division entries)" },
   { value: "update_existing", label: "Update Existing (rename matches)" },
   { value: "skip_existing", label: "Skip Existing (ignore duplicates)" },
 ];
 
 function countForMode(summary, mode) {
   if (mode === "update_existing") return summary.newCount + summary.duplicateCount;
+  if (mode === "add_new") return summary.newCount + (summary.registerExistingCount || 0);
   return summary.newCount;
 }
 
@@ -26,6 +28,18 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
     setPhase("importing");
     const results = { created: 0, updated: 0, registered: 0, needsPairing: 0, skipped: 0, failed: [] };
     const usable = rows.filter((r) => !r.isEmptyRow && r.errors.length === 0);
+    // A player listed in several divisions of this file is ONE person: the
+    // first row creates them, later rows reuse that record (never a second
+    // add_person for the same name).
+    const createdInRun = new Map();
+    async function newPersonId(name) {
+      const key = doubleEntryNameKey(name);
+      if (createdInRun.has(key)) return createdInRun.get(key);
+      const out = await command("add_person", { tournament_id: tournamentId, display_name: name });
+      createdInRun.set(key, out.result.person.id);
+      results.created++;
+      return out.result.person.id;
+    }
 
     for (const row of usable) {
       try {
@@ -33,18 +47,18 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
           // "Rem / Jeff" style row: resolve/create both halves, then
           // register them together as one doubles participant. Mode applies
           // to the whole pair exactly as it would to a single duplicate row
-          // (add_new/skip_existing skip the row entirely if either half
-          // already exists; update_existing renames whichever half changed).
-          if (row.isDuplicate && (mode === "add_new" || mode === "skip_existing")) {
+          // (skip_existing skips the row if either half already exists;
+          // add_new reuses existing halves unrenamed only when the pair is
+          // entering a division they are not in yet; update_existing renames
+          // whichever half changed).
+          if (row.isDuplicate && (mode === "skip_existing" || (mode === "add_new" && !row.registerExisting))) {
             results.skipped++;
             continue;
           }
           const personIds = [];
           for (const half of row.pairPersons) {
             if (!half.existingPerson) {
-              const out = await command("add_person", { tournament_id: tournamentId, display_name: half.name });
-              personIds.push(out.result.person.id);
-              results.created++;
+              personIds.push(await newPersonId(half.name));
             } else if (mode === "update_existing" && half.existingPerson.display_name !== half.name) {
               const out = await command("update_person", { person_id: half.existingPerson.id, display_name: half.name });
               personIds.push(out.result.person.id);
@@ -69,9 +83,7 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
 
         let personId = null;
         if (!row.isDuplicate) {
-          const out = await command("add_person", { tournament_id: tournamentId, display_name: row.playerName });
-          personId = out.result.person.id;
-          results.created++;
+          personId = await newPersonId(row.playerName);
         } else if (mode === "skip_existing") {
           results.skipped++;
           continue;
@@ -83,8 +95,13 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
           } else {
             personId = row.existingPerson.id;
           }
+        } else if (row.registerExisting) {
+          // add_new mode: reuse the existing player untouched (no rename) and
+          // only register them into a division they are not in yet.
+          personId = row.existingPerson.id;
         } else {
-          // add_new mode + duplicate: leave the existing player untouched.
+          // add_new mode + duplicate with nothing new to register: leave the
+          // existing player untouched.
           results.skipped++;
           continue;
         }
@@ -128,6 +145,7 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
             <Badge tone={summary.invalid ? "warn" : "muted"}>Invalid: {summary.invalid}</Badge>
             <Badge tone="muted">New: {summary.newCount}</Badge>
             <Badge tone="muted">Existing (duplicates): {summary.duplicateCount}</Badge>
+            {summary.doubleEntryCount > 0 && <Badge tone="warn">Double entry: {summary.doubleEntryCount}</Badge>}
           </div>
 
           {/* Bounded + scrollable so a large import (many rows) can't push the
@@ -164,11 +182,21 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
                       key: "status",
                       header: "Status",
                       render: (r) => {
-                        if (r.pairNames) {
-                          const label = `Pair: ${r.pairNames.join(" / ")}`;
-                          return r.isDuplicate ? `${label} (existing)` : `${label} (new)`;
-                        }
-                        return r.isDuplicate ? "Existing" : "New";
+                        const status = r.pairNames
+                          ? `Pair: ${r.pairNames.join(" / ")} (${r.isDuplicate ? "existing" : "new"})`
+                          : r.isDuplicate ? "Existing" : "New";
+                        if (!r.doubleEntries?.length) return status;
+                        return (
+                          <div className="stack" style={{ gap: 4 }}>
+                            <span>{status}</span>
+                            {r.doubleEntries.map((d) => (
+                              <span key={d.name} title={`${d.name}: ${d.divisions.join(", ")}`}>
+                                <Badge tone="warn">DOUBLE ENTRY</Badge>{" "}
+                                <span className="muted">{r.pairNames ? `${d.name}: ` : ""}{d.divisions.join(", ")}</span>
+                              </span>
+                            ))}
+                          </div>
+                        );
                       },
                     },
                   ]}
@@ -187,7 +215,7 @@ export default function PlayerImportModal({ analysis, data, command, tournamentI
           )}
 
           <p className="muted">
-            {mode === "add_new" && "Only brand-new players will be created. Existing players are left untouched."}
+            {mode === "add_new" && "New players are created. Existing players are never renamed or re-created — they are only registered into divisions they are not in yet."}
             {mode === "update_existing" && "New players are created; existing players are renamed to match the file."}
             {mode === "skip_existing" && "Only brand-new players will be created. Rows matching an existing player are skipped."}
           </p>

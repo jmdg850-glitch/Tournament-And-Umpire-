@@ -293,6 +293,52 @@ export function normalizePersonName(value) {
   return String(value ?? "").trim().toLowerCase();
 }
 
+// Name key for cross-division "DOUBLE ENTRY" detection: case-insensitive and
+// whitespace-normalized (trimmed, inner runs of spaces collapsed), so
+// " JUAN  DELA CRUZ " and "Juan Dela Cruz" are the same name.
+export function doubleEntryNameKey(value) {
+  return String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+// entries: [{ name, divisionId, divisionName }]. Returns Map(nameKey ->
+// [divisionName, ...]) holding only names entered in two or more DISTINCT
+// divisions — repeats within one division are never a double entry. This is
+// an information label, never a validation error.
+export function findDoubleEntries(entries = []) {
+  const byName = new Map();
+  for (const e of entries) {
+    const key = doubleEntryNameKey(e?.name);
+    if (!key || e.divisionId == null || e.divisionId === "") continue;
+    if (!byName.has(key)) byName.set(key, new Map());
+    const divisions = byName.get(key);
+    if (!divisions.has(e.divisionId)) divisions.set(e.divisionId, e.divisionName || String(e.divisionId));
+  }
+  const out = new Map();
+  for (const [key, divisions] of byName) {
+    if (divisions.size >= 2) out.set(key, [...divisions.values()]);
+  }
+  return out;
+}
+
+// One entry per registered person per division, from persisted data.
+export function registrationEntries(data) {
+  const participantById = new Map((data.participants || []).map((p) => [p.id, p]));
+  const divisionName = new Map((data.divisions || []).map((d) => [d.id, d.name]));
+  const entries = [];
+  for (const m of data.participantMembers || []) {
+    const participant = participantById.get(m.participant_id);
+    if (!participant) continue;
+    const person = (data.persons || []).find((p) => p.id === m.person_id);
+    if (!person) continue;
+    entries.push({ name: person.display_name, divisionId: participant.division_id, divisionName: divisionName.get(participant.division_id) });
+  }
+  return entries;
+}
+
+export function doubleEntryIndex(data) {
+  return findDoubleEntries(registrationEntries(data));
+}
+
 // Resolves one typed replacement string (Matches → Edit Players) against the
 // tournament's existing persons — case-insensitive, whitespace-trimmed, same
 // convention as the Excel importers. Returns null for a blank/untouched field
