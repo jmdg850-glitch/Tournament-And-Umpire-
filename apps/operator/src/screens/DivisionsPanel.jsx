@@ -19,7 +19,7 @@ function targetStrings(config) {
 
 function isValidTargetText(text) {
   const n = Number(text);
-  return /^d+$/.test(text) && n >= SCORING_TARGET_MIN && n <= SCORING_TARGET_MAX;
+  return /^\d+$/.test(text) && n >= SCORING_TARGET_MIN && n <= SCORING_TARGET_MAX;
 }
 
 // { qualification, semifinal, final } as numbers, or null if any is invalid.
