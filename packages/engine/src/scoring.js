@@ -9,17 +9,43 @@ export const checkGameWin = (scoreA, scoreB, winTo, winBy = "two") => {
     : null;
 };
 
-// Product scoring rule: the target is decided by the match's stage, never by a
-// manual choice. Qualification (and any other round) is race to 11; semifinal,
-// final and bronze are race to 15. First side to reach the target wins
+// Product scoring rule: the target is decided by the match's stage.
+// Qualification (and any other round) defaults to race to 11; semifinal,
+// final and bronze default to race to 15. A division may set its own
+// per-stage targets (config.scoringTargets, see normalizeScoringTargets);
+// bronze always follows the final's target. First side to reach the target wins
 // immediately — no deuce / win-by-2 (11–10 and 15–14 are final scores).
 export const SCORING_WIN_BY = "none";
 export const QUALIFICATION_TARGET = 11;
 export const PLAYOFF_TARGET = 15;
 const PLAYOFF_TARGET_STAGES = ["semifinal", "final", "bronze"];
 
-export function stageScoringTarget(stage) {
-  return PLAYOFF_TARGET_STAGES.includes(String(stage || "").toLowerCase()) ? PLAYOFF_TARGET : QUALIFICATION_TARGET;
+export const SCORING_TARGET_MIN = 1;
+export const SCORING_TARGET_MAX = 99;
+
+export function isValidScoringTarget(value) {
+  return Number.isInteger(value) && value >= SCORING_TARGET_MIN && value <= SCORING_TARGET_MAX;
+}
+
+// A division's per-stage targets, with each missing/invalid value falling
+// back to the product default.
+export function normalizeScoringTargets(raw) {
+  const t = raw && typeof raw === "object" ? raw : {};
+  const pick = (v, fallback) => (isValidScoringTarget(v) ? v : fallback);
+  return {
+    qualification: pick(t.qualification, QUALIFICATION_TARGET),
+    semifinal: pick(t.semifinal, PLAYOFF_TARGET),
+    final: pick(t.final, PLAYOFF_TARGET),
+  };
+}
+
+export function stageScoringTarget(stage, targets) {
+  const s = String(stage || "").toLowerCase();
+  if (targets == null) return PLAYOFF_TARGET_STAGES.includes(s) ? PLAYOFF_TARGET : QUALIFICATION_TARGET;
+  const t = normalizeScoringTargets(targets);
+  if (s === "semifinal") return t.semifinal;
+  if (s === "final" || s === "bronze") return t.final;
+  return t.qualification;
 }
 
 // Resolves the stage that decides a match's scoring target, without relying
@@ -56,8 +82,8 @@ export function matchScoringStage(match, related = []) {
   return "qualification";
 }
 
-export function matchScoringTarget(match, related = []) {
-  return stageScoringTarget(matchScoringStage(match, related));
+export function matchScoringTarget(match, related = [], targets) {
+  return stageScoringTarget(matchScoringStage(match, related), targets);
 }
 
 // Validates a manually entered game score against a race-to-N target with no

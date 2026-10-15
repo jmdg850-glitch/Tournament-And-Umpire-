@@ -9,6 +9,8 @@ import {
   matchScoringTarget,
   validateFinalScore,
   SCORING_WIN_BY,
+  isValidScoringTarget,
+  normalizeScoringTargets,
 } from "./scoring.js";
 
 // Product rules: qualification race to 11, semifinal/final (and bronze) race
@@ -183,5 +185,57 @@ describe("stage target is applied to persisted state", () => {
     expect(done.status).toBe("completed");
     expect(done.winner).toBe("B");
     expect(done.winTo).toBe(15);
+  });
+});
+
+describe("division scoring targets (config.scoringTargets)", () => {
+  const custom = { qualification: 9, semifinal: 21, final: 25 };
+
+  test("no targets: product defaults are unchanged (11 / 15 / 15, bronze 15)", () => {
+    expect(stageScoringTarget("round_robin", undefined)).toBe(11);
+    expect(stageScoringTarget("semifinal", undefined)).toBe(15);
+    expect(stageScoringTarget("final", null)).toBe(15);
+    expect(stageScoringTarget("bronze")).toBe(15);
+  });
+
+  test("custom targets apply per stage, and bronze follows the final", () => {
+    expect(stageScoringTarget("round_robin", custom)).toBe(9);
+    expect(stageScoringTarget("knockout", custom)).toBe(9);
+    expect(stageScoringTarget("Semifinal", custom)).toBe(21);
+    expect(stageScoringTarget("final", custom)).toBe(25);
+    expect(stageScoringTarget("bronze", custom)).toBe(25);
+  });
+
+  test("matchScoringTarget passes the division targets through stage resolution", () => {
+    const se = [
+      { id: "s1", round: 1, bracket_side: "main" },
+      { id: "f", round: 2, bracket_side: "main" },
+      { id: "b", round: 2, bracket_side: "bronze" },
+    ];
+    expect(matchScoringTarget(se[0], se, custom)).toBe(21);
+    expect(matchScoringTarget(se[1], se, custom)).toBe(25);
+    expect(matchScoringTarget(se[2], se, custom)).toBe(25);
+    expect(matchScoringTarget({ id: "q", stage_label: "round_robin" }, [], custom)).toBe(9);
+  });
+
+  test("valid range is whole numbers 1-99", () => {
+    for (const ok of [1, 7, 11, 99]) expect(isValidScoringTarget(ok)).toBe(true);
+    for (const bad of [0, -1, 100, 1.5, "11", null, undefined, NaN]) expect(isValidScoringTarget(bad)).toBe(false);
+  });
+
+  test("missing or invalid values fall back to the defaults individually", () => {
+    expect(normalizeScoringTargets(undefined)).toEqual({ qualification: 11, semifinal: 15, final: 15 });
+    expect(normalizeScoringTargets({ qualification: 0, semifinal: 100, final: 1.5 })).toEqual({ qualification: 11, semifinal: 15, final: 15 });
+    expect(normalizeScoringTargets({ qualification: 7 })).toEqual({ qualification: 7, semifinal: 15, final: 15 });
+    expect(stageScoringTarget("semifinal", { semifinal: "x" })).toBe(15);
+  });
+
+  test("a custom target is enforced by the reducer: race to 9 ends at 9-8, no deuce", () => {
+    const settings = { winTo: stageScoringTarget("round_robin", custom), winBy: SCORING_WIN_BY, bestOf: 1, isDoubles: false, servingTeam: "A" };
+    const st = createInitialScoreState(settings);
+    const done = applyScoreEvent(st, { id: "c1", type: "correction", seq: 1, payload: { scoreA: 9, scoreB: 8 } }).state;
+    expect(done.status).toBe("completed");
+    expect(done.winner).toBe("A");
+    expect(validateFinalScore(10, 8, 9).ok).toBe(false);
   });
 });

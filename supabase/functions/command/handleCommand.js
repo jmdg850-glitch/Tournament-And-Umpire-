@@ -69,8 +69,27 @@ var SCORING_WIN_BY = "none";
 var QUALIFICATION_TARGET = 11;
 var PLAYOFF_TARGET = 15;
 var PLAYOFF_TARGET_STAGES = ["semifinal", "final", "bronze"];
-function stageScoringTarget(stage) {
-  return PLAYOFF_TARGET_STAGES.includes(String(stage || "").toLowerCase()) ? PLAYOFF_TARGET : QUALIFICATION_TARGET;
+var SCORING_TARGET_MIN = 1;
+var SCORING_TARGET_MAX = 99;
+function isValidScoringTarget(value) {
+  return Number.isInteger(value) && value >= SCORING_TARGET_MIN && value <= SCORING_TARGET_MAX;
+}
+function normalizeScoringTargets(raw) {
+  const t = raw && typeof raw === "object" ? raw : {};
+  const pick = (v, fallback) => isValidScoringTarget(v) ? v : fallback;
+  return {
+    qualification: pick(t.qualification, QUALIFICATION_TARGET),
+    semifinal: pick(t.semifinal, PLAYOFF_TARGET),
+    final: pick(t.final, PLAYOFF_TARGET)
+  };
+}
+function stageScoringTarget(stage, targets) {
+  const s = String(stage || "").toLowerCase();
+  if (targets == null) return PLAYOFF_TARGET_STAGES.includes(s) ? PLAYOFF_TARGET : QUALIFICATION_TARGET;
+  const t = normalizeScoringTargets(targets);
+  if (s === "semifinal") return t.semifinal;
+  if (s === "final" || s === "bronze") return t.final;
+  return t.qualification;
 }
 function matchScoringStage(match, related = []) {
   if (!match) return "qualification";
@@ -92,8 +111,8 @@ function matchScoringStage(match, related = []) {
   }
   return "qualification";
 }
-function matchScoringTarget(match, related = []) {
-  return stageScoringTarget(matchScoringStage(match, related));
+function matchScoringTarget(match, related = [], targets) {
+  return stageScoringTarget(matchScoringStage(match, related), targets);
 }
 function validateFinalScore(scoreA, scoreB, winTo) {
   if (!Number.isInteger(scoreA) || !Number.isInteger(scoreB) || scoreA < 0 || scoreB < 0) {
@@ -1652,6 +1671,23 @@ function assertGameTimeConfig(config) {
     throw httpError(400, "INVALID_GAME_TIME", `Game time must be a whole number of seconds from ${MIN_GAME_TIME_SEC} to ${MAX_GAME_TIME_SEC}`);
   }
 }
+var SCORING_TARGET_KEYS = ["qualification", "semifinal", "final"];
+function assertScoringTargetsConfig(config) {
+  if (!config || !Object.hasOwn(config, "scoringTargets") || config.scoringTargets === null) return;
+  const t = config.scoringTargets;
+  const range = `a whole number from ${SCORING_TARGET_MIN} to ${SCORING_TARGET_MAX}`;
+  if (typeof t !== "object" || Array.isArray(t)) {
+    throw httpError(400, "INVALID_SCORING_TARGET", "scoringTargets must be an object");
+  }
+  for (const [key, value] of Object.entries(t)) {
+    if (!SCORING_TARGET_KEYS.includes(key)) {
+      throw httpError(400, "INVALID_SCORING_TARGET", `Unknown scoring stage "${key}"`);
+    }
+    if (!isValidScoringTarget(value)) {
+      throw httpError(400, "INVALID_SCORING_TARGET", `The ${key} target must be ${range}`);
+    }
+  }
+}
 function assertTeamQualificationConfig(config) {
   if (Object.hasOwn(config, "qualifierMode") && config.qualifierMode !== TEAM_QUALIFIER_MODE) {
     throw httpError(
@@ -1683,6 +1719,10 @@ function scoringSettings(config = {}) {
   };
 }
 async function matchScoringSettings(admin, division, match) {
+  const pinned = match.started_at ? match.score_state?.winTo : null;
+  if (Number.isInteger(pinned) && pinned > 0) {
+    return { ...scoringSettings(division.config), winTo: pinned, winBy: SCORING_WIN_BY };
+  }
   let related = [];
   if (!match.stage_label) {
     const cols = "id, round, bracket_side, parent_match_id, stage_id, stage_label, division_id";
@@ -1694,7 +1734,7 @@ async function matchScoringSettings(admin, division, match) {
       related = siblings || [];
     }
   }
-  return { ...scoringSettings(division.config), winTo: matchScoringTarget(match, related), winBy: SCORING_WIN_BY };
+  return { ...scoringSettings(division.config), winTo: matchScoringTarget(match, related, division.config?.scoringTargets), winBy: SCORING_WIN_BY };
 }
 async function commit(admin, batch, { command_id, type, request_hash, precondition, actorId, actorDeviceId, tournamentId, matchId, result, detail }) {
   if (precondition) {
@@ -2291,6 +2331,7 @@ async function handleCreateDivision(admin, actor, payload, envelope) {
   const format = payload.format || "single_elim";
   const config = { ...payload.config || { bestOf: 1, winBy: "none", isDoubles: true } };
   assertGameTimeConfig(config);
+  assertScoringTargetsConfig(config);
   if (format === "team_elimination") {
     assertTeamQualificationConfig(config);
     if (config.sameTeamPolicy == null) config.sameTeamPolicy = "avoid_semis";
@@ -2321,7 +2362,10 @@ async function handleUpdateDivision(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
   await requireOrganizerLicensed(admin, actor, member);
-  if (payload.config != null) assertGameTimeConfig(payload.config);
+  if (payload.config != null) {
+    assertGameTimeConfig(payload.config);
+    assertScoringTargetsConfig(payload.config);
+  }
   const next = {
     ...division,
     name: payload.name != null ? String(payload.name).trim() : division.name,

@@ -1,22 +1,85 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Input, Select, SectionHeader } from "@tournament/ui";
 import { Trash2 } from "lucide-react";
-import { QUALIFICATION_TARGET, PLAYOFF_TARGET, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
+import { MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC, SCORING_TARGET_MIN, SCORING_TARGET_MAX, normalizeScoringTargets } from "@tournament/engine";
 import { FORMAT_LABEL } from "../lib.js";
 
-// Scoring is decided by the match's stage and enforced by the engine/API —
-// it is shown here for reference only and is not a per-division choice.
-function ScoringRules() {
+// Race-to target per stage (config.scoringTargets), enforced by the engine/API
+// for each match by its stage. Bronze follows the final. Defaults 11 / 15 / 15.
+const SCORING_STAGES = [
+  ["qualification", "Qualification"],
+  ["semifinal", "Semifinal"],
+  ["final", "Final"],
+];
+
+function targetStrings(config) {
+  const t = normalizeScoringTargets(config?.scoringTargets);
+  return { qualification: String(t.qualification), semifinal: String(t.semifinal), final: String(t.final) };
+}
+
+function isValidTargetText(text) {
+  const n = Number(text);
+  return /^d+$/.test(text) && n >= SCORING_TARGET_MIN && n <= SCORING_TARGET_MAX;
+}
+
+// { qualification, semifinal, final } as numbers, or null if any is invalid.
+function targetsForSave(values) {
+  if (!SCORING_STAGES.every(([key]) => isValidTargetText(values[key]))) return null;
+  return Object.fromEntries(SCORING_STAGES.map(([key]) => [key, Number(values[key])]));
+}
+
+function ScoringRules({ values, onChange }) {
+  const baseId = useId();
+  const invalid = SCORING_STAGES.filter(([key]) => !isValidTargetText(values[key]));
+  const q = Number(values.qualification);
+  const p = Number(values.final);
   return (
     <section className="division-section" aria-label="Scoring">
       <h4 className="division-section-title">Scoring</h4>
       <ul className="division-rules">
-        <li><span>Qualification</span><strong>Race to {QUALIFICATION_TARGET}</strong></li>
-        <li><span>Semifinal</span><strong>Race to {PLAYOFF_TARGET}</strong></li>
-        <li><span>Final</span><strong>Race to {PLAYOFF_TARGET}</strong></li>
+        {SCORING_STAGES.map(([key, label]) => (
+          <li key={key}>
+            <label htmlFor={`${baseId}-${key}`}><span>{key === "final" ? "Final / bronze" : label}</span></label>
+            <strong className="division-target">
+              Race to{" "}
+              <input
+                id={`${baseId}-${key}`}
+                inputMode="numeric"
+                value={values[key]}
+                aria-invalid={isValidTargetText(values[key]) ? undefined : "true"}
+                onChange={(e) => onChange({ [key]: e.target.value.replace(/[^0-9]/g, "").slice(0, 2) })}
+              />
+            </strong>
+          </li>
+        ))}
       </ul>
-      <p className="division-note">Set automatically by stage. First side to reach the target wins — no deuce ({QUALIFICATION_TARGET}–{QUALIFICATION_TARGET - 1} and {PLAYOFF_TARGET}–{PLAYOFF_TARGET - 1} are final scores).</p>
+      {invalid.length > 0 ? (
+        <p className="field-error" role="alert">Enter a whole number from {SCORING_TARGET_MIN} to {SCORING_TARGET_MAX} for {invalid.map(([, label]) => label).join(", ")}.</p>
+      ) : (
+        <p className="division-note">
+          First side to reach the target wins — no deuce ({q}–{q - 1} and {p}–{p - 1} are final scores). Changes apply to matches that haven't started yet; a started match keeps its target.
+        </p>
+      )}
     </section>
+  );
+}
+
+function DivisionScoring({ division, busy, run }) {
+  const saved = targetStrings(division.config);
+  const [values, setValues] = useState(saved);
+  const toSave = targetsForSave(values);
+  const unchanged = SCORING_STAGES.every(([key]) => values[key] === saved[key]);
+  return (
+    <form className="division-form" onSubmit={(e) => {
+      e.preventDefault();
+      if (!toSave) return;
+      run("Save scoring", "update_division", { division_id: division.id, config: { scoringTargets: toSave } });
+    }}>
+      <ScoringRules values={values} onChange={(patch) => setValues((prev) => ({ ...prev, ...patch }))} />
+      <div className="division-actions">
+        <Button type="submit" variant="secondary" disabled={!!busy || !toSave || unchanged}>Save scoring</Button>
+      </div>
+    </form>
   );
 }
 
@@ -142,6 +205,8 @@ export function DivisionsPanel({ data, busy, run }) {
     progressionMode: "playoffs",
   });
   const [edit, setEdit] = useState({});
+  const [newTargets, setNewTargets] = useState(() => targetStrings(null));
+  const newTargetsForSave = targetsForSave(newTargets);
   const [confirmDelete, setConfirmDelete] = useState(null);
   return (
     <div className="stack">
@@ -149,7 +214,8 @@ export function DivisionsPanel({ data, busy, run }) {
       <Card as="form" className="division-card" onSubmit={(e) => {
         e.preventDefault();
         if (format === "team_elimination" && qualifierCountForSave(draft) == null) return;
-        const config = { bestOf: 1, winBy: "none", isDoubles: true, bronzeMatch: true };
+        if (!newTargetsForSave) return;
+        const config = { bestOf: 1, winBy: "none", isDoubles: true, bronzeMatch: true, scoringTargets: newTargetsForSave };
         if (format === "team_elimination") {
           config.qualifierMode = "top_x_per_team";
           config.qualifierCount = qualifierCountForSave(draft);
@@ -174,12 +240,12 @@ export function DivisionsPanel({ data, busy, run }) {
             </Select>
           </div>
         </section>
-        <ScoringRules />
+        <ScoringRules values={newTargets} onChange={(patch) => setNewTargets((prev) => ({ ...prev, ...patch }))} />
         {format === "team_elimination" && (
           <QualificationFields cfg={draft} onChange={(patch) => setDraft((prev) => ({ ...prev, ...patch }))} />
         )}
         <div className="division-actions">
-          <Button type="submit" disabled={!!busy || (format === "team_elimination" && qualifierCountForSave(draft) == null)}>Add division</Button>
+          <Button type="submit" disabled={!!busy || !newTargetsForSave || (format === "team_elimination" && qualifierCountForSave(draft) == null)}>Add division</Button>
         </div>
       </Card>
       {data.divisions.length === 0 && (
@@ -217,7 +283,7 @@ export function DivisionsPanel({ data, busy, run }) {
                 )}
               </div>
             </div>
-            <ScoringRules />
+            <DivisionScoring division={d} busy={busy} run={run} />
             {isTeam && (
               <form className="division-form" onSubmit={(e) => {
                 e.preventDefault();

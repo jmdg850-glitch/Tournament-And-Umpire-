@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createBrowserClient, envConfig, sendCommand, defaultStore, isNetworkError, classifySendError, pairStation, authRedirectUrl, applyAuthCallback, isRecoveryAuthUrl, createSyncEngine, createMatchLane, createUserAuthProvider, reconstructMatchView, laneOf, ownerKey, classifyQueryFailure, applyLoadOutcome, stateFromCache, createDashboardCache, probeIdentity, rememberVerified, forgetVerified, sessionGate, startIdentity } from "@tournament/client";
-import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, readCoinToss, stageScoringTarget, validateFinalScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
+import { applyOptimisticScore, mergeMatchFromResult, isCoinTossCommitted, readCoinToss, validateFinalScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
 import { clearStation, parsePairingInput, readStation, writeStation, stationDeviceId, stationTokenExpiresSoon } from "./stationSession.js";
 import { canUmpireSetGameTime, markLocalCompletion, timerDisplayMatch } from "./timerDisplay.js";
 import { friendlyError, syncChipState } from "./umpireText.js";
@@ -1224,12 +1224,13 @@ function GameTimeModal({ match, busy, onClose, onSend }) {
   );
 }
 
+// Organizers can set each division's race-to target per stage, and this
+// device never sees division settings (a court station gets no division
+// data), so the target is only shown once the server has started the match.
 function knownScoringTarget(match) {
+  if (!match?.started_at) return null;
   const started = Number(match?.score_state?.winTo);
-  if (Number.isInteger(started) && started > 0) return started;
-  if (match?.stage_label) return stageScoringTarget(match.stage_label);
-  if (match?.bracket_side === "bronze" || match?.bracket_side === "final") return stageScoringTarget(match.bracket_side);
-  return null;
+  return Number.isInteger(started) && started > 0 ? started : null;
 }
 
 function roundLabel(m) {
@@ -2145,11 +2146,11 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
               {knownScoringTarget(match) ? (
                 <p className="ump-modal-text">
                   <strong>Race to {knownScoringTarget(match)}</strong>
-                  <span className="muted"> — set by stage. The first team to {knownScoringTarget(match)} wins immediately (no deuce).</span>
+                  <span className="muted"> — set by the organizer for this stage. The first team to {knownScoringTarget(match)} wins immediately (no deuce).</span>
                 </p>
               ) : (
                 <p className="muted ump-modal-text">
-                  The target is set automatically by stage (qualification: race to 11 · semifinal/final: race to 15) and shown once the match starts. No deuce.
+                  The race-to target is set by the organizer for this stage and shown once the match starts. No deuce.
                 </p>
               )}
               {configuredTimer.state === "configured" && (

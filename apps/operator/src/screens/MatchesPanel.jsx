@@ -13,6 +13,7 @@ import {
   playableMatches,
   nextSeqAfterOutOfOrder,
   scoringTargetFor,
+  divisionTargetsFor,
   resolvePersonByName,
   resultFor,
   scoreLine,
@@ -308,7 +309,7 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
       {editingMatch && (
         <EditScoreModal
           match={editingMatch}
-          target={scoringTargetFor(editingMatch, data.matches)}
+          target={scoringTargetFor(editingMatch, data.matches, divisionTargetsFor(editingMatch, data.divisions))}
           nameA={sideOf(editingMatch.id, "A", data).name}
           nameB={sideOf(editingMatch.id, "B", data).name}
           command={command}
@@ -528,8 +529,8 @@ function OverrideStartModal({ match, data, command, onClose, onSaved }) {
   const b = sideOf(match.id, "B", data);
   const [reasonChoice, setReasonChoice] = useState("");
   const [customReason, setCustomReason] = useState("");
-  // Decided by stage and enforced by the server — shown, not chosen.
-  const winTo = scoringTargetFor(match, data.matches);
+  // Decided by stage (division's Scoring settings) and enforced by the server.
+  const winTo = scoringTargetFor(match, data.matches, divisionTargetsFor(match, data.divisions));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -558,7 +559,7 @@ function OverrideStartModal({ match, data, command, onClose, onSaved }) {
       <div className="stack">
         <Alert>This bypasses the normal umpire start flow. Use only when the umpire cannot start the match.</Alert>
         <p className="muted" style={{ margin: 0 }}>{a.name} vs {b.name}</p>
-        <p style={{ margin: 0 }}><strong>Race to {winTo}</strong> <span className="muted">— set by stage; the first team to {winTo} wins (no deuce).</span></p>
+        <p style={{ margin: 0 }}><strong>Race to {winTo}</strong> <span className="muted">— set for this stage in Divisions; the first team to {winTo} wins (no deuce).</span></p>
         <Select label="Reason" value={reasonChoice} onChange={(e) => setReasonChoice(e.target.value)} disabled={busy}>
           <option value="">Select a reason…</option>
           {OVERRIDE_START_REASONS.map((r) => <option key={r} value={r}>{r}</option>)}

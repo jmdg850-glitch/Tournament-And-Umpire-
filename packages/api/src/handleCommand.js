@@ -8,6 +8,9 @@ import {
   applyScoreEvent,
   reduceScoreEvents,
   matchScoringTarget,
+  isValidScoringTarget,
+  SCORING_TARGET_MIN,
+  SCORING_TARGET_MAX,
   QUALIFICATION_TARGET,
   SCORING_WIN_BY,
   normalizeCoinTossPayload,
@@ -80,6 +83,26 @@ function assertGameTimeConfig(config) {
   }
 }
 
+// Optional per-division race-to targets: { qualification, semifinal, final }
+// (bronze follows final). Each present value must be a whole number in range.
+const SCORING_TARGET_KEYS = ["qualification", "semifinal", "final"];
+function assertScoringTargetsConfig(config) {
+  if (!config || !Object.hasOwn(config, "scoringTargets") || config.scoringTargets === null) return;
+  const t = config.scoringTargets;
+  const range = `a whole number from ${SCORING_TARGET_MIN} to ${SCORING_TARGET_MAX}`;
+  if (typeof t !== "object" || Array.isArray(t)) {
+    throw httpError(400, "INVALID_SCORING_TARGET", "scoringTargets must be an object");
+  }
+  for (const [key, value] of Object.entries(t)) {
+    if (!SCORING_TARGET_KEYS.includes(key)) {
+      throw httpError(400, "INVALID_SCORING_TARGET", `Unknown scoring stage "${key}"`);
+    }
+    if (!isValidScoringTarget(value)) {
+      throw httpError(400, "INVALID_SCORING_TARGET", `The ${key} target must be ${range}`);
+    }
+  }
+}
+
 function assertTeamQualificationConfig(config) {
   if (Object.hasOwn(config, "qualifierMode") && config.qualifierMode !== TEAM_QUALIFIER_MODE) {
     throw httpError(
@@ -113,11 +136,18 @@ function scoringSettings(config = {}) {
 }
 
 // The authoritative scoring rules for one match. The target is decided by the
-// match's stage (qualification 11; semifinal/final/bronze 15) — never by the
-// division's stored winTo or a client-chosen override — and is used for every
-// path that builds or re-reduces a match's score state (start, coin toss,
-// score events, complete), so a recompute can never silently change targets.
+// match's stage (defaults: qualification 11; semifinal/final/bronze 15), using
+// the division's per-stage config.scoringTargets when set — never the legacy
+// stored winTo or a client-chosen override. It is used for every path that
+// builds or re-reduces a match's score state (start, coin toss, score events,
+// complete). Once a match has started, the target it started with is pinned
+// (score_state.winTo): editing the division later only affects matches that
+// have not started, so a live, held or finished match never changes target.
 async function matchScoringSettings(admin, division, match) {
+  const pinned = match.started_at ? match.score_state?.winTo : null;
+  if (Number.isInteger(pinned) && pinned > 0) {
+    return { ...scoringSettings(division.config), winTo: pinned, winBy: SCORING_WIN_BY };
+  }
   let related = [];
   if (!match.stage_label) {
     const cols = "id, round, bracket_side, parent_match_id, stage_id, stage_label, division_id";
@@ -129,7 +159,7 @@ async function matchScoringSettings(admin, division, match) {
       related = siblings || [];
     }
   }
-  return { ...scoringSettings(division.config), winTo: matchScoringTarget(match, related), winBy: SCORING_WIN_BY };
+  return { ...scoringSettings(division.config), winTo: matchScoringTarget(match, related, division.config?.scoringTargets), winBy: SCORING_WIN_BY };
 }
 
 // One transaction (apply_official_writes): the receipt claim, the optional
@@ -817,6 +847,7 @@ async function handleCreateDivision(admin, actor, payload, envelope) {
   const format = payload.format || "single_elim";
   const config = { ...(payload.config || { bestOf: 1, winBy: "none", isDoubles: true }) };
   assertGameTimeConfig(config);
+  assertScoringTargetsConfig(config);
   if (format === "team_elimination") {
     assertTeamQualificationConfig(config);
     if (config.sameTeamPolicy == null) config.sameTeamPolicy = "avoid_semis";
@@ -848,7 +879,10 @@ async function handleUpdateDivision(admin, actor, payload, envelope) {
   const division = await getDivision(admin, payload.division_id);
   const member = await loadMember(admin, division.tournament_id, actor.id);
   await requireOrganizerLicensed(admin, actor, member);
-  if (payload.config != null) assertGameTimeConfig(payload.config);
+  if (payload.config != null) {
+    assertGameTimeConfig(payload.config);
+    assertScoringTargetsConfig(payload.config);
+  }
   const next = {
     ...division,
     name: payload.name != null ? String(payload.name).trim() : division.name,

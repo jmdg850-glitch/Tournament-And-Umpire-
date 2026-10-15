@@ -6,7 +6,7 @@
 // of resolvePersonByName/normalizePersonName, fully exercised below.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizePersonName, resolvePersonByName, liveShareUrl, resolveShareOrigin, PUBLIC_LIVE_PRODUCTION_ORIGIN, scoringTargetFor, nextSeqAfterOutOfOrder, teamStandings, unresolvedTieGroups, doubleEntryIndex, doubleEntryNameKey } from "./lib.js";
+import { normalizePersonName, resolvePersonByName, liveShareUrl, resolveShareOrigin, PUBLIC_LIVE_PRODUCTION_ORIGIN, scoringTargetFor, nextSeqAfterOutOfOrder, teamStandings, unresolvedTieGroups, doubleEntryIndex, doubleEntryNameKey, divisionTargetsFor } from "./lib.js";
 
 const persons = [
   { id: "p1", display_name: "Rem" },
@@ -244,4 +244,17 @@ test("doubleEntryIndex: flags names registered in 2+ distinct divisions only", (
   assert.equal(index.has(doubleEntryNameKey("Pedro Santos")), false);
   assert.equal(index.has(doubleEntryNameKey("Maria")), false);
   assert.equal(index.size, 1);
+});
+
+test("scoringTargetFor: a division's custom targets apply per stage; a started match keeps its own target", () => {
+  const targets = { qualification: 9, semifinal: 21, final: 25 };
+  assert.equal(scoringTargetFor({ stage_label: "round_robin" }, [], targets), 9);
+  assert.equal(scoringTargetFor({ stage_label: "semifinal" }, [], targets), 21);
+  assert.equal(scoringTargetFor({ stage_label: "final" }, [], targets), 25);
+  assert.equal(scoringTargetFor({ stage_label: "bronze" }, [], targets), 25);
+  assert.equal(scoringTargetFor({ stage_label: "round_robin", score_state: { winTo: 11 } }, [], targets), 11);
+  const divisions = [{ id: "d1", config: { scoringTargets: targets } }, { id: "d2", config: {} }];
+  assert.deepEqual(divisionTargetsFor({ division_id: "d1" }, divisions), targets);
+  assert.equal(divisionTargetsFor({ division_id: "d2" }, divisions), undefined);
+  assert.equal(scoringTargetFor({ stage_label: "final", division_id: "d2" }, [], divisionTargetsFor({ division_id: "d2" }, divisions)), 15);
 });

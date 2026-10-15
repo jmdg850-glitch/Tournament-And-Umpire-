@@ -230,15 +230,21 @@ export function stageTitle(label) {
   return String(label).replaceAll("_", " ");
 }
 
-// The race-to target for a match. Scoring targets are decided by stage and
-// enforced server-side (packages/api matchScoringSettings → engine
-// matchScoringTarget): once started, the persisted score_state.winTo is
-// authoritative; before start, the same engine rule is applied to the loaded
-// matches so the operator sees exactly what the server will use.
-export function scoringTargetFor(match, matches = []) {
+// The race-to target for a match. Scoring targets are decided by stage (and
+// the division's config.scoringTargets) and enforced server-side (packages/api
+// matchScoringSettings → engine matchScoringTarget): once started, the
+// persisted score_state.winTo is authoritative; before start, the same engine
+// rule is applied to the loaded matches so the operator sees exactly what the
+// server will use.
+export function scoringTargetFor(match, matches = [], targets) {
   const started = Number(match?.score_state?.winTo);
   if (Number.isInteger(started) && started > 0) return started;
-  return matchScoringTarget(match, matches);
+  return matchScoringTarget(match, matches, targets);
+}
+
+// The division-level per-stage targets for a match (undefined = defaults).
+export function divisionTargetsFor(match, divisions = []) {
+  return divisions.find((d) => d.id === match?.division_id)?.config?.scoringTargets;
 }
 
 // A stale-seq correction is rejected by the engine with

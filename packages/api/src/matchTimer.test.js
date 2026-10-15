@@ -543,3 +543,53 @@ describe("completion", () => {
     expect(err2.status).toBe(409);
   });
 });
+
+// Per-division race-to targets (config.scoringTargets) — not the game timer,
+// but exercised with the same real start/Hold/resume command flow.
+describe("division scoring targets", () => {
+  test("start_match uses the division's custom target; defaults are unchanged without one", async () => {
+    const custom = fixture({ divisionConfig: { scoringTargets: { qualification: 9, semifinal: 21, final: 21 } } });
+    await send(custom, UMPIRE, "start_match", { match_id: M });
+    expect(row(custom).score_state.winTo).toBe(9);
+
+    const plain = fixture();
+    await send(plain, UMPIRE, "start_match", { match_id: M });
+    expect(row(plain).score_state.winTo).toBe(11);
+  });
+
+  test("a custom target is enforced: 9-8 ends a race-to-9 match, 10-8 is refused", async () => {
+    const admin = fixture({ divisionConfig: { scoringTargets: { qualification: 9 } } });
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    const bad = await fail(send(admin, UMPIRE, "score_event", { match_id: M, event_id: cmdId(), seq: 1, type: "correction", payload: { scoreA: 10, scoreB: 8 } }));
+    expect(bad.status).toBeGreaterThanOrEqual(400);
+    await send(admin, UMPIRE, "score_event", { match_id: M, event_id: cmdId(), seq: 1, type: "correction", payload: { scoreA: 9, scoreB: 8 } });
+    expect(row(admin).score_state).toMatchObject({ status: "completed", winner: "A", winTo: 9 });
+  });
+
+  test("changing the division mid-match never changes a started match's target (live, held, resumed)", async () => {
+    const admin = fixture({ divisionConfig: { scoringTargets: { qualification: 9 } } });
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    await send(admin, ORGANIZER, "update_division", { division_id: D, config: { scoringTargets: { qualification: 21 } } });
+    expect(admin.tables.divisions[0].config.scoringTargets.qualification).toBe(21);
+    await send(admin, UMPIRE, "score_event", { match_id: M, event_id: cmdId(), seq: 1, type: "point", payload: { team: "A" } });
+    expect(row(admin).score_state.winTo).toBe(9);
+    await send(admin, UMPIRE, "transition_match", { match_id: M, status: "postponed" });
+    await send(admin, ORGANIZER, "transition_match", { match_id: M, status: "ready" });
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    expect(row(admin).score_state.winTo).toBe(9);
+  });
+
+  test("invalid targets are rejected on create and update, and nothing is written", async () => {
+    const admin = fixture();
+    for (const scoringTargets of [{ qualification: 0 }, { semifinal: 100 }, { final: 1.5 }, { final: "15" }, { bronze: 15 }, [11], "11"]) {
+      const err = await fail(send(admin, ORGANIZER, "update_division", { division_id: D, config: { scoringTargets } }));
+      expect(err).toMatchObject({ status: 400, code: "INVALID_SCORING_TARGET" });
+    }
+    expect(admin.tables.divisions[0].config).toEqual({});
+    const err = await fail(send(admin, ORGANIZER, "create_division", { tournament_id: T, name: "X", config: { scoringTargets: { qualification: -3 } } }));
+    expect(err).toMatchObject({ status: 400, code: "INVALID_SCORING_TARGET" });
+    expect(admin.tables.divisions).toHaveLength(1);
+    await send(admin, ORGANIZER, "update_division", { division_id: D, config: { scoringTargets: { qualification: 1, semifinal: 99, final: 21 } } });
+    expect(admin.tables.divisions[0].config.scoringTargets).toEqual({ qualification: 1, semifinal: 99, final: 21 });
+  });
+});
