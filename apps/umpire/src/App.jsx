@@ -1130,7 +1130,7 @@ function timeoutStorage() {
 // Running timeout countdown. Remaining time is endsAt − now (useNow ticks and
 // re-reads on visibility), so backgrounding or sleep never resets or extends
 // it. `onExpire` fires once when it reaches 0:00. Score and play controls
-// are not affected.
+// are not affected (the game-timer pause is handled in MatchDesk).
 function TimeoutBanner({ rec, onEnd, onExpire }) {
   const now = useNow(timeoutView(rec, Date.now()).active, 500);
   const view = timeoutView(rec, now);
@@ -1152,12 +1152,14 @@ function TimeoutBanner({ rec, onEnd, onExpire }) {
   );
 }
 
-function TimeoutModal({ onClose, onStart }) {
+function TimeoutModal({ pausesGameTimer, onClose, onStart }) {
   return (
     <Modal title="Start a timeout" onClose={onClose}>
       <div className="stack">
         <p className="muted ump-modal-text">
-          Choose the length. The countdown runs on this device only — the score, the game timer and the match are not changed.
+          {pausesGameTimer
+            ? "Choose the length. The game timer is paused until the timeout ends (this needs an internet connection — offline, the game timer keeps running). The score and the match are not changed."
+            : "Choose the length. The countdown runs on this device only — the score, the game timer and the match are not changed."}
         </p>
         <div className="ump-timeout-choices">
           {TIMEOUT_DURATIONS_MIN.map((min) => (
@@ -1582,37 +1584,106 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const participants = base?.participants || [];
   const court = base?.court || null;
 
-  // Device-local umpire timeout for this match (timeoutClock.js).
+  // Umpire timeout for this match (timeoutClock.js). The countdown itself is
+  // device-local; on top of it the game timer is paused on the server while
+  // the timeout runs (set_match_timer pause/resume — online only, and never
+  // for a court station, which can't change the timer). `gamePaused` on the
+  // record means this device paused it and must resume it.
+  const resumeOnLoad = useRef(false);
   const [timeoutRec, setTimeoutRec] = useState(() => {
     const saved = readTimeout(timeoutStorage(), owner, matchId);
     if (saved && timeoutView(saved, Date.now()).active) return saved;
-    if (saved) clearMatchTimeout(timeoutStorage(), owner, matchId); // ended while away
+    if (saved) {
+      clearMatchTimeout(timeoutStorage(), owner, matchId); // ended while away
+      if (saved.gamePaused) resumeOnLoad.current = true;
+    }
     return null;
   });
+  const timeoutRecRef = useRef(timeoutRec);
+  timeoutRecRef.current = timeoutRec;
+  const matchRef = useRef(match);
+  matchRef.current = match;
   const [showTimeout, setShowTimeout] = useState(false);
   const [timeoutOver, setTimeoutOver] = useState(false);
-  const startMatchTimeout = useCallback((minutes) => {
+  const [timerNotice, setTimerNotice] = useState(null); // { action, text }
+  const sendTimerControl = useCallback(async (action) => {
+    const m = matchRef.current;
+    if (station || !m || m.status !== "in_progress") return false;
+    const state = timerView(m, Date.now()).state;
+    if (action === "pause" && state !== "running") return false; // nothing to pause
+    if (action === "resume" && state !== "paused") { setTimerNotice(null); return true; }
+    try {
+      const body = await liveCommand({ cfg, getAuth, type: "set_match_timer", payload: { match_id: m.id, action } });
+      if (body?.result && baseRef.current) {
+        await store.putMatch({ ...baseRef.current, match: mergeMatchFromResult(baseRef.current.match, body.result), savedAt: Date.now() });
+        await refreshLocal();
+      }
+      setTimerNotice(null);
+      return true;
+    } catch (err) {
+      const why = isNetworkError(err) ? "No connection." : friendlyError(err, "action");
+      setTimerNotice({
+        action,
+        text: action === "pause"
+          ? `${why} The game timer was NOT paused — it keeps running.`
+          : `${why} The game timer is still paused.`,
+      });
+      return false;
+    }
+  }, [station, cfg, getAuth, store, refreshLocal]);
+  const markGamePaused = useCallback((rec) => {
+    const current = timeoutRecRef.current;
+    if (!current || current.startedAt !== rec.startedAt) {
+      sendTimerControl("resume"); // the timeout ended while the pause was in flight
+      return;
+    }
+    const next = { ...current, gamePaused: true };
+    writeTimeout(timeoutStorage(), owner, matchId, next);
+    timeoutRecRef.current = next;
+    setTimeoutRec(next);
+  }, [owner, matchId, sendTimerControl]);
+  const startMatchTimeout = useCallback(async (minutes) => {
     setShowTimeout(false);
     setTimeoutOver(false);
-    setTimeoutRec((current) => {
-      const next = startTimeout(current, minutes, Date.now());
-      if (!next || next === current) return current;
-      writeTimeout(timeoutStorage(), owner, matchId, next);
-      return next;
-    });
-  }, [owner, matchId]);
-  const endMatchTimeout = useCallback(({ expired = false } = {}) => {
+    const current = timeoutRecRef.current;
+    const next = startTimeout(current, minutes, Date.now());
+    if (!next || next === current) return;
+    writeTimeout(timeoutStorage(), owner, matchId, next);
+    timeoutRecRef.current = next;
+    setTimeoutRec(next);
+    if (await sendTimerControl("pause")) markGamePaused(next);
+  }, [owner, matchId, sendTimerControl, markGamePaused]);
+  const endMatchTimeout = useCallback(({ expired = false, resume = true } = {}) => {
+    const rec = timeoutRecRef.current;
     clearMatchTimeout(timeoutStorage(), owner, matchId);
+    timeoutRecRef.current = null;
     setTimeoutRec(null);
     setTimeoutOver(expired);
-  }, [owner, matchId]);
+    setTimerNotice((n) => (n?.action === "pause" ? null : n));
+    if (resume && rec?.gamePaused) sendTimerControl("resume");
+  }, [owner, matchId, sendTimerControl]);
   const onTimeoutExpire = useCallback(() => endMatchTimeout({ expired: true }), [endMatchTimeout]);
+  async function retryTimerControl() {
+    const action = timerNotice?.action;
+    if (!action) return;
+    const rec = timeoutRecRef.current;
+    if (action === "pause" && !rec) { setTimerNotice(null); return; }
+    if (await sendTimerControl(action) && action === "pause") markGamePaused(rec);
+  }
   // A timeout only belongs to a match in play: drop it once the match is
-  // held, completed or otherwise leaves in_progress.
+  // held, completed or otherwise leaves in_progress. No resume then — Hold
+  // already banks the time, and the server only resumes a live match.
   const liveStatus = match?.status;
   useEffect(() => {
-    if (liveStatus && liveStatus !== "in_progress" && timeoutRec) endMatchTimeout();
+    if (liveStatus && liveStatus !== "in_progress" && timeoutRec) endMatchTimeout({ resume: false });
   }, [liveStatus, timeoutRec, endMatchTimeout]);
+  // A timeout this device paused the game for ran out while the app was
+  // closed: resume the game timer once the match is loaded.
+  useEffect(() => {
+    if (!resumeOnLoad.current || !liveStatus) return;
+    resumeOnLoad.current = false;
+    if (liveStatus === "in_progress") sendTimerControl("resume");
+  }, [liveStatus, sendTimerControl]);
   useEffect(() => {
     if (!timeoutOver) return undefined;
     const t = window.setTimeout(() => setTimeoutOver(false), 5000);
@@ -2013,7 +2084,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
           )}
         />
         {score.servingTeam && !completed && (
-          <p className="ump-serve">
+          <p className={`ump-serve ${score.servingTeam === "A" ? "team-a" : "team-b"}`}>
             <span className="ump-serve-dot" aria-hidden="true" />
             <strong>{score.servingTeam === "A" ? nameA : nameB}</strong>
             <span> serving</span>
@@ -2027,6 +2098,12 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
         )}
         {scoring && timeoutOver && !timeoutRec && (
           <div className="ump-timeout ump-timeout-over" role="status">Timeout over — resume play.</div>
+        )}
+        {scoring && timerNotice && (
+          <div className="ump-timeout ump-timer-notice" role="alert">
+            <span>{timerNotice.text}</span>
+            <Button variant="secondary" className="compact" onClick={retryTimerControl}>Retry</Button>
+          </div>
         )}
         {showPendingNote && (
           <div className="ump-pending-note">
@@ -2256,7 +2333,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
       </div>
 
       {showTimeout && scoring && (
-        <TimeoutModal onClose={() => setShowTimeout(false)} onStart={startMatchTimeout} />
+        <TimeoutModal pausesGameTimer={!station} onClose={() => setShowTimeout(false)} onStart={startMatchTimeout} />
       )}
 
       {showEditScore && (

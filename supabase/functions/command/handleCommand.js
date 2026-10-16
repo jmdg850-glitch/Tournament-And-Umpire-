@@ -2244,6 +2244,141 @@ async function finishMatchIfWon(admin, batch, match, scoreState, actorId) {
   }
   return { match: completed, progressed };
 }
+var NOT_STARTED_STATUSES = /* @__PURE__ */ new Set(["scheduled", "ready", "assigned"]);
+function downstreamOpen(m) {
+  return Boolean(m) && NOT_STARTED_STATUSES.has(m.status) && !m.started_at;
+}
+function refuseDownstream(what) {
+  throw httpError(409, "DOWNSTREAM_STARTED", `The ${what} has already started, so the winner of this match can't be changed`);
+}
+function isQualification(m) {
+  return m?.stage_label === "round_robin" || m?.bracket_side === "round_robin";
+}
+async function playoffsSeeded(admin, divisionId) {
+  const { data: stages } = await admin.from("stages").select("*").eq("division_id", divisionId);
+  return (stages || []).some((s) => s.kind === "team_knockout");
+}
+function reassignSlot(batch, allSides, targetId, slot, fromParticipantId, participantId, teamId) {
+  const row = (allSides || []).find((x) => x.match_id === targetId && x.slot === slot);
+  if (row?.participant_id && row.participant_id !== fromParticipantId) {
+    throw httpError(409, "DOWNSTREAM_CHANGED", "The next match's players were changed after this match ended, so the winner can't be changed automatically");
+  }
+  batch.upsert("match_participants", {
+    id: row?.id || uuid(),
+    match_id: targetId,
+    slot,
+    participant_id: participantId,
+    team_id: teamId !== void 0 ? teamId : row?.team_id ?? null
+  });
+}
+async function reviseCompletedMatch(admin, batch, match, scoreState) {
+  const sides = await matchSides(admin, match.id);
+  const oldSlot = match.winner || match.score_state?.winner;
+  const newSlot = scoreState.winner;
+  const winnerChanged = oldSlot !== newSlot;
+  const side = (slot) => sides.find((s) => s.slot === slot);
+  const other = (slot) => slot === "A" ? "B" : "A";
+  const revised = { ...match, winner: newSlot, score_state: scoreState };
+  batch.expectMatch(match);
+  persistMatch(batch, revised);
+  const { data: existingResult } = await admin.from("match_results").select("*").eq("match_id", match.id).maybeSingle();
+  if (existingResult || winnerChanged) {
+    batch.upsert("match_results", {
+      ...existingResult || { id: uuid(), match_id: match.id, completed_at: match.completed_at || nowIso() },
+      winner_slot: newSlot,
+      winner_participant_id: side(newSlot)?.participant_id ?? null,
+      winner_team_id: side(newSlot)?.team_id ?? null,
+      games: scoreState.games || [],
+      score_a: scoreState.scoreA,
+      score_b: scoreState.scoreB
+    });
+  }
+  const progressed = {};
+  if (winnerChanged && !match.parent_match_id && (match.next_match_id || match.loser_next_match_id)) {
+    if (isQualification(match) && await playoffsSeeded(admin, match.division_id)) {
+      throw httpError(409, "PLAYOFFS_SEEDED", "The playoffs were already generated from these results, so the winner can't be changed");
+    }
+    const { data: all } = await admin.from("matches").select("*").eq("division_id", match.division_id);
+    const { data: allSides } = await admin.from("match_participants").select("*").in("match_id", (all || []).map((m) => m.id));
+    const oldWinner = side(oldSlot)?.participant_id ?? null;
+    const oldLoser = side(other(oldSlot))?.participant_id ?? null;
+    const newWinner = side(newSlot)?.participant_id ?? null;
+    const newLoser = side(other(newSlot))?.participant_id ?? null;
+    for (const [targetId, targetSlot, from, to, what] of [
+      [match.next_match_id, match.next_match_slot, oldWinner, newWinner, "next match"],
+      [match.loser_next_match_id, match.loser_next_match_slot, oldLoser, newLoser, "bronze match"]
+    ]) {
+      if (!targetId || !targetSlot) continue;
+      const target = (all || []).find((m) => m.id === targetId);
+      if (!target) continue;
+      if (!downstreamOpen(target)) refuseDownstream(what);
+      batch.expectMatch(target);
+      persistMatch(batch, { ...target });
+      reassignSlot(batch, allSides, targetId, targetSlot, from, to);
+      progressed[what === "next match" ? "next" : "bronze"] = { matchId: targetId, slot: targetSlot, participantId: to };
+    }
+  }
+  if (match.parent_match_id) {
+    const parent = await getMatch(admin, match.parent_match_id);
+    if (winnerChanged && isQualification(parent) && await playoffsSeeded(admin, match.division_id)) {
+      throw httpError(409, "PLAYOFFS_SEEDED", "The playoffs were already generated from these results, so the winner can't be changed");
+    }
+    const { data: siblings } = await admin.from("matches").select("*").eq("parent_match_id", parent.id);
+    const parentSides = await matchSides(admin, parent.id);
+    const teamOf = (slot) => parentSides.find((s) => s.slot === slot)?.team_id;
+    const pairMatches = (siblings || []).map((m) => ({
+      id: m.id,
+      teamMatchupId: m.parent_match_id,
+      status: m.status,
+      winner: m.id === match.id ? newSlot : m.winner,
+      score: m.id === match.id ? { scoreA: scoreState.scoreA, scoreB: scoreState.scoreB } : m.score_state || {}
+    }));
+    const finalized = parent.status === "completed" ? finalizeCrossTeamMatchup({ id: parent.id, teamAId: teamOf("A"), teamBId: teamOf("B") }, pairMatches) : null;
+    batch.expectMatch(parent);
+    if (!finalized) {
+      persistMatch(batch, { ...parent });
+    } else {
+      persistMatch(batch, { ...parent, winner: finalized.winnerSlot, team_a_wins: finalized.teamAWins, team_b_wins: finalized.teamBWins });
+      progressed.teamMatchup = finalized;
+      const parentOld = parent.winner;
+      const parentNew = finalized.winnerSlot;
+      if (!winnerChanged && parentOld !== parentNew && isQualification(parent) && await playoffsSeeded(admin, match.division_id)) {
+        throw httpError(409, "PLAYOFFS_SEEDED", "The playoffs were already generated from these results, so this correction can't change the team result");
+      }
+      if (parentOld !== parentNew && (parent.next_match_id || parent.loser_next_match_id)) {
+        const { data: matchups } = await admin.from("matches").select("*").eq("division_id", parent.division_id).is("parent_match_id", null);
+        const { data: muSides } = await admin.from("match_participants").select("*").in("match_id", (matchups || []).map((m) => m.id));
+        const parentSide = (slot) => parentSides.find((s) => s.slot === slot);
+        for (const [targetId, targetSlot, fromSlot, toSlot, what] of [
+          [parent.next_match_id, parent.next_match_slot, parentOld, parentNew, "next matchup"],
+          [parent.loser_next_match_id, parent.loser_next_match_slot, other(parentOld), other(parentNew), "bronze matchup"]
+        ]) {
+          if (!targetId || !targetSlot) continue;
+          const target = (matchups || []).find((m) => m.id === targetId);
+          if (!target) continue;
+          if (!downstreamOpen(target)) refuseDownstream(what);
+          const { data: kids } = await admin.from("matches").select("*").eq("parent_match_id", target.id);
+          if ((kids || []).some((k) => !downstreamOpen(k))) refuseDownstream(what);
+          const from = parentSide(fromSlot);
+          const to = parentSide(toSlot);
+          batch.expectMatch(target);
+          persistMatch(batch, { ...target });
+          reassignSlot(batch, muSides, target.id, targetSlot, from?.participant_id ?? null, to?.participant_id ?? null, to?.team_id ?? null);
+          if ((kids || []).length) {
+            const overlay = ["A", "B"].map((slot) => {
+              if (slot === targetSlot) return { slot, participant_id: to?.participant_id ?? null, team_id: to?.team_id ?? null };
+              const row = (muSides || []).find((x) => x.match_id === target.id && x.slot === slot);
+              return { slot, participant_id: row?.participant_id ?? null, team_id: row?.team_id ?? null };
+            });
+            await ensurePlayoffChildInBatch(admin, batch, target, overlay);
+          }
+          progressed[what === "next matchup" ? "next" : "bronze"] = { matchId: target.id, slot: targetSlot, participantId: to?.participant_id ?? null };
+        }
+      }
+    }
+  }
+  return { match: revised, progressed: Object.keys(progressed).length ? progressed : null, winnerChanged };
+}
 async function handleCreateTournament(admin, actor, payload, envelope) {
   const name = String(payload.name || "").trim();
   if (!name) throw httpError(400, "INVALID_COMMAND", "name is required");
@@ -3406,7 +3541,11 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     throw httpError(400, "INVALID_COMMAND", "That score event could not be applied");
   }
   const state = applied.state;
-  if (isCorrection && wasCompleted && (state.status !== "completed" || state.winner !== match.score_state?.winner)) {
+  const isOrganizerActor = Boolean(scoringMember) && ["organizer", "admin"].includes(scoringMember.role);
+  if (isCorrection && wasCompleted && state.status !== "completed") {
+    throw httpError(409, "WOULD_CHANGE_WINNER", "A completed match needs a final score (one team must win).");
+  }
+  if (isCorrection && wasCompleted && !isOrganizerActor && state.winner !== match.score_state?.winner) {
     throw httpError(409, "WOULD_CHANGE_WINNER", "This correction would change the match winner. Corrections to a completed match cannot change the winner.");
   }
   const batch = createBatch();
@@ -3436,7 +3575,15 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
       }
     };
   }
-  if (wasCompleted) {
+  if (wasCompleted && isOrganizerActor) {
+    const rev = await reviseCompletedMatch(admin, batch, match, state);
+    completed = rev.match;
+    progressed = rev.progressed;
+    if (detail) {
+      detail.correction.previous_winner = match.winner || match.score_state?.winner || null;
+      detail.correction.next_winner = state.winner;
+    }
+  } else if (wasCompleted) {
     batch.expectMatch(match);
     persistMatch(batch, { ...match, score_state: state });
     const { data: existingResult } = await admin.from("match_results").select("*").eq("match_id", match.id).maybeSingle();
@@ -3460,7 +3607,7 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     result: { match: completed || { ...match, score_state: state }, score_state: state, duplicate: false, progressed },
     detail
   }).catch((err) => rethrowSeqConflict(admin, err, match.id, payload.seq));
-  if (!wasCompleted && state.status === "completed") {
+  if (state.status === "completed") {
     await reconcilePlayoffChildren(admin, match.division_id, division.format);
   }
   return result;
@@ -3513,7 +3660,8 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
   const current = normalizeTimer(match.timer);
   let timer;
   const started = match.status === "in_progress" || TIMER_SETUP_STATUSES.has(match.status) && Boolean(match.started_at);
-  if (!isOrganizer && (started || action !== "set" && action !== "clear")) {
+  const umpireTimeout = action === "pause" || action === "resume";
+  if (!isOrganizer && !umpireTimeout && (started || action !== "set" && action !== "clear")) {
     throw httpError(403, "FORBIDDEN", "Once the match has started, only the organizer can change the game timer");
   }
   if (action === "set" || action === "clear") {
@@ -3545,8 +3693,19 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
     } else {
       timer = resetTimer(current, meta);
     }
+  } else if (umpireTimeout) {
+    if (match.status !== "in_progress") {
+      throw httpError(409, "MATCH_NOT_ACTIVE", `Cannot ${action} the timer of a ${match.status} match`);
+    }
+    if (!current) throw httpError(409, "NO_TIMER", "This match has no game timer");
+    timer = action === "pause" ? pauseTimer(current, now) : startTimer(current, now);
+    if (timer.runningSince === current.runningSince && timer.remainingMs === current.remainingMs) {
+      timer = current;
+    } else {
+      timer = { ...timer, updatedAt: now, updatedBy: actor.id };
+    }
   } else {
-    throw httpError(400, "INVALID_COMMAND", "action must be set, clear, adjust or reset");
+    throw httpError(400, "INVALID_COMMAND", "action must be set, clear, adjust, reset, pause or resume");
   }
   const next = { ...match, timer };
   const batch = createBatch();

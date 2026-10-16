@@ -745,3 +745,104 @@ describe("command safety regressions", () => {
     expect(admin.tables.matches.find((m) => m.id === "rr-1").status).toBe("in_progress");
   });
 });
+
+// Operator → Edit score on a completed match: a corrected winner is carried
+// into the team matchup and the playoff bracket, never past a started match.
+describe("organizer correction of a completed team-elimination pair match", () => {
+  const row = (admin, mid) => admin.tables.matches.find((m) => m.id === mid);
+  const correct = (admin, mid, scoreA, scoreB) => send(admin, "score_event", {
+    match_id: mid,
+    event_id: crypto.randomUUID(),
+    seq: (row(admin, mid).score_state?.lastSeq || 0) + 1,
+    type: "correction",
+    payload: { scoreA, scoreB, confirm_completed: true, reason: "Scoresheet" },
+  });
+  const flip = (admin, child) => {
+    const s = row(admin, child.id).score_state;
+    return correct(admin, child.id, s.scoreB, s.scoreA);
+  };
+  async function semisWith(admin) {
+    await send(admin, "generate_team_playoffs", { division_id: D });
+    const semis = parents(admin, "semifinal");
+    return (key) => semis.find((m) => pairsIn(admin, m.id).includes(id(key)));
+  }
+
+  test("flipping a semifinal winner moves the new winner into the final and the old winner to bronze", async () => {
+    const admin = begLow();
+    const semiWith = await semisWith(admin);
+    const sf = semiWith("KEN");
+    const opponent = pairsIn(admin, sf.id).find((p) => p !== id("KEN"));
+    const { child } = await playKnockout(admin, sf.id, id("KEN"));
+    const [final] = parents(admin, "final");
+    const [bronze] = parents(admin, "bronze");
+    expect(pairsIn(admin, final.id)).toContain(id("KEN"));
+
+    const res = await flip(admin, child);
+    expect(res.ok).toBe(true);
+    const fixed = row(admin, child.id);
+    expect(side(admin, child.id, fixed.winner).participant_id).toBe(opponent);
+    expect(side(admin, sf.id, row(admin, sf.id).winner).participant_id).toBe(opponent);
+    expect(pairsIn(admin, final.id)).toContain(opponent);
+    expect(pairsIn(admin, final.id)).not.toContain(id("KEN"));
+    expect(pairsIn(admin, bronze.id)).toContain(id("KEN"));
+    const result = admin.tables.match_results.find((r) => r.match_id === child.id);
+    expect(result.winner_participant_id).toBe(opponent);
+    expect([result.score_a, result.score_b]).toEqual([fixed.score_state.scoreA, fixed.score_state.scoreB]);
+  });
+
+  test("when both semifinals are done, the final's (not yet started) pair match gets the new finalist too", async () => {
+    const admin = begLow();
+    const semiWith = await semisWith(admin);
+    const sfKen = semiWith("KEN");
+    const opponent = pairsIn(admin, sfKen.id).find((p) => p !== id("KEN"));
+    const { child } = await playKnockout(admin, sfKen.id, id("KEN"));
+    await playKnockout(admin, semiWith("JEFF").id, id("JEFF"));
+    const [final] = parents(admin, "final");
+    const [bronze] = parents(admin, "bronze");
+    const [finalChild] = childOf(admin, final.id);
+
+    expect((await flip(admin, child)).ok).toBe(true);
+    expect(new Set(pairsIn(admin, final.id))).toEqual(new Set([opponent, id("JEFF")]));
+    expect(pairsIn(admin, finalChild.id)).toEqual(pairsIn(admin, final.id));
+    const [bronzeChild] = childOf(admin, bronze.id);
+    expect(pairsIn(admin, bronzeChild.id)).toEqual(pairsIn(admin, bronze.id));
+    expect(pairsIn(admin, bronze.id)).toContain(id("KEN"));
+  });
+
+  test("refused once the final has started; nothing changes", async () => {
+    const admin = begLow();
+    const semiWith = await semisWith(admin);
+    const { child } = await playKnockout(admin, semiWith("KEN").id, id("KEN"));
+    await playKnockout(admin, semiWith("JEFF").id, id("JEFF"));
+    const [final] = parents(admin, "final");
+    childOf(admin, final.id)[0].status = "in_progress";
+    const before = JSON.stringify(admin.tables.match_participants);
+    const err = await flip(admin, child).then(() => { throw new Error("unexpectedly succeeded"); }, (e) => e);
+    expect([err.status, err.code]).toEqual([409, "DOWNSTREAM_STARTED"]);
+    expect(JSON.stringify(admin.tables.match_participants)).toBe(before);
+    expect(row(admin, child.id).winner).toBe(side(admin, child.id, "A").participant_id === id("KEN") ? "A" : "B");
+  });
+
+  test("qualification: a flip recounts the team matchup's wins", async () => {
+    const admin = begLow();
+    const res = await correct(admin, "rr-pm-6", 9, 11); // CARL 11-9 JEFF → JEFF wins
+    expect(res.ok).toBe(true);
+    expect(row(admin, "rr-pm-6").winner).toBe("B");
+    expect(row(admin, "rr-1")).toMatchObject({ team_a_wins: 6, team_b_wins: 14, winner: "B" });
+  });
+
+  test("qualification: a flip after the playoffs were generated is refused", async () => {
+    const admin = begLow();
+    await send(admin, "generate_team_playoffs", { division_id: D });
+    const err = await correct(admin, "rr-pm-6", 9, 11).then(() => { throw new Error("unexpectedly succeeded"); }, (e) => e);
+    expect([err.status, err.code]).toEqual([409, "PLAYOFFS_SEEDED"]);
+    expect(row(admin, "rr-pm-6").winner).toBe("A");
+  });
+
+  test("qualification: a same-winner score fix after the playoffs is still allowed", async () => {
+    const admin = begLow();
+    await send(admin, "generate_team_playoffs", { division_id: D });
+    expect((await correct(admin, "rr-pm-6", 11, 7)).ok).toBe(true);
+    expect(row(admin, "rr-pm-6")).toMatchObject({ winner: "A", score_state: expect.objectContaining({ scoreA: 11, scoreB: 7 }) });
+  });
+});

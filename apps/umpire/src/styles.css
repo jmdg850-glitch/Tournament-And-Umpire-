@@ -9,6 +9,9 @@
   --focus: #ff6b3d;
   --ump-gutter: 14px;
   --ump-pad-h: clamp(96px, 20dvh, 150px);
+  /* Team pad colours (--team-a / --team-b) lifted for text on the dark court. */
+  --serve-a: color-mix(in srgb, var(--team-a) 65%, #fff);
+  --serve-b: color-mix(in srgb, var(--team-b) 75%, #fff);
 }
 
 html, body, #root {
@@ -141,25 +144,31 @@ html, body, #root {
   width: 9px;
   height: 9px;
   border-radius: 50%;
-  background: var(--gold-accent);
+  background: var(--serve-a);
   margin-right: 6px;
   vertical-align: 1px;
 }
+.ump-score .scoreboard.serving-b > div:last-child .who::before { background: var(--serve-b); }
 /* The score is what the umpire checks after every rally — let it own the
    free height a phone has between the header and the pads. */
 .ump-score .scoreboard .pts { font-size: clamp(3.5rem, 24vw, 8rem); }
 .ump-score .scoreboard > div:nth-child(2) { display: grid; justify-items: center; gap: 6px; }
 .ump-games { color: #eef1f4; }
+/* The serve line takes the serving team's pad colour (lightened so it stays
+   readable on the dark court). */
 .ump-serve {
+  --serve-color: var(--gold-accent);
   margin: 10px 0 0;
-  color: var(--gold-accent);
+  color: var(--serve-color);
   font-size: var(--text-md);
   text-align: center;
   overflow-wrap: anywhere;
 }
+.ump-serve.team-a { --serve-color: var(--serve-a); }
+.ump-serve.team-b { --serve-color: var(--serve-b); }
 .ump-serve strong { font-weight: 800; }
-.ump-serve-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--gold-accent); margin-right: 6px; vertical-align: 1px; }
-.ump-serve-num { color: var(--muted-court); font-weight: 600; }
+.ump-serve-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--serve-color); margin-right: 6px; vertical-align: 1px; }
+.ump-serve-num { color: var(--serve-color); font-weight: 600; }
 .ump-pending-note {
   display: flex;
   align-items: center;
@@ -190,6 +199,7 @@ html, body, #root {
 .ump-timeout-label { display: inline-flex; align-items: center; gap: 6px; }
 .ump-timeout-clock { font-variant-numeric: tabular-nums; font-weight: 800; font-size: var(--text-lg, 1.25rem); }
 .ump-timeout-over { justify-content: center; }
+.ump-timer-notice { color: var(--text, #eef1f4); font-size: var(--text-sm); }
 .ump-timeout-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: var(--space-2); }
 
 /* ---- Actions ---------------------------------------------------------- */

@@ -1,9 +1,13 @@
 // Umpire timeout countdown — device-local by design.
 //
-// A timeout here is a display-only countdown on this umpire device: it never
-// sends a command, never touches the score, the sync outbox or the game
-// timer, so it works fully offline. (The server deliberately refuses
-// "timeout" score events from umpires/stations — see packages/api/src/authz.js.)
+// A timeout here is a countdown on this umpire device: this module never
+// sends a command, never touches the score or the sync outbox, so the
+// countdown works fully offline. (The server deliberately refuses "timeout"
+// score events from umpires/stations — see packages/api/src/authz.js.)
+// Separately, the match screen pauses the game timer on the server for the
+// timeout (set_match_timer pause/resume, online only); the optional
+// `gamePaused: true` on the record means this device paused it and must
+// resume it when the timeout ends.
 //
 // The record stores an absolute end time, and remaining time is always
 // endsAt − now. So backgrounding, screen sleep, leaving and reopening the

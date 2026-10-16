@@ -92,6 +92,17 @@ test("storage round trip is scoped per owner and match", () => {
   assert.equal(readTimeout(storage, "u1", "m1"), null);
 });
 
+test("the gamePaused flag survives a reload and never changes the countdown", () => {
+  const storage = memoryStorage();
+  const rec = { ...startTimeout(null, 1, T0), gamePaused: true };
+  writeTimeout(storage, "u1", "m1", rec);
+  const back = readTimeout(storage, "u1", "m1");
+  assert.equal(back.gamePaused, true);
+  assert.deepEqual(timeoutView(back, T0 + 20000), { active: true, remainingMs: 40000 });
+  // a running timeout is still never restarted
+  assert.equal(startTimeout(back, 5, T0 + 1000), back);
+});
+
 test("corrupt stored JSON reads as no timeout", () => {
   const storage = memoryStorage();
   storage.setItem(timeoutStorageKey("u1", "m1"), "{not json");

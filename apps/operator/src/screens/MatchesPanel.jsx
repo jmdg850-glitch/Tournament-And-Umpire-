@@ -25,11 +25,15 @@ import {
 // Edit Score / Instant Score Entry — sends a "correction" score_event through
 // the same command/engine/audit pipeline as normal point-scoring (see
 // packages/engine/src/scoring.js applyScoreEvent's "correction" case and
-// packages/api/src/handleCommand.js handleScoreEvent). Only reachable for
-// live (in-progress) matches from this entry point.
+// packages/api/src/handleCommand.js handleScoreEvent). Reachable for live
+// matches (Live tiles) and completed ones (Completed table). A completed match
+// needs a final score and a reason; if the winner changes, the server moves
+// the new winner/loser into the next and bronze matches and recounts the team
+// matchup (reviseCompletedMatch) — refused once those have started.
 function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved }) {
   const state = match.score_state || {};
-  const winTo = target || 11;
+  const completedMatch = match.status === "completed";
+  const winTo = target || state.winTo || 11;
   const [scoreA, setScoreA] = useState(String(state.scoreA ?? 0));
   const [scoreB, setScoreB] = useState(String(state.scoreB ?? 0));
   const [reason, setReason] = useState("");
@@ -49,8 +53,15 @@ function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved
   const unchanged = validNumbers && nextA === (state.scoreA ?? 0) && nextB === (state.scoreB ?? 0);
   // Same rule the engine enforces: race to winTo, no deuce (e.g. 11–10 / 15–14 end the match).
   const check = validNumbers ? validateFinalScore(nextA, nextB, winTo) : null;
-  const scoreError = check && !check.ok ? check.reason : "";
-  const canContinue = validNumbers && !unchanged && !scoreError && !busy;
+  const scoreError = check && !check.ok
+    ? check.reason
+    : completedMatch && check && !check.complete ? `A completed match needs a final score — one side must reach ${winTo}.` : "";
+  const oldWinner = completedMatch ? (match.winner || state.winner) : null;
+  const newWinner = check?.complete ? (nextA > nextB ? "A" : "B") : null;
+  const winnerChanges = completedMatch && newWinner && oldWinner && newWinner !== oldWinner;
+  const needsReason = completedMatch && !reason.trim();
+  const canContinue = validNumbers && !unchanged && !scoreError && !needsReason && !busy;
+  const nameOf = (slot) => (slot === "A" ? nameA : nameB);
 
   async function submit() {
     setBusy(true);
@@ -60,7 +71,12 @@ function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved
       event_id: crypto.randomUUID(),
       seq,
       type: "correction",
-      payload: { scoreA: nextA, scoreB: nextB, reason: reason.trim() || undefined },
+      payload: {
+        scoreA: nextA,
+        scoreB: nextB,
+        reason: reason.trim() || undefined,
+        ...(completedMatch ? { confirm_completed: true } : {}),
+      },
     }, { durable: true });
     try {
       try {
@@ -100,9 +116,19 @@ function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved
             </div>
           </div>
         </div>
-        <Input label="Reason (optional)" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why is this score being corrected?" />
+        <Input
+          label={completedMatch ? "Reason (required)" : "Reason (optional)"}
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Why is this score being corrected?"
+        />
+        {completedMatch && (
+          <p className="muted" style={{ margin: 0 }}>
+            This match is completed. The corrected score updates the results, standings and brackets.
+          </p>
+        )}
         {scoreError && <Alert>{scoreError}</Alert>}
-        {check?.ok && check.complete && !unchanged && (
+        {!completedMatch && check?.ok && check.complete && !unchanged && (
           <p className="muted" style={{ margin: 0 }}>This score ends the match — first to {winTo} wins.</p>
         )}
         {error && <Alert>{error}</Alert>}
@@ -114,6 +140,11 @@ function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved
         ) : (
           <>
             <p style={{ margin: 0 }}>Change score from {state.scoreA ?? 0}–{state.scoreB ?? 0} to {nextA}–{nextB}?</p>
+            {winnerChanges && (
+              <Alert>
+                This changes the winner from {nameOf(oldWinner)} to {nameOf(newWinner)}. {nameOf(newWinner)} takes the place in the next match (and {nameOf(oldWinner)} goes to the bronze match, if there is one); team results and standings are recounted. This is refused if the next match has already started.
+              </Alert>
+            )}
             <div className="row">
               <Button type="button" variant="secondary" onClick={() => setConfirming(false)} disabled={busy}>Back</Button>
               <Button type="button" disabled={busy} onClick={submit}>{busy ? "Saving…" : "Apply correction"}</Button>
@@ -151,7 +182,8 @@ export function canControlGameTimer(match) {
 // Organizer game-timer control, via the set_match_timer command (authorized
 // on the server — organizer/admin only). Before start: set/clear the game
 // time; the countdown itself only begins when the match is started. Live or
-// on hold: add/remove a minute or reset to the full time. Never changes the
+// on hold: add/remove a minute or reset to the full time; a live match
+// paused by an umpire timeout can be resumed. Never changes the
 // score or the match status.
 function GameTimerModal({ match, data, command, onClose, onSaved }) {
   const a = sideOf(match.id, "A", data);
@@ -226,6 +258,10 @@ function GameTimerModal({ match, data, command, onClose, onSaved }) {
             <Button variant="secondary" disabled={busy} onClick={() => send({ action: "adjust", delta_seconds: 60 })}>+1 min</Button>
             <Button variant="secondary" disabled={busy} onClick={() => send({ action: "adjust", delta_seconds: -60 })}>−1 min</Button>
             <Button variant="secondary" disabled={busy} onClick={() => send({ action: "reset" })}>Reset to {Math.round(view.durationSec / 60)} min</Button>
+            {/* A live match paused by an umpire timeout (e.g. the umpire's device went offline mid-timeout). */}
+            {match.status === "in_progress" && view.state === "paused" && (
+              <Button disabled={busy} onClick={() => send({ action: "resume" })}>Resume timer</Button>
+            )}
           </div>
         )}
         {error && <Alert>{error}</Alert>}
@@ -585,6 +621,8 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
   const overrideStartMatch = overrideStartId ? rows.find((m) => m.id === overrideStartId) : null;
   const [timerId, setTimerId] = useState(null);
   const timerMatch = timerId ? rows.find((m) => m.id === timerId) : null;
+  const [editingScoreId, setEditingScoreId] = useState(null);
+  const editingScoreMatch = editingScoreId ? rows.find((m) => m.id === editingScoreId) : null;
   return (
     <>
     <Table
@@ -680,7 +718,12 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
                     )}
                   </Dropdown>
                 )}
-                {!canEditPlayers && !isHeld && (
+                {m.status === "completed" && (
+                  <Button variant="secondary" className="compact" disabled={!!busy} onClick={() => setEditingScoreId(m.id)}>
+                    Edit score
+                  </Button>
+                )}
+                {!canEditPlayers && !isHeld && m.status !== "completed" && (
                   <span className="muted" style={{ fontSize: "var(--text-xs)" }}>
                     {m.status === "in_progress" ? "Locked — match started"
                       : m.status === "completed" || m.status === "bye" ? "Locked — match completed"
@@ -714,6 +757,17 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
         data={data}
         command={command}
         onClose={() => setTimerId(null)}
+        onSaved={load}
+      />
+    )}
+    {editingScoreMatch && (
+      <EditScoreModal
+        match={editingScoreMatch}
+        target={scoringTargetFor(editingScoreMatch, data.matches, divisionTargetsFor(editingScoreMatch, data.divisions))}
+        nameA={sideOf(editingScoreMatch.id, "A", data).name}
+        nameB={sideOf(editingScoreMatch.id, "B", data).name}
+        command={command}
+        onClose={() => setEditingScoreId(null)}
         onSaved={load}
       />
     )}
@@ -883,7 +937,7 @@ export function MatchesPanel({ data, busy, run, command, load }) {
                 rows={completed}
                 sections={completedSections}
                 summaryFor={completedSummary}
-                tableProps={{ busy, run }}
+                tableProps={{ busy, run, command, load }}
               />
             </div>
           )}

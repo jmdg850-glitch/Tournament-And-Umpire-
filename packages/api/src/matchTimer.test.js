@@ -259,6 +259,85 @@ describe("set_match_timer — authorization (server-side)", () => {
   });
 });
 
+describe("set_match_timer — pause / resume (umpire timeout)", () => {
+  const OTHER_UMPIRE = { kind: "user", id: "88888888-8888-4888-8888-888888888888", email: "other.umpire@example.com" };
+  const withOtherUmpire = (admin) => {
+    admin.tables.tournament_members.push({ id: "tm-u2", tournament_id: T, user_id: OTHER_UMPIRE.id, role: "umpire" });
+    return admin;
+  };
+  const timerCmd = (admin, actor, action) => send(admin, actor, "set_match_timer", { match_id: M, action });
+  async function live(admin = fixture()) {
+    await setTimer(admin, UMPIRE, 600);
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    return admin;
+  }
+
+  test("the assigned umpire pauses a live game: the time left is banked", async () => {
+    const admin = await live();
+    advance(30);
+    await timerCmd(admin, UMPIRE, "pause");
+    advance(60); // the timeout itself never counts
+    expect(timerView(row(admin), Date.now())).toMatchObject({ state: "paused", remainingMs: 570000 });
+    expect(row(admin).status).toBe("in_progress");
+    expect(row(admin).timer.updatedBy).toBe(UMPIRE.id);
+  });
+
+  test("resume counts down again from the banked time", async () => {
+    const admin = await live();
+    advance(30);
+    await timerCmd(admin, UMPIRE, "pause");
+    advance(60);
+    await timerCmd(admin, UMPIRE, "resume");
+    advance(10);
+    expect(timerView(row(admin), Date.now())).toMatchObject({ state: "running", remainingMs: 560000 });
+  });
+
+  test("repeated pause / resume are no-ops", async () => {
+    const admin = await live();
+    advance(30);
+    await timerCmd(admin, UMPIRE, "pause");
+    const paused = row(admin).timer;
+    advance(5);
+    await timerCmd(admin, UMPIRE, "pause");
+    expect(row(admin).timer).toEqual(paused);
+    await timerCmd(admin, UMPIRE, "resume");
+    const running = row(admin).timer;
+    advance(5);
+    await timerCmd(admin, UMPIRE, "resume");
+    expect(row(admin).timer).toEqual(running);
+  });
+
+  test("the organizer can pause and resume too", async () => {
+    const admin = await live();
+    await timerCmd(admin, ORGANIZER, "pause");
+    expect(timerView(row(admin), Date.now()).state).toBe("paused");
+    await timerCmd(admin, ORGANIZER, "resume");
+    expect(timerView(row(admin), Date.now()).state).toBe("running");
+  });
+
+  test("refused before the match starts, and when there is no timer", async () => {
+    const admin = fixture();
+    await setTimer(admin, UMPIRE, 600);
+    expect(await fail(timerCmd(admin, UMPIRE, "pause"))).toMatchObject({ status: 409, code: "MATCH_NOT_ACTIVE" });
+    const noTimer = fixture();
+    await send(noTimer, UMPIRE, "start_match", { match_id: M });
+    expect(await fail(timerCmd(noTimer, UMPIRE, "pause"))).toMatchObject({ status: 409, code: "NO_TIMER" });
+  });
+
+  test("refused for a completed match", async () => {
+    const admin = fixture({ status: "completed", timer: { v: 1, durationSec: 600, remainingMs: 300000, runningSince: null } });
+    expect(await fail(timerCmd(admin, ORGANIZER, "resume"))).toMatchObject({ status: 409, code: "MATCH_NOT_ACTIVE" });
+  });
+
+  test("another umpire and a court station are refused", async () => {
+    const admin = withOtherUmpire(await live());
+    const before = row(admin).timer;
+    expect(await fail(timerCmd(admin, OTHER_UMPIRE, "pause"))).toMatchObject({ status: 403, code: "FORBIDDEN" });
+    expect(await fail(timerCmd(admin, STATION, "pause"))).toMatchObject({ status: 403, code: "FORBIDDEN" });
+    expect(row(admin).timer).toEqual(before);
+  });
+});
+
 describe("start_match starts the timer — exactly once, and only there", () => {
   test("countdown begins at the real start", async () => {
     const admin = fixture();
