@@ -4,7 +4,11 @@ export const STATION_COMMANDS = new Set([
   "coin_toss",
   "score_event",
   "complete_match",
+  // pause/resume only (an umpire timeout) — see assertStationMayIssue.
+  "set_match_timer",
 ]);
+
+export const STATION_TIMER_ACTIONS = new Set(["pause", "resume"]);
 
 export const STATION_SCORE_EVENT_TYPES = new Set(["point", "undo"]);
 
@@ -45,6 +49,9 @@ export function assertStationMayIssue(actor, type, payload) {
     if (eventType && !STATION_SCORE_EVENT_TYPES.has(eventType)) {
       forbid("Court stations cannot issue this scoring action");
     }
+  }
+  if (type === "set_match_timer" && !STATION_TIMER_ACTIONS.has(payload?.action)) {
+    forbid("Court stations can only pause or resume the game timer");
   }
 }
 

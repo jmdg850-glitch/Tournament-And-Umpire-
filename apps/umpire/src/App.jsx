@@ -1152,14 +1152,12 @@ function TimeoutBanner({ rec, onEnd, onExpire }) {
   );
 }
 
-function TimeoutModal({ pausesGameTimer, onClose, onStart }) {
+function TimeoutModal({ onClose, onStart }) {
   return (
     <Modal title="Start a timeout" onClose={onClose}>
       <div className="stack">
         <p className="muted ump-modal-text">
-          {pausesGameTimer
-            ? "Choose the length. The game timer is paused until the timeout ends (this needs an internet connection — offline, the game timer keeps running). The score and the match are not changed."
-            : "Choose the length. The countdown runs on this device only — the score, the game timer and the match are not changed."}
+          Choose the length. The game timer is paused until the timeout ends (this needs an internet connection — offline, the game timer keeps running). The score and the match are not changed.
         </p>
         <div className="ump-timeout-choices">
           {TIMEOUT_DURATIONS_MIN.map((min) => (
@@ -1541,6 +1539,9 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const [showHold, setShowHold] = useState(false);
   const [holdReason, setHoldReason] = useState("");
   const [holding, setHolding] = useState(false);
+  // Win by default / Cancel dialog: { mode: "default" | "cancel", winner, reason }.
+  const [outcome, setOutcome] = useState(null);
+  const [outcomeBusy, setOutcomeBusy] = useState(false);
   const [confirmKeepServer, setConfirmKeepServer] = useState(false);
   const [reapplyLocal, setReapplyLocal] = useState(null);
   const [resolving, setResolving] = useState(false);
@@ -1586,8 +1587,8 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
 
   // Umpire timeout for this match (timeoutClock.js). The countdown itself is
   // device-local; on top of it the game timer is paused on the server while
-  // the timeout runs (set_match_timer pause/resume — online only, and never
-  // for a court station, which can't change the timer). `gamePaused` on the
+  // the timeout runs (set_match_timer pause/resume — online only; signed-in
+  // umpires and court stations alike). `gamePaused` on the
   // record means this device paused it and must resume it.
   const resumeOnLoad = useRef(false);
   const [timeoutRec, setTimeoutRec] = useState(() => {
@@ -1608,7 +1609,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const [timerNotice, setTimerNotice] = useState(null); // { action, text }
   const sendTimerControl = useCallback(async (action) => {
     const m = matchRef.current;
-    if (station || !m || m.status !== "in_progress") return false;
+    if (!m || m.status !== "in_progress") return false;
     const state = timerView(m, Date.now()).state;
     if (action === "pause" && state !== "running") return false; // nothing to pause
     if (action === "resume" && state !== "paused") { setTimerNotice(null); return true; }
@@ -1630,7 +1631,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
       });
       return false;
     }
-  }, [station, cfg, getAuth, store, refreshLocal]);
+  }, [cfg, getAuth, store, refreshLocal]);
   const markGamePaused = useCallback((rec) => {
     const current = timeoutRecRef.current;
     if (!current || current.startedAt !== rec.startedAt) {
@@ -1915,6 +1916,30 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
     }
   }
 
+  // Win by default (declare_default_win) or Cancel (transition_match:
+  // cancelled before play, abandoned while live). Online only, like Hold.
+  async function confirmOutcome() {
+    if (!outcome) return;
+    setOutcomeBusy(true);
+    try {
+      const reason = outcome.reason.trim();
+      const ok = outcome.mode === "default"
+        ? await onlineOnly(
+          "declare_default_win",
+          { match_id: match.id, winner: outcome.winner, reason },
+          "You're offline — the match was NOT changed. A win by default needs an internet connection.",
+        )
+        : await onlineOnly(
+          "transition_match",
+          { match_id: match.id, status: match.status === "in_progress" ? "abandoned" : "cancelled", reason },
+          "You're offline — the match was NOT cancelled. Cancelling needs an internet connection.",
+        );
+      if (ok) setOutcome(null);
+    } finally {
+      setOutcomeBusy(false);
+    }
+  }
+
   // Conflict resolution — every option keeps the local actions on disk.
   async function keepServerScore() {
     setResolving(true);
@@ -2018,7 +2043,16 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   // A paired court station may only score points and undo: the server refuses
   // corrections from a station, and a refused correction would block this
   // match's sync queue. So corrections are offered to signed-in umpires only.
-  const canCorrect = !station;
+  const isDefaultWin = Boolean(score.defaultWin);
+  const canCorrect = !station && !isDefaultWin;
+  // Win by default / Cancel (signed-in umpire only — court stations score
+  // only). The server enforces the same rules (declare_default_win,
+  // transition_match): no result can't be carried into a next-round match or
+  // a team matchup, so Cancel is only offered where nothing depends on it.
+  const matchOpen = ["scheduled", "ready", "assigned", "postponed", "in_progress"].includes(match.status);
+  const bothSides = ["A", "B"].every((slot) => sides.some((s) => s.match_id === match.id && s.slot === slot && s.participant_id));
+  const canDefaultWin = !station && matchOpen && bothSides;
+  const canCancelMatch = !station && matchOpen && !match.next_match_id && !match.loser_next_match_id && !match.parent_match_id;
   const canReapply = canCorrect && Boolean(localResult) && (localResult.bestOf || 1) <= 1
     && ["in_progress", "completed"].includes(base?.match?.status);
   const actionsLocked = laneBusy || inConflict;
@@ -2150,6 +2184,9 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
         )}
         {match.status === "postponed" && (
           <p className="ump-status-note">This match is on hold. The organizer resumes it from the desk; tap Reload once play continues.</p>
+        )}
+        {(match.status === "cancelled" || match.status === "abandoned") && (
+          <p className="ump-status-note">This match was cancelled — it ended with no result.</p>
         )}
 
         {showToss && !tossCommitted && (
@@ -2308,13 +2345,30 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
           </Button>
         ))}
 
+        {(canDefaultWin || canCancelMatch) && !readyToComplete && (
+          <div className="ump-secondary-row ump-outcome-row">
+            {canDefaultWin && (
+              <Button variant="ghost" disabled={busy} onClick={() => { setError(""); setOutcome({ mode: "default", winner: null, reason: "" }); }}>
+                Win by default
+              </Button>
+            )}
+            {canCancelMatch && (
+              <Button variant="ghost" disabled={busy} onClick={() => { setError(""); setOutcome({ mode: "cancel", winner: null, reason: "" }); }}>
+                Cancel match
+              </Button>
+            )}
+          </div>
+        )}
+
         {completed && (
           <Card className="ump-complete">
             <div className="kicker">Match complete</div>
             <div className="ump-complete-label">Winner</div>
             <h2>{winnerName || "—"}</h2>
             <p className="ump-final">
-              {multiGame
+              {isDefaultWin
+                ? <>Won by default (W/O){score.defaultWin.reason ? <span className="muted"> · {score.defaultWin.reason}</span> : null}</>
+                : multiGame
                 ? <>Games {gamesA}–{gamesB} <span className="muted">· last game {score.scoreA ?? 0}–{score.scoreB ?? 0}</span></>
                 : <>Final score {score.scoreA ?? 0}–{score.scoreB ?? 0}</>}
             </p>
@@ -2333,7 +2387,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
       </div>
 
       {showTimeout && scoring && (
-        <TimeoutModal pausesGameTimer={!station} onClose={() => setShowTimeout(false)} onStart={startMatchTimeout} />
+        <TimeoutModal onClose={() => setShowTimeout(false)} onStart={startMatchTimeout} />
       )}
 
       {showEditScore && (
@@ -2387,6 +2441,58 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
             <div className="ump-modal-actions">
               <Button variant="secondary" onClick={() => setShowHold(false)} disabled={holding}>Cancel</Button>
               <Button onClick={confirmHold} busy={holding}>{holding ? "Holding…" : "Hold match"}</Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {outcome && (
+        <Modal
+          title={outcome.mode === "default" ? "Win by default" : "Cancel this match?"}
+          onClose={() => !outcomeBusy && setOutcome(null)}
+        >
+          <div className="stack">
+            <p className="ump-modal-lead">{nameA} <span className="muted">vs</span> {nameB}</p>
+            <p className="ump-modal-text">
+              {outcome.mode === "default"
+                ? "Who wins by default (walkover)? It's recorded as W/O 0–0 and counts as a win; the winner moves on in the bracket. This can't be undone."
+                : "The match ends with no result — no winner, and it counts for nobody in the standings. This can't be undone."}
+            </p>
+            {outcome.mode === "default" && (
+              <div className="ump-timeout-choices">
+                {["A", "B"].map((slot) => (
+                  <Button
+                    key={slot}
+                    variant={outcome.winner === slot ? "primary" : "secondary"}
+                    aria-pressed={outcome.winner === slot}
+                    disabled={outcomeBusy}
+                    onClick={() => setOutcome((o) => ({ ...o, winner: slot }))}
+                  >
+                    {slot === "A" ? nameA : nameB}
+                  </Button>
+                ))}
+              </div>
+            )}
+            <Input
+              label="Reason (required)"
+              value={outcome.reason}
+              onChange={(e) => { const reason = e.target.value; setOutcome((o) => ({ ...o, reason })); }}
+              placeholder={outcome.mode === "default" ? "e.g. no-show, injury, retired" : "e.g. weather, withdrawn"}
+              disabled={outcomeBusy}
+            />
+            {error && <Alert>{error}</Alert>}
+            <div className="ump-modal-actions">
+              <Button variant="secondary" onClick={() => setOutcome(null)} disabled={outcomeBusy}>Back</Button>
+              <Button
+                variant="danger"
+                busy={outcomeBusy}
+                disabled={!outcome.reason.trim() || (outcome.mode === "default" && !outcome.winner)}
+                onClick={confirmOutcome}
+              >
+                {outcomeBusy ? "Saving…"
+                  : outcome.mode === "cancel" ? "Cancel match"
+                    : outcome.winner ? `${outcome.winner === "A" ? nameA : nameB} wins by default` : "Choose the winner"}
+              </Button>
             </div>
           </div>
         </Modal>

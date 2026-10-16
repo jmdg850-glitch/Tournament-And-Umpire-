@@ -194,6 +194,8 @@ export function sideOf(matchId, slot, data) {
 }
 
 export function scoreLine(match, result) {
+  // Won by default (declare_default_win): recorded 0–0, shown as a walkover.
+  if (match?.score_state?.defaultWin) return "W/O";
   const a = result?.score_a ?? match?.score_state?.scoreA;
   const b = result?.score_b ?? match?.score_state?.scoreB;
   if (a == null && b == null) return "—";

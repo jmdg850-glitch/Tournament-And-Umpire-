@@ -135,7 +135,7 @@ function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved
         {!confirming ? (
           <div className="row">
             <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
-            <Button type="button" disabled={!canContinue} onClick={() => setConfirming(true)}>Save score</Button>
+            <Button type="button" disabled={!canContinue} onClick={() => { setError(""); setConfirming(true); }}>Save score</Button>
           </div>
         ) : (
           <>
@@ -146,11 +146,111 @@ function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved
               </Alert>
             )}
             <div className="row">
-              <Button type="button" variant="secondary" onClick={() => setConfirming(false)} disabled={busy}>Back</Button>
+              <Button type="button" variant="secondary" onClick={() => { setError(""); setConfirming(false); }} disabled={busy}>Back</Button>
               <Button type="button" disabled={busy} onClick={submit}>{busy ? "Saving…" : "Apply correction"}</Button>
             </div>
           </>
         )}
+      </div>
+    </Modal>
+  );
+}
+
+// Statuses a match can be held / won by default / cancelled from (the server
+// enforces the same rules: transition_match + declare_default_win).
+const OPEN_MATCH_STATUSES = new Set(["scheduled", "ready", "assigned", "postponed", "in_progress"]);
+
+// No result can't be carried into another match: a bracket match whose
+// winner/loser feeds the next round, or a team pair match, can't be cancelled
+// (server: CANCEL_BLOCKS_BRACKET) — Win by default is used instead.
+export function canCancelMatch(match) {
+  return OPEN_MATCH_STATUSES.has(match?.status)
+    && !match.next_match_id && !match.loser_next_match_id && !match.parent_match_id;
+}
+
+export function canDeclareDefaultWin(match, data) {
+  if (!OPEN_MATCH_STATUSES.has(match?.status)) return false;
+  return Boolean(sideOf(match.id, "A", data).participant && sideOf(match.id, "B", data).participant);
+}
+
+// Hold / Win by default / Cancel for one match. Hold = transition_match
+// postponed (resumed from the Matches table); Cancel = no result: cancelled
+// before play, abandoned while live; Win by default = declare_default_win
+// (recorded 0–0 W/O, advances like a played win). All audited server-side.
+function MatchActionModal({ match, mode, nameA, nameB, command, onClose, onSaved }) {
+  const [reason, setReason] = useState("");
+  const [winner, setWinner] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const live = match.status === "in_progress";
+  const nameOf = (slot) => (slot === "A" ? nameA : nameB);
+  const reasonRequired = mode !== "hold";
+  const canSubmit = !busy && (!reasonRequired || reason.trim()) && (mode !== "default" || winner);
+  const title = mode === "hold" ? "Hold this match?" : mode === "cancel" ? "Cancel this match?" : "Win by default";
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      const trimmed = reason.trim() || undefined;
+      if (mode === "default") {
+        await command("declare_default_win", { match_id: match.id, winner, reason: trimmed });
+      } else {
+        const status = mode === "hold" ? "postponed" : live ? "abandoned" : "cancelled";
+        await command("transition_match", { match_id: match.id, status, reason: trimmed });
+      }
+      await onSaved?.();
+      onClose();
+    } catch (err) {
+      setError(err.message || "The match was not changed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title={title} onClose={() => !busy && onClose()}>
+      <div className="stack">
+        <p className="muted" style={{ margin: 0 }}>{nameA} vs {nameB}</p>
+        {mode === "hold" && (
+          <p style={{ margin: 0 }}>Play stops and the score and game time are kept. Resume it from the Matches table when play continues.</p>
+        )}
+        {mode === "cancel" && (
+          <p style={{ margin: 0 }}>The match ends with no result — no winner, and it counts for nobody in the standings. This can't be undone.</p>
+        )}
+        {mode === "default" && (
+          <>
+            <p style={{ margin: 0 }}>Who wins by default (walkover)? It's recorded as W/O 0–0 and counts as a win; the winner moves on in the bracket. This can't be undone.</p>
+            <div className="row" style={{ flexWrap: "wrap" }}>
+              {["A", "B"].map((slot) => (
+                <Button
+                  key={slot}
+                  type="button"
+                  variant={winner === slot ? "primary" : "secondary"}
+                  aria-pressed={winner === slot}
+                  disabled={busy}
+                  onClick={() => setWinner(slot)}
+                >
+                  {nameOf(slot)}
+                </Button>
+              ))}
+            </div>
+          </>
+        )}
+        <Input
+          label={reasonRequired ? "Reason (required)" : "Reason (optional)"}
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder={mode === "default" ? "e.g. no-show, injury, retired" : mode === "cancel" ? "e.g. weather, withdrawn" : "e.g. injury, court issue"}
+          disabled={busy}
+        />
+        {error && <Alert>{error}</Alert>}
+        <div className="row">
+          <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>Back</Button>
+          <Button type="button" variant={mode === "hold" ? "primary" : "danger"} disabled={!canSubmit} onClick={submit}>
+            {busy ? "Saving…" : mode === "hold" ? "Hold match" : mode === "cancel" ? "Cancel match" : winner ? `${nameOf(winner)} wins by default` : "Choose the winner"}
+          </Button>
+        </div>
       </div>
     </Modal>
   );
@@ -278,6 +378,8 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
   const editingMatch = editingId ? matches.find((m) => m.id === editingId) : null;
   const [timerId, setTimerId] = useState(null);
   const timerMatch = timerId ? matches.find((m) => m.id === timerId) : null;
+  const [action, setAction] = useState(null); // { id, mode }
+  const actionMatch = action ? matches.find((m) => m.id === action.id) : null;
   return (
     <div className="live-strip">
       {matches.map((m) => {
@@ -330,9 +432,31 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
                 Game timer
               </Button>
             ) : null}
+            {command ? (
+              <div className="row" style={{ gap: 4, marginTop: 2, flexWrap: "wrap" }}>
+                <Button variant="ghost" className="compact" onClick={() => setAction({ id: m.id, mode: "hold" })}>Hold</Button>
+                {canDeclareDefaultWin(m, data) && (
+                  <Button variant="ghost" className="compact" onClick={() => setAction({ id: m.id, mode: "default" })}>Win by default</Button>
+                )}
+                {canCancelMatch(m) && (
+                  <Button variant="ghost" className="compact" onClick={() => setAction({ id: m.id, mode: "cancel" })}>Cancel</Button>
+                )}
+              </div>
+            ) : null}
           </div>
         );
       })}
+      {actionMatch && (
+        <MatchActionModal
+          match={actionMatch}
+          mode={action.mode}
+          nameA={sideOf(actionMatch.id, "A", data).name}
+          nameB={sideOf(actionMatch.id, "B", data).name}
+          command={command}
+          onClose={() => setAction(null)}
+          onSaved={load}
+        />
+      )}
       {timerMatch && (
         <GameTimerModal
           match={timerMatch}
@@ -623,6 +747,8 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
   const timerMatch = timerId ? rows.find((m) => m.id === timerId) : null;
   const [editingScoreId, setEditingScoreId] = useState(null);
   const editingScoreMatch = editingScoreId ? rows.find((m) => m.id === editingScoreId) : null;
+  const [action, setAction] = useState(null); // { id, mode }
+  const actionMatch = action ? rows.find((m) => m.id === action.id) : null;
   return (
     <>
     <Table
@@ -687,6 +813,8 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
             const canOverrideStart = ["ready", "assigned"].includes(m.status);
             const canTimer = canControlGameTimer(m);
             const isHeld = m.status === "postponed";
+            const canDefault = canDeclareDefaultWin(m, data);
+            const canCancel = canCancelMatch(m);
             return (
               <div className="row" style={{ gap: 6, justifyContent: "flex-end", flexWrap: "nowrap" }}>
                 {isHeld && (
@@ -699,7 +827,7 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
                     Resume match
                   </Button>
                 )}
-                {(canEditPlayers || canOverrideStart || canTimer) && (
+                {(canEditPlayers || canOverrideStart || canTimer || canDefault || canCancel) && (
                   <Dropdown label="More">
                     {canEditPlayers && (
                       <Button type="button" variant="ghost" style={{ width: "100%", justifyContent: "flex-start" }} onClick={() => setEditingPlayersId(m.id)}>
@@ -716,12 +844,25 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
                         Override start…
                       </Button>
                     )}
+                    {canDefault && (
+                      <Button type="button" variant="ghost" style={{ width: "100%", justifyContent: "flex-start" }} onClick={() => setAction({ id: m.id, mode: "default" })}>
+                        Win by default…
+                      </Button>
+                    )}
+                    {canCancel && (
+                      <Button type="button" variant="danger" style={{ width: "100%", justifyContent: "flex-start" }} onClick={() => setAction({ id: m.id, mode: "cancel" })}>
+                        Cancel match…
+                      </Button>
+                    )}
                   </Dropdown>
                 )}
-                {m.status === "completed" && (
+                {m.status === "completed" && !m.score_state?.defaultWin && (
                   <Button variant="secondary" className="compact" disabled={!!busy} onClick={() => setEditingScoreId(m.id)}>
                     Edit score
                   </Button>
+                )}
+                {m.status === "completed" && m.score_state?.defaultWin && (
+                  <span className="muted" style={{ fontSize: "var(--text-xs)" }}>Won by default</span>
                 )}
                 {!canEditPlayers && !isHeld && m.status !== "completed" && (
                   <span className="muted" style={{ fontSize: "var(--text-xs)" }}>
@@ -757,6 +898,17 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
         data={data}
         command={command}
         onClose={() => setTimerId(null)}
+        onSaved={load}
+      />
+    )}
+    {actionMatch && (
+      <MatchActionModal
+        match={actionMatch}
+        mode={action.mode}
+        nameA={sideOf(actionMatch.id, "A", data).name}
+        nameB={sideOf(actionMatch.id, "B", data).name}
+        command={command}
+        onClose={() => setAction(null)}
         onSaved={load}
       />
     )}

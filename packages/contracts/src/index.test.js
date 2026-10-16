@@ -27,6 +27,15 @@ describe("contracts", () => {
     assert.equal(cmd.type, "delete_division");
     assert.equal(COMMAND_TYPES.includes("delete_division"), true);
   });
+
+  it("accepts a declare_default_win envelope", () => {
+    const cmd = parseCommandEnvelope({
+      command_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      type: "declare_default_win",
+      payload: { match_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", winner: "A", reason: "No show" },
+    });
+    assert.equal(cmd.type, "declare_default_win");
+  });
 });
 
 describe("pairing payload {v,sid,g}", () => {

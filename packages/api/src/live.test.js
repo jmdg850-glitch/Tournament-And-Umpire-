@@ -1491,9 +1491,11 @@ describe.skipIf(!live)("Umpire Cancel/Hold (transition_match: in_progress -> pos
     expect(outsiderTry.body.ok).toBe(false);
     expect(outsiderTry.status).toBe(403);
 
+    // An umpire may cancel their own match, but a live match can only become
+    // "abandoned" (lifecycle), never jump straight to "cancelled".
     const wrongTransitionTry = await send(umpire.token, "transition_match", { match_id: matchId, status: "cancelled" });
     expect(wrongTransitionTry.body.ok).toBe(false);
-    expect(wrongTransitionTry.body.error.code).toBe("FORBIDDEN");
+    expect(wrongTransitionTry.body.error.code).toBe("ILLEGAL_TRANSITION");
 
     const holdR = await expectOk(umpire.token, "transition_match", { match_id: matchId, status: "postponed", reason: "Injury timeout" });
     expect(holdR.body.result.match.status).toBe("postponed");

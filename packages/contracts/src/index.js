@@ -30,6 +30,7 @@ export const COMMAND_TYPES = Object.freeze([
   "score_event",
   "complete_match",
   "set_match_timer",
+  "declare_default_win",
 ]);
 
 export const TOURNAMENT_STATUSES = Object.freeze([

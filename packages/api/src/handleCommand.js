@@ -1966,11 +1966,15 @@ async function handleTransitionMatch(admin, actor, payload, envelope) {
   if (isOrganizer) {
     await requireLicense(admin, actor);
   } else {
-    // The one self-service transition a non-organizer may make is putting
-    // their own currently-live match on hold (Umpire Cancel/Hold) — anything
-    // else falls through to the exact original organizer-only error. Never
-    // license-gated: an umpire's own login doesn't consume an Operator seat.
-    if (payload.status !== "postponed" || match.status !== "in_progress") {
+    // Self-service transitions a non-organizer may make on their OWN match:
+    // putting it on hold while live (Umpire Hold), and cancelling it
+    // (cancelled before play, abandoned while live — both "no result").
+    // Anything else falls through to the exact original organizer-only
+    // error. Never license-gated: an umpire's own login doesn't consume an
+    // Operator seat.
+    const umpireHold = payload.status === "postponed" && match.status === "in_progress";
+    const umpireCancel = payload.status === "cancelled" || payload.status === "abandoned";
+    if (!umpireHold && !umpireCancel) {
       requireOrganizer(member);
     }
     const ump = await matchUmpire(admin, match.id);
@@ -1988,6 +1992,15 @@ async function handleTransitionMatch(admin, actor, payload, envelope) {
     throw httpError(409, err.code || "ILLEGAL_TRANSITION", err.message);
   }
   const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  if (payload.status === "cancelled" || payload.status === "abandoned") {
+    // No result can't be carried forward: a bracket match whose winner (or
+    // loser) feeds another match, or a team pair match (its matchup and
+    // qualification need every pair result), would be stuck for good.
+    if (match.next_match_id || match.loser_next_match_id || match.parent_match_id) {
+      throw httpError(409, "CANCEL_BLOCKS_BRACKET", "This match's result is needed for the next round, so it can't be cancelled. Use Win by default instead.");
+    }
+    if (!reason) throw httpError(400, "REASON_REQUIRED", "A reason is required to cancel a match");
+  }
   const next = { ...match, status: payload.status };
   // Leaving play (Hold / abandon) pauses the game timer: the time left is
   // banked so start_match resumes from it. No timer → the row is untouched.
@@ -2201,6 +2214,9 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
 
   if (wasCompleted) {
     if (!isCorrection) throw httpError(409, "ILLEGAL_TRANSITION", "Match is not in progress");
+    if (match.score_state?.defaultWin) {
+      throw httpError(409, "DEFAULT_WIN", "This match was won by default; its score can't be edited");
+    }
     if ((settings.bestOf || 1) > 1) {
       throw httpError(409, "CORRECTION_UNSUPPORTED", "Correcting a completed multi-game match is not supported");
     }
@@ -2367,13 +2383,73 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
   return result;
 }
 
+// Win by default (walkover / forfeit): the organizer or this match's assigned
+// umpire gives the match to one side without playing it out. Recorded as a
+// 0–0 win flagged score_state.defaultWin (W/O), then completed through the
+// same finishMatchIfWon path as a played win — match_results, bracket
+// advancement (next + bronze) and team-matchup recount are identical. Court
+// stations can't (not in STATION_COMMANDS).
+const DEFAULT_WIN_FROM = new Set(["scheduled", "ready", "assigned", "postponed", "in_progress"]);
+
+async function handleDeclareDefaultWin(admin, actor, payload, envelope) {
+  requireUserActor(actor);
+  const match = await getMatch(admin, payload.match_id);
+  await authorizeMatchOperation(admin, actor, match);
+  if (!DEFAULT_WIN_FROM.has(match.status)) {
+    throw httpError(409, "MATCH_NOT_ACTIVE", `A ${match.status} match can't be won by default`);
+  }
+  const winner = payload.winner;
+  if (winner !== "A" && winner !== "B") {
+    throw httpError(400, "INVALID_COMMAND", "winner must be A or B");
+  }
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  if (!reason) throw httpError(400, "REASON_REQUIRED", "A reason is required for a win by default");
+  const division = await getDivision(admin, match.division_id);
+  await assertMatchPlayable(admin, match, division);
+  const settings = await matchScoringSettings(admin, division, match);
+  const prev = match.score_state || {};
+  const at = nowIso();
+  const state = {
+    ...prev,
+    winTo: settings.winTo,
+    winBy: settings.winBy,
+    bestOf: settings.bestOf,
+    scoreA: 0,
+    scoreB: 0,
+    games: [],
+    status: "completed",
+    winner,
+    lastSeq: Number.isSafeInteger(prev.lastSeq) ? prev.lastSeq : 0,
+    defaultWin: { winner, reason, at },
+  };
+  const batch = createBatch();
+  batch.expectMatch(match);
+  // finishMatchIfWon only accepts the live → completed transition; a default
+  // win may also end a match that never started (or was held), so it is
+  // handed over as live. A running game timer is banked first.
+  const asLive = { ...match, status: "in_progress" };
+  if (normalizeTimer(match.timer)) asLive.timer = pauseTimer(match.timer, at);
+  const fin = await finishMatchIfWon(admin, batch, asLive, state, actor.id);
+  const result = await commit(admin, batch, {
+    ...envelope,
+    ...actorCommit(actor),
+    tournamentId: match.tournament_id,
+    matchId: match.id,
+    result: { match: fin.match, progressed: fin.progressed },
+    detail: { ok: true, default_win: { match_id: match.id, winner, reason, from_status: match.status } },
+  });
+  await reconcilePlayoffChildren(admin, match.division_id, division.format);
+  return result;
+}
+
 // Game timer control. Enforced here, never in the client:
 //   - organizer/admin (licensed): every action below (Operator/SA override);
 //   - the umpire assigned to THIS match: set/clear before the match has
 //     ever started (game-time setup), and pause/resume while it is live (an
 //     umpire timeout). Anything else once started → FORBIDDEN;
-//   - anyone else (other umpires, members, strangers) → FORBIDDEN; court
-//     stations never reach this (not in STATION_COMMANDS).
+//   - a court station: only pause/resume, on a live match assigned to its
+//     own court (same check as scoring there);
+//   - anyone else (other umpires, members, strangers) → FORBIDDEN.
 // Only matches.timer changes: status, score, winner and progression are never
 // touched, and the countdown itself only starts in handleStartMatch.
 //   set    { duration_seconds }  before the match has ever started: configure.
@@ -2391,11 +2467,19 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
 const TIMER_SETUP_STATUSES = new Set(["scheduled", "ready", "assigned", "postponed"]);
 
 async function handleSetMatchTimer(admin, actor, payload, envelope) {
-  requireUserActor(actor);
+  const isStation = actor.kind === "station";
+  // A court station may only pause/resume (umpire timeout) — also enforced by
+  // assertStationMayIssue before any handler runs.
+  if (isStation && payload.action !== "pause" && payload.action !== "resume") {
+    throw httpError(403, "FORBIDDEN", "Court stations can only pause or resume the game timer");
+  }
   const match = await getMatch(admin, payload.match_id);
-  const member = await loadMember(admin, match.tournament_id, actor.id);
+  const member = isStation ? null : await loadMember(admin, match.tournament_id, actor.id);
   const isOrganizer = Boolean(member) && ["organizer", "admin"].includes(member.role);
-  if (isOrganizer) {
+  if (isStation) {
+    // Same device + court-assignment check as scoring on this court.
+    await authorizeMatchOperation(admin, actor, match);
+  } else if (isOrganizer) {
     await requireOrganizerLicensed(admin, actor, member);
   } else {
     // Only this match's assigned umpire; like their own Hold, not license-gated.
@@ -2459,7 +2543,7 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
     if (timer.runningSince === current.runningSince && timer.remainingMs === current.remainingMs) {
       timer = current; // already paused / already running: unchanged
     } else {
-      timer = { ...timer, updatedAt: now, updatedBy: actor.id };
+      timer = { ...timer, updatedAt: now, updatedBy: isStation ? actor.deviceId : actor.id };
     }
   } else {
     throw httpError(400, "INVALID_COMMAND", "action must be set, clear, adjust, reset, pause or resume");
@@ -2470,7 +2554,7 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
   persistMatch(batch, next);
   return commit(admin, batch, {
     ...envelope,
-    actorId: actor.id,
+    ...actorCommit(actor),
     tournamentId: match.tournament_id,
     matchId: match.id,
     result: { match: next },
@@ -2615,6 +2699,7 @@ const HANDLERS = {
   score_event: handleScoreEvent,
   complete_match: handleCompleteMatch,
   set_match_timer: handleSetMatchTimer,
+  declare_default_win: handleDeclareDefaultWin,
 };
 
 // Deterministic JSON (object keys sorted, recursively) so the same request

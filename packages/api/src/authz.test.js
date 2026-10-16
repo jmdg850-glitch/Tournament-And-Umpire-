@@ -54,6 +54,15 @@ describe("station command allowlist", () => {
     expect(() => assertAllowedScoreEventType("undo")).not.toThrow();
   });
 
+  test("stations may only pause or resume the game timer", () => {
+    for (const action of ["pause", "resume"]) {
+      expect(() => assertStationMayIssue({ kind: "station" }, "set_match_timer", { action })).not.toThrow();
+    }
+    for (const action of ["set", "clear", "adjust", "reset", undefined]) {
+      expect(() => assertStationMayIssue({ kind: "station" }, "set_match_timer", { action })).toThrow(/pause or resume/i);
+    }
+  });
+
   test("organizer actors are not blocked by the station allowlist", () => {
     expect(() => assertStationMayIssue({ kind: "user" }, "transition_match", {})).not.toThrow();
   });

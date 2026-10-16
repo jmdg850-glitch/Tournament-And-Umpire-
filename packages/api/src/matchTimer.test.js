@@ -329,11 +329,50 @@ describe("set_match_timer — pause / resume (umpire timeout)", () => {
     expect(await fail(timerCmd(admin, ORGANIZER, "resume"))).toMatchObject({ status: 409, code: "MATCH_NOT_ACTIVE" });
   });
 
-  test("another umpire and a court station are refused", async () => {
+  test("another umpire, and a station not paired to this match's court, are refused", async () => {
     const admin = withOtherUmpire(await live());
     const before = row(admin).timer;
     expect(await fail(timerCmd(admin, OTHER_UMPIRE, "pause"))).toMatchObject({ status: 403, code: "FORBIDDEN" });
-    expect(await fail(timerCmd(admin, STATION, "pause"))).toMatchObject({ status: 403, code: "FORBIDDEN" });
+    expect(await fail(timerCmd(admin, STATION, "pause"))).toMatchObject({ status: 403, code: "COURT_MISMATCH" });
+    expect(row(admin).timer).toEqual(before);
+  });
+
+  // A paired court station (umpire phone in station mode) on this match's court.
+  const withStation = (admin, { court = "c-1" } = {}) => {
+    admin.tables.court_devices = [{ id: STATION.deviceId, tournament_id: T, court_id: "c-1", status: "active" }];
+    admin.tables.court_assignments.push({ id: "ca-1", match_id: M, court_id: court });
+    return admin;
+  };
+
+  test("the court station on this match's court pauses and resumes a live game", async () => {
+    const admin = withStation(await live());
+    advance(30);
+    await timerCmd(admin, STATION, "pause");
+    advance(60);
+    expect(timerView(row(admin), Date.now())).toMatchObject({ state: "paused", remainingMs: 570000 });
+    expect(row(admin).timer.updatedBy).toBe(STATION.deviceId);
+    await timerCmd(admin, STATION, "resume");
+    advance(10);
+    expect(timerView(row(admin), Date.now())).toMatchObject({ state: "running", remainingMs: 560000 });
+  });
+
+  test("a station on another court is refused", async () => {
+    const admin = withStation(await live(), { court: "c-2" });
+    expect(await fail(timerCmd(admin, STATION, "pause"))).toMatchObject({ status: 403, code: "COURT_MISMATCH" });
+  });
+
+  test("a station still can't set, clear, adjust or reset the timer", async () => {
+    const admin = withStation(await live());
+    const before = row(admin).timer;
+    for (const payload of [
+      { action: "adjust", delta_seconds: 60 },
+      { action: "reset" },
+      { action: "set", duration_seconds: 900 },
+      { action: "clear" },
+    ]) {
+      const err = await fail(send(admin, STATION, "set_match_timer", { match_id: M, ...payload }));
+      expect(err).toMatchObject({ status: 403, code: "FORBIDDEN" });
+    }
     expect(row(admin).timer).toEqual(before);
   });
 });

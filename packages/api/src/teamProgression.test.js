@@ -839,6 +839,36 @@ describe("organizer correction of a completed team-elimination pair match", () =
     expect(row(admin, "rr-pm-6").winner).toBe("A");
   });
 
+  test("win by default on a semifinal pair match advances it like a played win", async () => {
+    const admin = begLow();
+    const semiWith = await semisWith(admin);
+    const sf = semiWith("KEN");
+    const [child] = childOf(admin, sf.id);
+    const kenSlot = side(admin, child.id, "A").participant_id === id("KEN") ? "A" : "B";
+    const opponent = pairsIn(admin, sf.id).find((p) => p !== id("KEN"));
+    const res = await send(admin, "declare_default_win", { match_id: child.id, winner: kenSlot, reason: "Opponent injured" });
+    expect(res.ok).toBe(true);
+    expect(row(admin, child.id)).toMatchObject({ status: "completed", winner: kenSlot });
+    expect(row(admin, sf.id)).toMatchObject({ status: "completed", winner: kenSlot });
+    const [final] = parents(admin, "final");
+    const [bronze] = parents(admin, "bronze");
+    expect(pairsIn(admin, final.id)).toContain(id("KEN"));
+    expect(pairsIn(admin, bronze.id)).toContain(opponent);
+    // The team matchup itself is decided through its pair match, not directly.
+    const err = await send(admin, "declare_default_win", { match_id: semiWith("JEFF").id, winner: "A", reason: "x" })
+      .then(() => { throw new Error("unexpectedly succeeded"); }, (e) => e);
+    expect(err.status).toBe(409);
+  });
+
+  test("a qualification pair match can't be cancelled (the matchup would never finish)", async () => {
+    const admin = begLow();
+    const m = row(admin, "rr-pm-6");
+    m.status = "scheduled"; m.winner = null;
+    const err = await send(admin, "transition_match", { match_id: "rr-pm-6", status: "cancelled", reason: "x" })
+      .then(() => { throw new Error("unexpectedly succeeded"); }, (e) => e);
+    expect([err.status, err.code]).toEqual([409, "CANCEL_BLOCKS_BRACKET"]);
+  });
+
   test("qualification: a same-winner score fix after the playoffs is still allowed", async () => {
     const admin = begLow();
     await send(admin, "generate_team_playoffs", { division_id: D });

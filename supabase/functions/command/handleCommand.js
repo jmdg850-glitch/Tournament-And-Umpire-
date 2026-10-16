@@ -1260,7 +1260,8 @@ var COMMAND_TYPES = Object.freeze([
   "coin_toss",
   "score_event",
   "complete_match",
-  "set_match_timer"
+  "set_match_timer",
+  "declare_default_win"
 ]);
 var TOURNAMENT_STATUSES2 = Object.freeze([
   "draft",
@@ -1435,8 +1436,11 @@ var STATION_COMMANDS = /* @__PURE__ */ new Set([
   "start_match",
   "coin_toss",
   "score_event",
-  "complete_match"
+  "complete_match",
+  // pause/resume only (an umpire timeout) — see assertStationMayIssue.
+  "set_match_timer"
 ]);
+var STATION_TIMER_ACTIONS = /* @__PURE__ */ new Set(["pause", "resume"]);
 var STATION_SCORE_EVENT_TYPES = /* @__PURE__ */ new Set(["point", "undo"]);
 var STATION_FORBIDDEN_COMMANDS = Object.freeze([
   "transition_match",
@@ -1473,6 +1477,9 @@ function assertStationMayIssue(actor, type, payload) {
     if (eventType && !STATION_SCORE_EVENT_TYPES.has(eventType)) {
       forbid("Court stations cannot issue this scoring action");
     }
+  }
+  if (type === "set_match_timer" && !STATION_TIMER_ACTIONS.has(payload?.action)) {
+    forbid("Court stations can only pause or resume the game timer");
   }
 }
 var USER_ONLY_SCORE_EVENT_TYPES = /* @__PURE__ */ new Set(["correction"]);
@@ -3301,7 +3308,9 @@ async function handleTransitionMatch(admin, actor, payload, envelope) {
   if (isOrganizer) {
     await requireLicense(admin, actor);
   } else {
-    if (payload.status !== "postponed" || match.status !== "in_progress") {
+    const umpireHold = payload.status === "postponed" && match.status === "in_progress";
+    const umpireCancel = payload.status === "cancelled" || payload.status === "abandoned";
+    if (!umpireHold && !umpireCancel) {
       requireOrganizer(member);
     }
     const ump = await matchUmpire(admin, match.id);
@@ -3316,6 +3325,12 @@ async function handleTransitionMatch(admin, actor, payload, envelope) {
     throw httpError(409, err.code || "ILLEGAL_TRANSITION", err.message);
   }
   const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  if (payload.status === "cancelled" || payload.status === "abandoned") {
+    if (match.next_match_id || match.loser_next_match_id || match.parent_match_id) {
+      throw httpError(409, "CANCEL_BLOCKS_BRACKET", "This match's result is needed for the next round, so it can't be cancelled. Use Win by default instead.");
+    }
+    if (!reason) throw httpError(400, "REASON_REQUIRED", "A reason is required to cancel a match");
+  }
   const next = { ...match, status: payload.status };
   if (match.status === "in_progress" && normalizeTimer(match.timer)) {
     next.timer = pauseTimer(match.timer, nowIso());
@@ -3496,6 +3511,9 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
   const eventPayload = payload.event_payload || payload.payload || {};
   if (wasCompleted) {
     if (!isCorrection) throw httpError(409, "ILLEGAL_TRANSITION", "Match is not in progress");
+    if (match.score_state?.defaultWin) {
+      throw httpError(409, "DEFAULT_WIN", "This match was won by default; its score can't be edited");
+    }
     if ((settings.bestOf || 1) > 1) {
       throw httpError(409, "CORRECTION_UNSUPPORTED", "Correcting a completed multi-game match is not supported");
     }
@@ -3639,13 +3657,66 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
   await reconcilePlayoffChildren(admin, match.division_id, division.format);
   return result;
 }
-var TIMER_SETUP_STATUSES = /* @__PURE__ */ new Set(["scheduled", "ready", "assigned", "postponed"]);
-async function handleSetMatchTimer(admin, actor, payload, envelope) {
+var DEFAULT_WIN_FROM = /* @__PURE__ */ new Set(["scheduled", "ready", "assigned", "postponed", "in_progress"]);
+async function handleDeclareDefaultWin(admin, actor, payload, envelope) {
   requireUserActor(actor);
   const match = await getMatch(admin, payload.match_id);
-  const member = await loadMember(admin, match.tournament_id, actor.id);
+  await authorizeMatchOperation(admin, actor, match);
+  if (!DEFAULT_WIN_FROM.has(match.status)) {
+    throw httpError(409, "MATCH_NOT_ACTIVE", `A ${match.status} match can't be won by default`);
+  }
+  const winner = payload.winner;
+  if (winner !== "A" && winner !== "B") {
+    throw httpError(400, "INVALID_COMMAND", "winner must be A or B");
+  }
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  if (!reason) throw httpError(400, "REASON_REQUIRED", "A reason is required for a win by default");
+  const division = await getDivision(admin, match.division_id);
+  await assertMatchPlayable(admin, match, division);
+  const settings = await matchScoringSettings(admin, division, match);
+  const prev = match.score_state || {};
+  const at = nowIso();
+  const state = {
+    ...prev,
+    winTo: settings.winTo,
+    winBy: settings.winBy,
+    bestOf: settings.bestOf,
+    scoreA: 0,
+    scoreB: 0,
+    games: [],
+    status: "completed",
+    winner,
+    lastSeq: Number.isSafeInteger(prev.lastSeq) ? prev.lastSeq : 0,
+    defaultWin: { winner, reason, at }
+  };
+  const batch = createBatch();
+  batch.expectMatch(match);
+  const asLive = { ...match, status: "in_progress" };
+  if (normalizeTimer(match.timer)) asLive.timer = pauseTimer(match.timer, at);
+  const fin = await finishMatchIfWon(admin, batch, asLive, state, actor.id);
+  const result = await commit(admin, batch, {
+    ...envelope,
+    ...actorCommit(actor),
+    tournamentId: match.tournament_id,
+    matchId: match.id,
+    result: { match: fin.match, progressed: fin.progressed },
+    detail: { ok: true, default_win: { match_id: match.id, winner, reason, from_status: match.status } }
+  });
+  await reconcilePlayoffChildren(admin, match.division_id, division.format);
+  return result;
+}
+var TIMER_SETUP_STATUSES = /* @__PURE__ */ new Set(["scheduled", "ready", "assigned", "postponed"]);
+async function handleSetMatchTimer(admin, actor, payload, envelope) {
+  const isStation = actor.kind === "station";
+  if (isStation && payload.action !== "pause" && payload.action !== "resume") {
+    throw httpError(403, "FORBIDDEN", "Court stations can only pause or resume the game timer");
+  }
+  const match = await getMatch(admin, payload.match_id);
+  const member = isStation ? null : await loadMember(admin, match.tournament_id, actor.id);
   const isOrganizer = Boolean(member) && ["organizer", "admin"].includes(member.role);
-  if (isOrganizer) {
+  if (isStation) {
+    await authorizeMatchOperation(admin, actor, match);
+  } else if (isOrganizer) {
     await requireOrganizerLicensed(admin, actor, member);
   } else {
     const ump = await matchUmpire(admin, match.id);
@@ -3702,7 +3773,7 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
     if (timer.runningSince === current.runningSince && timer.remainingMs === current.remainingMs) {
       timer = current;
     } else {
-      timer = { ...timer, updatedAt: now, updatedBy: actor.id };
+      timer = { ...timer, updatedAt: now, updatedBy: isStation ? actor.deviceId : actor.id };
     }
   } else {
     throw httpError(400, "INVALID_COMMAND", "action must be set, clear, adjust, reset, pause or resume");
@@ -3713,7 +3784,7 @@ async function handleSetMatchTimer(admin, actor, payload, envelope) {
   persistMatch(batch, next);
   return commit(admin, batch, {
     ...envelope,
-    actorId: actor.id,
+    ...actorCommit(actor),
     tournamentId: match.tournament_id,
     matchId: match.id,
     result: { match: next }
@@ -3842,7 +3913,8 @@ var HANDLERS = {
   coin_toss: handleCoinToss,
   score_event: handleScoreEvent,
   complete_match: handleCompleteMatch,
-  set_match_timer: handleSetMatchTimer
+  set_match_timer: handleSetMatchTimer,
+  declare_default_win: handleDeclareDefaultWin
 };
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
