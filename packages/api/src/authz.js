@@ -30,6 +30,9 @@ export const STATION_FORBIDDEN_COMMANDS = Object.freeze([
   "add_member",
   "add_person",
   "create_team",
+  "update_person",
+  "set_default_win_score",
+  "replace_playoff_qualifier",
 ]);
 
 function forbid(message) {

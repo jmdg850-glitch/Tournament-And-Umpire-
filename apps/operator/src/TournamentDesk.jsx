@@ -43,7 +43,7 @@ import { UmpiresPanel } from "./screens/UmpiresPanel.jsx";
 import { LiveTiles, MatchesPanel } from "./screens/MatchesPanel.jsx";
 import { ResultsPanel } from "./screens/ResultsPanel.jsx";
 import { SettingsPanel } from "./screens/SettingsPanel.jsx";
-import { openLiveMatchWindow, useRealtimeChannel } from "./useRealtimeChannel.js";
+import { notifyDeskRefresh, openLiveMatchWindow, useRealtimeChannel } from "./useRealtimeChannel.js";
 import { useDesktopUpdateContext } from "./UpdateBanner.jsx";
 import OfflineStatusBanner from "./OfflineStatusBanner.jsx";
 import { INITIAL_LOAD_INFO, LOAD_FAILURE_STATUS as FAILURE_STATUS, deskOutcome, mergeServerMatches } from "./offlineData.js";
@@ -248,6 +248,15 @@ export default function TournamentDesk({ supabase, session, identityMode, reposi
     }
   }, [data, busy, loadInfo.source, loadInfo.status]);
 
+  // Every confirmed desk command also tells this tournament's open pop-out
+  // windows to reload (renames etc. aren't realtime events). Queued offline
+  // commands aren't confirmed yet, so they don't.
+  const deskCommand = useCallback(async (type, payload, options) => {
+    const out = await command(type, payload, options);
+    if (!out?.queued) notifyDeskRefresh(tournamentId);
+    return out;
+  }, [command, tournamentId]);
+
   async function run(label, type, payload, needsConfirm, { onError } = {}) {
     if (needsConfirm) {
       setConfirm({ label, type, payload, danger: /cancel|remove|archive/i.test(label) });
@@ -256,7 +265,7 @@ export default function TournamentDesk({ supabase, session, identityMode, reposi
     setBusy(label);
     setError("");
     try {
-      const out = await command(type, payload, { durable: true });
+      const out = await deskCommand(type, payload, { durable: true });
       if (out?.queued) {
         toast(`${label} — queued, will sync when back online`);
       } else {
@@ -414,18 +423,18 @@ export default function TournamentDesk({ supabase, session, identityMode, reposi
                 onOpenLive={() => setTab("matches")}
                 onOpenLiveWindow={(matchId) => openLiveMatchWindow(t.id, matchId)}
                 onGoto={setTab}
-                command={command}
+                command={deskCommand}
                 load={load}
               />
             )}
-            {tab === "brackets" && <BracketsPanel data={data} command={command} load={load} />}
+            {tab === "brackets" && <BracketsPanel data={data} command={deskCommand} load={load} />}
             {tab === "settings" && <SettingsPanel t={t} busy={busy} run={run} />}
             {tab === "divisions" && <DivisionsPanel data={data} busy={busy} run={run} />}
-            {tab === "players" && <PlayersPanel data={data} busy={busy} run={run} command={command} load={load} />}
+            {tab === "players" && <PlayersPanel data={data} busy={busy} run={run} command={deskCommand} load={load} />}
             {tab === "teams" && <TeamsPanel data={data} busy={busy} run={run} />}
             {tab === "courts" && <CourtsPanel data={data} busy={busy} run={run} onOpenLiveWindow={(matchId) => openLiveMatchWindow(t.id, matchId)} />}
             {tab === "umpires" && <UmpiresPanel data={data} session={session} busy={busy} run={run} />}
-            {tab === "matches" && <MatchesPanel data={data} busy={busy} run={run} command={command} load={load} />}
+            {tab === "matches" && <MatchesPanel data={data} busy={busy} run={run} command={deskCommand} load={load} />}
             {tab === "results" && <ResultsPanel data={data} />}
           </div>
     </PageShell>

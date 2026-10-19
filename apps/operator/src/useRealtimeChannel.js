@@ -70,3 +70,34 @@ export async function openMatchDisplayWindow(tournamentId, divisionId) {
   window.open(url, `tournament-matches-${divisionId}`, "noopener,noreferrer,width=1000,height=760");
   return { ok: true, browser: true };
 }
+
+// Desk → pop-out refresh. Persons and participants are not in the realtime
+// publication, so a change like a player rename never reaches an open Bracket,
+// Match display or Live window by itself. After a confirmed command the main
+// desk posts on a tournament-scoped BroadcastChannel (same origin only), and
+// those windows reload. Best effort: without BroadcastChannel they still
+// reload on focus/visibility as before.
+const deskRefreshChannel = (tournamentId) => `desk-refresh:${tournamentId}`;
+
+export function notifyDeskRefresh(tournamentId) {
+  if (!tournamentId || typeof BroadcastChannel === "undefined") return;
+  try {
+    const ch = new BroadcastChannel(deskRefreshChannel(tournamentId));
+    ch.postMessage({ type: "refresh", at: Date.now() });
+    ch.close();
+  } catch { /* unavailable: windows refresh on focus instead */ }
+}
+
+export function useDeskRefreshListener(tournamentId, onRefresh) {
+  const ref = useRef(onRefresh);
+  ref.current = onRefresh;
+  useEffect(() => {
+    if (!tournamentId || typeof BroadcastChannel === "undefined") return undefined;
+    let ch;
+    try {
+      ch = new BroadcastChannel(deskRefreshChannel(tournamentId));
+      ch.onmessage = () => { ref.current?.(); };
+    } catch { return undefined; }
+    return () => ch.close();
+  }, [tournamentId]);
+}

@@ -876,3 +876,158 @@ describe("organizer correction of a completed team-elimination pair match", () =
     expect(row(admin, "rr-pm-6")).toMatchObject({ winner: "A", score_state: expect.objectContaining({ scoreA: 11, scoreB: 7 }) });
   });
 });
+
+// Operator → Edit qualifiers: the organizer corrects a seeded playoff slot
+// with another pair of the same team. The automatic result is preserved in
+// the knockout stage config; nothing regenerates over the override.
+describe("replace_playoff_qualifier (organizer correction of a semifinal qualifier)", () => {
+  const UMPIRE = { kind: "user", id: "umpire-1", email: "umpire@example.com" };
+  const STATION = { kind: "station", id: "dev-1", deviceId: "dev-1", courtId: "c-1", tournamentId: T };
+  const row = (admin, mid) => admin.tables.matches.find((m) => m.id === mid);
+  async function seeded() {
+    const admin = begLow();
+    await send(admin, "generate_team_playoffs", { division_id: D });
+    const semis = parents(admin, "semifinal");
+    const at = (key) => {
+      const m = semis.find((x) => pairsIn(admin, x.id).includes(id(key)));
+      return { match: m, slot: side(admin, m.id, "A").participant_id === id(key) ? "A" : "B" };
+    };
+    return { admin, at };
+  }
+  const replace = (admin, { match, slot }, toKey, extra = {}) => ({
+    match_id: match.id, slot, participant_id: id(toKey), reason: "Wrong pair seeded", ...extra,
+  });
+
+  test("replaces the pair in the slot and its pair match, records the override, keeps the automatic result", async () => {
+    const { admin, at } = await seeded();
+    const jeff = at("JEFF");
+    const res = await send(admin, "replace_playoff_qualifier", replace(admin, jeff, "GRACE", { expected_participant_id: id("JEFF") }));
+    expect(res.ok).toBe(true);
+    expect(side(admin, jeff.match.id, jeff.slot)).toMatchObject({ participant_id: id("GRACE"), team_id: NEXTG });
+    const [child] = childOf(admin, jeff.match.id);
+    expect(childOf(admin, jeff.match.id)).toHaveLength(1);
+    expect(pairsIn(admin, child.id)).toEqual(pairsIn(admin, jeff.match.id));
+    const stage = admin.tables.stages.find((s) => s.kind === "team_knockout");
+    expect(stage.config).toMatchObject({ qualifierMode: "top_x_per_team", qualifierCount: 2 });
+    expect(stage.config.auto_slots).toContainEqual({ match_id: jeff.match.id, slot: jeff.slot, participant_id: id("JEFF") });
+    expect(stage.config.overrides).toEqual([expect.objectContaining({
+      match_id: jeff.match.id, slot: jeff.slot, from_participant_id: id("JEFF"), to_participant_id: id("GRACE"),
+      reason: "Wrong pair seeded", by: ORGANIZER.id,
+    })]);
+    expect(JSON.stringify(admin.tables.audit_logs.at(-1).detail)).toContain("playoff_override");
+    // The qualification results themselves are untouched.
+    expect(admin.tables.matches.filter((m) => m.parent_match_id === "rr-1").every((m) => m.status === "completed")).toBe(true);
+  });
+
+  test("a second override keeps the original automatic slots; replacing back restores the automatic pair", async () => {
+    const { admin, at } = await seeded();
+    const jeff = at("JEFF");
+    await send(admin, "replace_playoff_qualifier", replace(admin, jeff, "GRACE", { expected_participant_id: id("JEFF") }));
+    await send(admin, "replace_playoff_qualifier", replace(admin, jeff, "JEFF", { expected_participant_id: id("GRACE"), reason: "Undo" }));
+    const stage = admin.tables.stages.find((s) => s.kind === "team_knockout");
+    expect(stage.config.auto_slots).toContainEqual({ match_id: jeff.match.id, slot: jeff.slot, participant_id: id("JEFF") });
+    expect(stage.config.overrides).toHaveLength(2);
+    expect(side(admin, jeff.match.id, jeff.slot).participant_id).toBe(id("JEFF"));
+  });
+
+  test("the override survives: generating playoffs again is refused and the slot keeps the corrected pair", async () => {
+    const { admin, at } = await seeded();
+    const jeff = at("JEFF");
+    await send(admin, "replace_playoff_qualifier", replace(admin, jeff, "GRACE", { expected_participant_id: id("JEFF") }));
+    const err = await sendErr(admin, "generate_team_playoffs", { division_id: D });
+    expect([err.status, err.code]).toEqual([409, "PLAYOFFS_EXIST"]);
+    expect(side(admin, jeff.match.id, jeff.slot).participant_id).toBe(id("GRACE"));
+  });
+
+  test("the replacement pair plays its semifinal and advances to the final; its opponent goes to bronze", async () => {
+    const { admin, at } = await seeded();
+    const jeff = at("JEFF");
+    await send(admin, "replace_playoff_qualifier", replace(admin, jeff, "GRACE", { expected_participant_id: id("JEFF") }));
+    const opponent = pairsIn(admin, jeff.match.id).find((p) => p !== id("GRACE"));
+    await playKnockout(admin, jeff.match.id, id("GRACE"));
+    const [final] = parents(admin, "final");
+    const [bronze] = parents(admin, "bronze");
+    expect(pairsIn(admin, final.id)).toContain(id("GRACE"));
+    expect(pairsIn(admin, bronze.id)).toContain(opponent);
+    expect(pairsIn(admin, final.id)).not.toContain(id("JEFF"));
+  });
+
+  test("eligibility: another team's pair, a pair already in the playoffs, and the same pair are refused", async () => {
+    const { admin, at } = await seeded();
+    const jeff = at("JEFF");
+    const base = { expected_participant_id: id("JEFF") };
+    let err = await sendErr(admin, "replace_playoff_qualifier", replace(admin, jeff, "JOSH", base));
+    expect([err.status, err.code]).toEqual([400, "NOT_ELIGIBLE"]);
+    err = await sendErr(admin, "replace_playoff_qualifier", replace(admin, jeff, "KEN", base));
+    expect([err.status, err.code]).toEqual([409, "ALREADY_QUALIFIED"]);
+    err = await sendErr(admin, "replace_playoff_qualifier", replace(admin, jeff, "JEFF", base));
+    expect([err.status, err.code]).toEqual([400, "NOT_ELIGIBLE"]);
+    expect(side(admin, jeff.match.id, jeff.slot).participant_id).toBe(id("JEFF"));
+  });
+
+  test("a pair registered in another division is refused", async () => {
+    const { admin, at } = await seeded();
+    const jeff = at("JEFF");
+    const outsider = crypto.randomUUID();
+    admin.tables.participants.push({ id: outsider, division_id: "other-division", team_id: NEXTG, display_name: "X / Y" });
+    const err = await sendErr(admin, "replace_playoff_qualifier", { ...replace(admin, jeff, "GRACE", { expected_participant_id: id("JEFF") }), participant_id: outsider });
+    expect([err.status, err.code]).toEqual([400, "NOT_ELIGIBLE"]);
+  });
+
+  test("a stale screen (expected pair no longer in the slot) is refused", async () => {
+    const { admin, at } = await seeded();
+    const jeff = at("JEFF");
+    const err = await sendErr(admin, "replace_playoff_qualifier", replace(admin, jeff, "GRACE", { expected_participant_id: id("KEN") }));
+    expect([err.status, err.code]).toEqual([409, "STALE_STATE"]);
+  });
+
+  test("a started semifinal can't have its qualifiers changed (completed results are never rewritten)", async () => {
+    const { admin, at } = await seeded();
+    const jeff = at("JEFF");
+    const [child] = childOf(admin, jeff.match.id);
+    row(admin, child.id).status = "in_progress";
+    row(admin, child.id).started_at = "2026-09-21T06:00:00.000Z";
+    const err = await sendErr(admin, "replace_playoff_qualifier", replace(admin, jeff, "GRACE", { expected_participant_id: id("JEFF") }));
+    expect([err.status, err.code]).toEqual([409, "PLAYOFF_MATCH_STARTED"]);
+    expect(side(admin, jeff.match.id, jeff.slot).participant_id).toBe(id("JEFF"));
+  });
+
+  test("only seeded slots: a final slot fed by a semifinal and a qualification matchup are refused; a reason is required", async () => {
+    const { admin, at } = await seeded();
+    const [final] = parents(admin, "final");
+    let err = await sendErr(admin, "replace_playoff_qualifier", { match_id: final.id, slot: "A", participant_id: id("GRACE"), expected_participant_id: null, reason: "x" });
+    expect([err.status, err.code]).toEqual([400, "NOT_A_QUALIFIER_SLOT"]);
+    err = await sendErr(admin, "replace_playoff_qualifier", { match_id: "rr-1", slot: "A", participant_id: id("GRACE"), expected_participant_id: null, reason: "x" });
+    expect([err.status, err.code]).toEqual([400, "NOT_A_QUALIFIER_SLOT"]);
+    err = await sendErr(admin, "replace_playoff_qualifier", replace(admin, at("JEFF"), "GRACE", { expected_participant_id: id("JEFF"), reason: "  " }));
+    expect([err.status, err.code]).toEqual([400, "REASON_REQUIRED"]);
+  });
+
+  test("an umpire and a court station can't change qualifiers", async () => {
+    const { admin, at } = await seeded();
+    admin.tables.tournament_members.push({ id: "tm-u", tournament_id: T, user_id: UMPIRE.id, role: "umpire" });
+    const payload = replace(admin, at("JEFF"), "GRACE", { expected_participant_id: id("JEFF") });
+    for (const actor of [UMPIRE, STATION]) {
+      const err = await handleCommand({ admin, actor, body: { command_id: crypto.randomUUID(), type: "replace_playoff_qualifier", payload } })
+        .then(() => { throw new Error("unexpectedly succeeded"); }, (e) => e);
+      expect(err.status).toBe(403);
+    }
+    expect(side(admin, at("JEFF").match.id, at("JEFF").slot).participant_id).toBe(id("JEFF"));
+  });
+});
+
+describe("win by default with a recorded score in team elimination", () => {
+  const row = (admin, mid) => admin.tables.matches.find((m) => m.id === mid);
+  test("a scored W/O on a qualification pair match is stored as the match score and decides the matchup recount", async () => {
+    const admin = begLow();
+    const m = row(admin, "rr-pm-1");
+    // Re-open the match as not played (ALIE vs ADO), then give it to ADO (B) 11–0 by default.
+    m.status = "scheduled"; m.winner = null; m.score_state = {}; m.completed_at = null;
+    row(admin, "rr-1").status = "in_progress";
+    const res = await send(admin, "declare_default_win", { match_id: "rr-pm-1", winner: "B", reason: "No show", score: { a: 0, b: 11 } });
+    expect(res.ok).toBe(true);
+    expect(row(admin, "rr-pm-1").score_state).toMatchObject({ scoreA: 0, scoreB: 11, winner: "B", defaultWin: { winner: "B", score: { a: 0, b: 11 } } });
+    expect(admin.tables.match_results.find((r) => r.match_id === "rr-pm-1")).toMatchObject({ winner_slot: "B", score_a: 0, score_b: 11 });
+    expect(row(admin, "rr-1")).toMatchObject({ status: "completed", winner: "B" });
+  });
+});

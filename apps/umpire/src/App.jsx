@@ -2367,7 +2367,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
             <h2>{winnerName || "—"}</h2>
             <p className="ump-final">
               {isDefaultWin
-                ? <>Won by default (W/O){score.defaultWin.reason ? <span className="muted"> · {score.defaultWin.reason}</span> : null}</>
+                ? <>Won by default (W/O{score.defaultWin.score ? ` ${score.defaultWin.score.a}–${score.defaultWin.score.b}` : ""}){score.defaultWin.reason ? <span className="muted"> · {score.defaultWin.reason}</span> : null}</>
                 : multiGame
                 ? <>Games {gamesA}–{gamesB} <span className="muted">· last game {score.scoreA ?? 0}–{score.scoreB ?? 0}</span></>
                 : <>Final score {score.scoreA ?? 0}–{score.scoreB ?? 0}</>}

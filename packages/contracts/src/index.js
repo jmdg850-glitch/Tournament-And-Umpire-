@@ -31,6 +31,8 @@ export const COMMAND_TYPES = Object.freeze([
   "complete_match",
   "set_match_timer",
   "declare_default_win",
+  "set_default_win_score",
+  "replace_playoff_qualifier",
 ]);
 
 export const TOURNAMENT_STATUSES = Object.freeze([

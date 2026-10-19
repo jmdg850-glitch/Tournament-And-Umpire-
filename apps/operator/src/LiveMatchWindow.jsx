@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, LoadingState, Scoreboard, ServeIndicator, StatusBadge } from "@tournament/ui";
 import { Radio } from "lucide-react";
 import { applyDeskRealtime, applyMatchIfScoped, matchLiveChannelName } from "@tournament/engine";
-import { useRealtimeChannel } from "./useRealtimeChannel.js";
-import { courtFor, sideOf } from "./lib.js";
+import { useDeskRefreshListener, useRealtimeChannel } from "./useRealtimeChannel.js";
+import { courtFor, matchStageTitle, sideOf } from "./lib.js";
 import { keepFresherMatch } from "./offlineData.js";
 import { MatchTimerClock } from "./screens/MatchesPanel.jsx";
 
@@ -19,6 +19,9 @@ export default function LiveMatchWindow({ supabase, session, tournamentId, match
     persons: [],
   });
   const [error, setError] = useState("");
+  // The division's bracket skeleton — only what the stage label needs
+  // (a pair match's parent, the final round of its bracket).
+  const [stageMatches, setStageMatches] = useState([]);
 
   // Loads overlap (subscribe, focus, tab visible): only the latest may apply,
   // and a server read never replaces a newer score already on screen (a
@@ -37,13 +40,15 @@ export default function LiveMatchWindow({ supabase, session, tournamentId, match
       setMatch(null);
       return;
     }
-    const [sides, courtsA, courts, participants] = await Promise.all([
+    const [sides, courtsA, courts, participants, skeleton] = await Promise.all([
       supabase.from("match_participants").select("*").eq("match_id", matchId),
       supabase.from("court_assignments").select("*").eq("match_id", matchId),
       supabase.from("courts").select("*").eq("tournament_id", tournamentId),
       supabase.from("participants").select("*").eq("tournament_id", tournamentId),
+      supabase.from("matches").select("id, division_id, stage_id, stage_label, round, bracket_side, parent_match_id").eq("division_id", m.data.division_id),
     ]);
     if (seq !== loadSeqRef.current) return;
+    if (!skeleton.error) setStageMatches(skeleton.data || []);
     const first = [sides, courtsA, courts, participants].find((x) => x.error);
     if (first?.error) {
       setError(first.error.message);
@@ -95,6 +100,9 @@ export default function LiveMatchWindow({ supabase, session, tournamentId, match
     },
     onSubscribed: load,
   });
+
+  // A desk change that isn't a match row (e.g. a player rename) — reload.
+  useDeskRefreshListener(tournamentId, load);
 
   useEffect(() => {
     function onVis() {
@@ -157,7 +165,8 @@ export default function LiveMatchWindow({ supabase, session, tournamentId, match
           <>
             <div className="game">Game {score.gameNumber || 1}</div>
             <MatchTimerClock match={match} />
-            <div className="muted">{match.stage_label ? String(match.stage_label).replaceAll("_", " ") : `Round ${match.round}`}</div>
+            <div className="muted">{matchStageTitle(match, stageMatches)}</div>
+            {score.defaultWin ? <div><strong>Won by default (W/O)</strong></div> : null}
             {score.winTo ? <div className="muted">Race to {score.winTo}</div> : null}
           </>
         )}

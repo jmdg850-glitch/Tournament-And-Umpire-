@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { sessionGate } from "@tournament/client";
 import { loadDeskData } from "./lib.js";
+import { useDeskRefreshListener } from "./useRealtimeChannel.js";
 import { INITIAL_LOAD_INFO as INITIAL_INFO, LOAD_FAILURE_STATUS as FAILURE_STATUS, deskOutcome, mergeServerMatches } from "./offlineData.js";
 
 // Read-only display windows (Bracket, Match display): loadDeskData with this
@@ -58,6 +59,9 @@ export function useSavedDeskData({ supabase, session, repository, tournamentId }
   // an offline window settle (saved copy or a clear message) instead of
   // waiting on a subscription that can't happen.
   useEffect(() => { load(); }, [load]);
+
+  // The main desk confirmed a change (e.g. a player rename) — reload.
+  useDeskRefreshListener(tournamentId, load);
 
   return {
     data,

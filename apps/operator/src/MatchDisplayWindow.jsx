@@ -5,7 +5,7 @@ import { applyDeskRealtime, divisionDisplayChannelName, removeById, upsertById }
 import { useRealtimeChannel } from "./useRealtimeChannel.js";
 import { useSavedDeskData } from "./useSavedDeskData.js";
 import OfflineStatusBanner from "./OfflineStatusBanner.jsx";
-import { courtFor, resultFor, scoreLine, sideOf, stageTitle, umpireFor } from "./lib.js";
+import { courtFor, matchStageTitle, resultFor, scoreLine, sideOf, umpireFor } from "./lib.js";
 import { CollapsibleSection, useCollapsedSections } from "./CollapsibleSection.jsx";
 
 // A read-only, division-scoped match display — see useRealtimeChannel.js's
@@ -189,7 +189,7 @@ function DisplayMatchRow({ match, data }) {
         <div className="muted display-match-meta">
           {court ? court.name : "No court"}
           {ump ? ` · ${ump.name}` : ""}
-          {match.stage_label ? ` · ${stageTitle(match.stage_label)}` : ` · Round ${match.round}`}
+          {` · ${matchStageTitle(match, data.matches)}`}
         </div>
       </div>
       <div className="display-match-row-side">

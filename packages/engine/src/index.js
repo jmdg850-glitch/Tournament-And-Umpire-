@@ -122,6 +122,13 @@ export {
   hasKnockoutStageStarted,
 } from "./teamPlayoffs.js";
 
+export { validateDefaultWinScore } from "./defaultWin.js";
+
+export {
+  normalizeTeamNameKey,
+  buildOverallTeamStandings,
+} from "./overallTeamStandings.js";
+
 export {
   assignedPersonIds,
   validatePersonIdsForAssignment,

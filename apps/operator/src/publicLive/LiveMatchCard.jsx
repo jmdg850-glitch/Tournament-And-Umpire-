@@ -1,5 +1,5 @@
 import { Badge, Card, Scoreboard, ServeIndicator, StatusBadge } from "@tournament/ui";
-import { courtFor, sideOf, stageTitle } from "../lib.js";
+import { courtFor, sideOf, matchStageTitle } from "../lib.js";
 
 export default function LiveMatchCard({ match, data, divisionName }) {
   const a = sideOf(match.id, "A", data);
@@ -13,7 +13,7 @@ export default function LiveMatchCard({ match, data, divisionName }) {
       </div>
       <div className="muted spectator-subline">
         {divisionName}
-        {match.stage_label ? ` · ${stageTitle(match.stage_label)}` : ""}
+        {` · ${matchStageTitle(match, data.matches || [])}`}
         {match.round ? ` · Round ${match.round}` : ""}
       </div>
       <Scoreboard

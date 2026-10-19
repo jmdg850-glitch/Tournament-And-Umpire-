@@ -1,5 +1,5 @@
 import { Card, EmptyState } from "@tournament/ui";
-import { courtFor, resultFor, scoreLine, sideOf, stageTitle } from "../lib.js";
+import { courtFor, resultFor, scoreLine, sideOf, matchStageTitle } from "../lib.js";
 
 export default function ResultsList({ matches, data, divisionName }) {
   if (!matches.length) {
@@ -19,7 +19,7 @@ export default function ResultsList({ matches, data, divisionName }) {
               <strong>{court ? court.name : "Court TBD"}</strong>
               <span className="muted spectator-subline">
                 {divisionName(m.division_id)}
-                {m.stage_label ? ` · ${stageTitle(m.stage_label)}` : ""}
+                {` · ${matchStageTitle(m, data.matches || [])}`}
               </span>
             </div>
             <div className={`row spectator-matchup ${m.winner === "A" ? "won" : ""}`}>

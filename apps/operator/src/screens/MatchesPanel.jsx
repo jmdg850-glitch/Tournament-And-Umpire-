@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { Alert, Badge, Button, Card, Dropdown, EmptyState, GameTimer, Input, Modal, SectionHeader, Select, ServeIndicator, Stat, StatusBadge, Table, TickNumber, useNow } from "@tournament/ui";
 import { ExternalLink } from "lucide-react";
-import { validateFinalScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
+import { validateFinalScore, validateDefaultWinScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
 import { openLiveMatchWindow, openMatchDisplayWindow } from "../useRealtimeChannel.js";
 import { CollapsibleSection, ExpandCollapseAll, useCollapsedSections } from "../CollapsibleSection.jsx";
 import {
@@ -18,7 +18,8 @@ import {
   resultFor,
   scoreLine,
   sideOf,
-  stageTitle,
+  matchStageTitle,
+  parseOptionalScore,
   umpireFor,
 } from "../lib.js";
 
@@ -173,19 +174,94 @@ export function canDeclareDefaultWin(match, data) {
   return Boolean(sideOf(match.id, "A", data).participant && sideOf(match.id, "B", data).participant);
 }
 
+function DefaultWinScoreFields({ nameA, nameB, scoreA, scoreB, setScoreA, setScoreB, target, busy }) {
+  const digitsOnly = (v) => v.replace(/[^0-9]/g, "").slice(0, 4);
+  return (
+    <div className="stack" style={{ gap: 4 }}>
+      <p className="muted" style={{ margin: 0 }}>
+        Score (optional{target ? `, race to ${target}` : ""}) — recorded with the W/O and counted in the standings. Leave both empty for no score.
+      </p>
+      <div className="row" style={{ alignItems: "flex-end" }}>
+        <Input label={nameA} inputMode="numeric" value={scoreA} disabled={busy} onChange={(e) => setScoreA(digitsOnly(e.target.value))} />
+        <Input label={nameB} inputMode="numeric" value={scoreB} disabled={busy} onChange={(e) => setScoreB(digitsOnly(e.target.value))} />
+      </div>
+    </div>
+  );
+}
+
+// Add, correct or clear the administrative score of a match already won by
+// default (set_default_win_score, organizer only). The result stays Won by
+// Default and the winner can't change; every change is kept in the match's
+// W/O score history and the audit log.
+function DefaultWinScoreModal({ match, nameA, nameB, target, command, onClose, onSaved }) {
+  const dw = match.score_state?.defaultWin || {};
+  const winner = match.winner || dw.winner;
+  const [scoreA, setScoreA] = useState(dw.score ? String(dw.score.a) : "");
+  const [scoreB, setScoreB] = useState(dw.score ? String(dw.score.b) : "");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const score = parseOptionalScore(scoreA, scoreB);
+  const check = score === "invalid"
+    ? { ok: false, reason: "Enter both scores, or leave both empty." }
+    : validateDefaultWinScore(score ?? null, winner, { winTo: target });
+  const unchanged = JSON.stringify(score ?? null) === JSON.stringify(dw.score ?? null);
+  const canSave = !busy && check.ok && !unchanged && reason.trim();
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      await command("set_default_win_score", { match_id: match.id, score: score ?? null, reason: reason.trim() });
+      await onSaved?.();
+      onClose();
+    } catch (err) {
+      setError(err.message || "The W/O score was not changed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="W/O score" onClose={() => !busy && onClose()}>
+      <div className="stack">
+        <p className="muted" style={{ margin: 0 }}>
+          {nameA} vs {nameB} · Won by default by {winner === "A" ? nameA : nameB}{dw.reason ? ` (${dw.reason})` : ""}
+        </p>
+        <DefaultWinScoreFields nameA={nameA} nameB={nameB} scoreA={scoreA} scoreB={scoreB} setScoreA={setScoreA} setScoreB={setScoreB} target={target} busy={busy} />
+        {!check.ok && <Alert>{check.reason}</Alert>}
+        <Input label="Reason (required)" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why is the W/O score being recorded or changed?" disabled={busy} />
+        {error && <Alert>{error}</Alert>}
+        <div className="row">
+          <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button type="button" disabled={!canSave} onClick={submit}>{busy ? "Saving…" : "Save W/O score"}</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // Hold / Win by default / Cancel for one match. Hold = transition_match
 // postponed (resumed from the Matches table); Cancel = no result: cancelled
 // before play, abandoned while live; Win by default = declare_default_win
 // (recorded 0–0 W/O, advances like a played win). All audited server-side.
-function MatchActionModal({ match, mode, nameA, nameB, command, onClose, onSaved }) {
+function MatchActionModal({ match, mode, nameA, nameB, target, command, onClose, onSaved }) {
   const [reason, setReason] = useState("");
   const [winner, setWinner] = useState(null);
+  const [scoreA, setScoreA] = useState("");
+  const [scoreB, setScoreB] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const live = match.status === "in_progress";
   const nameOf = (slot) => (slot === "A" ? nameA : nameB);
   const reasonRequired = mode !== "hold";
-  const canSubmit = !busy && (!reasonRequired || reason.trim()) && (mode !== "default" || winner);
+  // Optional administrative score for a win by default: both boxes empty = no
+  // score (plain W/O). Checked here for early feedback; the server decides.
+  const score = parseOptionalScore(scoreA, scoreB);
+  const scoreCheck = mode === "default" && winner && score !== undefined
+    ? (score === "invalid" ? { ok: false, reason: "Enter both scores, or leave both empty." } : validateDefaultWinScore(score, winner, { winTo: target }))
+    : { ok: true };
+  const canSubmit = !busy && (!reasonRequired || reason.trim()) && (mode !== "default" || (winner && scoreCheck.ok));
   const title = mode === "hold" ? "Hold this match?" : mode === "cancel" ? "Cancel this match?" : "Win by default";
 
   async function submit() {
@@ -194,7 +270,7 @@ function MatchActionModal({ match, mode, nameA, nameB, command, onClose, onSaved
     try {
       const trimmed = reason.trim() || undefined;
       if (mode === "default") {
-        await command("declare_default_win", { match_id: match.id, winner, reason: trimmed });
+        await command("declare_default_win", { match_id: match.id, winner, reason: trimmed, ...(score && score !== "invalid" ? { score } : {}) });
       } else {
         const status = mode === "hold" ? "postponed" : live ? "abandoned" : "cancelled";
         await command("transition_match", { match_id: match.id, status, reason: trimmed });
@@ -220,7 +296,7 @@ function MatchActionModal({ match, mode, nameA, nameB, command, onClose, onSaved
         )}
         {mode === "default" && (
           <>
-            <p style={{ margin: 0 }}>Who wins by default (walkover)? It's recorded as W/O 0–0 and counts as a win; the winner moves on in the bracket. This can't be undone.</p>
+            <p style={{ margin: 0 }}>Who wins by default (walkover)? The result is recorded as Won by Default (W/O) and counts as a win; the winner moves on in the bracket. This can't be undone.</p>
             <div className="row" style={{ flexWrap: "wrap" }}>
               {["A", "B"].map((slot) => (
                 <Button
@@ -235,6 +311,8 @@ function MatchActionModal({ match, mode, nameA, nameB, command, onClose, onSaved
                 </Button>
               ))}
             </div>
+            <DefaultWinScoreFields nameA={nameA} nameB={nameB} scoreA={scoreA} scoreB={scoreB} setScoreA={setScoreA} setScoreB={setScoreB} target={target} busy={busy} />
+            {!scoreCheck.ok && <Alert>{scoreCheck.reason}</Alert>}
           </>
         )}
         <Input
@@ -452,6 +530,7 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
           mode={action.mode}
           nameA={sideOf(actionMatch.id, "A", data).name}
           nameB={sideOf(actionMatch.id, "B", data).name}
+          target={scoringTargetFor(actionMatch, data.matches, divisionTargetsFor(actionMatch, data.divisions))}
           command={command}
           onClose={() => setAction(null)}
           onSaved={load}
@@ -749,6 +828,8 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
   const editingScoreMatch = editingScoreId ? rows.find((m) => m.id === editingScoreId) : null;
   const [action, setAction] = useState(null); // { id, mode }
   const actionMatch = action ? rows.find((m) => m.id === action.id) : null;
+  const [woScoreId, setWoScoreId] = useState(null);
+  const woScoreMatch = woScoreId ? rows.find((m) => m.id === woScoreId) : null;
   return (
     <>
     <Table
@@ -767,7 +848,7 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
         {
           key: "meta",
           header: "Round",
-          render: (m) => `R${m.round}${m.stage_label ? ` · ${stageTitle(m.stage_label)}` : ""}`,
+          render: (m) => `R${m.round} · ${matchStageTitle(m, data.matches)}`,
         },
         { key: "status", header: "Status", render: (m) => <StatusBadge status={m.status} /> },
         { key: "score", header: "Score", render: (m) => scoreLine(m, resultFor(m, data.results)) },
@@ -862,7 +943,9 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
                   </Button>
                 )}
                 {m.status === "completed" && m.score_state?.defaultWin && (
-                  <span className="muted" style={{ fontSize: "var(--text-xs)" }}>Won by default</span>
+                  <Button variant="secondary" className="compact" disabled={!!busy} onClick={() => setWoScoreId(m.id)}>
+                    W/O score…
+                  </Button>
                 )}
                 {!canEditPlayers && !isHeld && m.status !== "completed" && (
                   <span className="muted" style={{ fontSize: "var(--text-xs)" }}>
@@ -907,8 +990,20 @@ function MatchTable({ data, rows, busy, run, command, load, hideDivision }) {
         mode={action.mode}
         nameA={sideOf(actionMatch.id, "A", data).name}
         nameB={sideOf(actionMatch.id, "B", data).name}
+        target={scoringTargetFor(actionMatch, data.matches, divisionTargetsFor(actionMatch, data.divisions))}
         command={command}
         onClose={() => setAction(null)}
+        onSaved={load}
+      />
+    )}
+    {woScoreMatch && (
+      <DefaultWinScoreModal
+        match={woScoreMatch}
+        nameA={sideOf(woScoreMatch.id, "A", data).name}
+        nameB={sideOf(woScoreMatch.id, "B", data).name}
+        target={scoringTargetFor(woScoreMatch, data.matches, divisionTargetsFor(woScoreMatch, data.divisions))}
+        command={command}
+        onClose={() => setWoScoreId(null)}
         onSaved={load}
       />
     )}

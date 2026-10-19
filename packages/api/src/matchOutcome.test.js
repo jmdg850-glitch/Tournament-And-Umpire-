@@ -252,3 +252,105 @@ describe("cancel a match (transition_match)", () => {
     expect(row(admin, "sf1").status).toBe("postponed");
   });
 });
+
+describe("win by default with a recorded (administrative) score", () => {
+  const result = (admin, id) => admin.tables.match_results.find((r) => r.match_id === id);
+  const setScore = (admin, actor, id, score, reason = "Scoresheet") => send(admin, actor, "set_default_win_score", { match_id: id, score, reason });
+
+  test("records the score while the result stays Won by Default; advancement is the same", async () => {
+    const admin = fixture();
+    const res = await send(admin, ORGANIZER, "declare_default_win", { match_id: "sf1", winner: "A", reason: "Retired", score: { a: 11, b: 4 } });
+    expect(res.ok).toBe(true);
+    expect(row(admin, "sf1")).toMatchObject({ status: "completed", winner: "A" });
+    expect(row(admin, "sf1").score_state).toMatchObject({ scoreA: 11, scoreB: 4, games: [], winner: "A", defaultWin: { winner: "A", reason: "Retired", score: { a: 11, b: 4 } } });
+    expect(result(admin, "sf1")).toMatchObject({ winner_slot: "A", winner_participant_id: "p1", score_a: 11, score_b: 4 });
+    expect(pairsIn(admin, "final")).toEqual(["p1", null]);
+    expect(pairsIn(admin, "bronze")).toEqual(["p2", null]);
+    expect(admin.tables.score_events).toHaveLength(0);
+    expect(JSON.stringify(admin.tables.audit_logs.at(-1).detail)).toContain("\"score\":{\"a\":11,\"b\":4}");
+  });
+
+  test("without a score it is exactly the existing 0–0 W/O (no score key)", async () => {
+    const admin = fixture();
+    await defaultWin(admin, ORGANIZER, "sf1", "B");
+    expect(row(admin, "sf1").score_state.defaultWin).not.toHaveProperty("score");
+    expect(result(admin, "sf1")).toMatchObject({ score_a: 0, score_b: 0 });
+  });
+
+  test("rejects a score that contradicts the winner, a tie, an over-target or malformed score — nothing written", async () => {
+    const admin = fixture();
+    const bad = [
+      [{ a: 4, b: 11 }, 400, "SCORE_WINNER_MISMATCH"],
+      [{ a: 6, b: 6 }, 400, "SCORE_WINNER_MISMATCH"],
+      [{ a: 15, b: 0 }, 400, "INVALID_SCORE"],
+      [{ a: "11", b: 0 }, 400, "INVALID_SCORE"],
+      [[11, 0], 400, "INVALID_SCORE"],
+    ];
+    for (const [score, status, code] of bad) {
+      const err = await fail(send(admin, ORGANIZER, "declare_default_win", { match_id: "sf1", winner: "A", reason: "x", score }));
+      expect([err.status, err.code]).toEqual([status, code]);
+    }
+    expect(row(admin, "sf1").status).toBe("scheduled");
+    expect(admin.tables.match_results).toHaveLength(0);
+  });
+
+  test("a multi-game match can't take a W/O score", async () => {
+    const admin = fixture();
+    admin.tables.divisions[0].config = { winTo: 11, bestOf: 3 };
+    const err = await fail(send(admin, ORGANIZER, "declare_default_win", { match_id: "sf1", winner: "A", reason: "x", score: { a: 11, b: 0 } }));
+    expect([err.status, err.code]).toEqual([409, "CORRECTION_UNSUPPORTED"]);
+  });
+
+  test("set_default_win_score adds, corrects and clears the score; the winner never changes; history is kept", async () => {
+    const admin = fixture();
+    await defaultWin(admin, ORGANIZER, "sf1", "B");
+    expect((await setScore(admin, ORGANIZER, "sf1", { a: 2, b: 11 })).ok).toBe(true);
+    expect(row(admin, "sf1")).toMatchObject({ status: "completed", winner: "B" });
+    expect(row(admin, "sf1").score_state).toMatchObject({ scoreA: 2, scoreB: 11, defaultWin: { winner: "B", reason: "No show", score: { a: 2, b: 11 } } });
+    expect(result(admin, "sf1")).toMatchObject({ winner_slot: "B", score_a: 2, score_b: 11 });
+    await setScore(admin, ORGANIZER, "sf1", { a: 5, b: 11 }, "Typo");
+    await setScore(admin, ORGANIZER, "sf1", null, "No score after all");
+    const dw = row(admin, "sf1").score_state.defaultWin;
+    expect(dw).not.toHaveProperty("score");
+    expect(dw.scoreHistory.map((h) => [h.from, h.to, h.reason])).toEqual([
+      [null, { a: 2, b: 11 }, "Scoresheet"],
+      [{ a: 2, b: 11 }, { a: 5, b: 11 }, "Typo"],
+      [{ a: 5, b: 11 }, null, "No score after all"],
+    ]);
+    expect(result(admin, "sf1")).toMatchObject({ winner_slot: "B", score_a: 0, score_b: 0 });
+    expect(pairsIn(admin, "final")).toEqual(["p2", null]);
+    expect(JSON.stringify(admin.tables.audit_logs.at(-1).detail)).toContain("default_win_score");
+  });
+
+  test("set_default_win_score refuses a score that would flip the winner, a played match, a missing reason", async () => {
+    const admin = fixture();
+    await defaultWin(admin, ORGANIZER, "sf1", "B");
+    let err = await fail(setScore(admin, ORGANIZER, "sf1", { a: 11, b: 2 }));
+    expect([err.status, err.code]).toEqual([400, "SCORE_WINNER_MISMATCH"]);
+    expect(row(admin, "sf1").winner).toBe("B");
+    err = await fail(setScore(admin, ORGANIZER, "sf2", { a: 11, b: 2 }));
+    expect([err.status, err.code]).toEqual([409, "NOT_DEFAULT_WIN"]);
+    err = await fail(setScore(admin, ORGANIZER, "sf1", { a: 2, b: 11 }, " "));
+    expect([err.status, err.code]).toEqual([400, "REASON_REQUIRED"]);
+  });
+
+  test("set_default_win_score is organizer-only: umpires and court stations are refused", async () => {
+    const admin = fixture();
+    await defaultWin(admin, ORGANIZER, "sf1", "B");
+    for (const actor of [UMPIRE, STATION]) {
+      const err = await fail(setScore(admin, actor, "sf1", { a: 2, b: 11 }));
+      expect(err.status).toBe(403);
+    }
+    expect(row(admin, "sf1").score_state.defaultWin).not.toHaveProperty("score");
+  });
+
+  test("the ordinary score correction path still refuses a W/O match", async () => {
+    const admin = fixture();
+    await send(admin, ORGANIZER, "declare_default_win", { match_id: "sf1", winner: "A", reason: "x", score: { a: 11, b: 0 } });
+    const err = await fail(send(admin, ORGANIZER, "score_event", {
+      match_id: "sf1", event_id: crypto.randomUUID(), seq: 1, type: "correction",
+      payload: { scoreA: 11, scoreB: 3, confirm_completed: true, reason: "x" },
+    }));
+    expect([err.status, err.code]).toEqual([409, "DEFAULT_WIN"]);
+  });
+});

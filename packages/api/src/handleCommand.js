@@ -40,6 +40,7 @@ import {
   pauseTimer,
   adjustTimer,
   resetTimer,
+  validateDefaultWinScore,
 } from "@tournament/engine";
 import { parseCommandEnvelope, isUuid } from "@tournament/contracts";
 import { applyBatch, createBatch, httpError, isUniqueViolation, nowIso, uuid } from "./writes.js";
@@ -1136,17 +1137,67 @@ async function handleUpdatePerson(admin, actor, payload, envelope) {
   if (!person) throw httpError(404, "NOT_FOUND", "Person not found");
   const member = await loadMember(admin, person.tournament_id, actor.id);
   await requireOrganizerLicensed(admin, actor, member);
-  const display_name = String(payload.display_name || "").trim();
+  const display_name = String(payload.display_name || "").trim().replace(/\s+/g, " ");
   if (!display_name) throw httpError(400, "INVALID_COMMAND", "display_name is required");
+  // A screen that loaded an older name must not overwrite a newer rename.
+  if (payload.expected_display_name !== undefined && payload.expected_display_name !== person.display_name) {
+    throw httpError(409, "STALE_STATE", "This player was renamed on another device since you loaded it. Reload and try again.");
+  }
   const next = { ...person, display_name };
   const batch = createBatch();
   batch.upsert("persons", next);
+  // Entries (participants) keep their own display name, which every match,
+  // bracket, umpire and export view shows. Update the entries whose name was
+  // built from this player's name, in the same transaction, so the rename
+  // reaches them all. Ids, registrations and results are untouched; an entry
+  // with a custom name is left as is and reported back.
+  const renamed = [];
+  const skipped = [];
+  if (display_name !== person.display_name) {
+    const { data: links } = await admin.from("participant_members").select("*").eq("person_id", person.id);
+    const participantIds = [...new Set((links || []).map((l) => l.participant_id))];
+    if (participantIds.length) {
+      const { data: entries } = await admin.from("participants").select("*").in("id", participantIds);
+      const { data: members } = await admin.from("participant_members").select("*").in("participant_id", participantIds);
+      const personIds = [...new Set((members || []).map((m) => m.person_id))];
+      const { data: people } = await admin.from("persons").select("id, display_name").in("id", personIds);
+      const nameOf = (pid) => (pid === person.id ? person.display_name : (people || []).find((p) => p.id === pid)?.display_name);
+      for (const entry of entries || []) {
+        const label = renamedEntryLabel(entry, members || [], person.id, nameOf, display_name);
+        if (label === null) skipped.push(entry.id);
+        else if (label !== entry.display_name) {
+          batch.upsert("participants", { ...entry, display_name: label });
+          renamed.push(entry.id);
+        }
+      }
+    }
+  }
   return commit(admin, batch, {
     ...envelope,
     actorId: actor.id,
     tournamentId: person.tournament_id,
-    result: { person: next },
+    result: { person: next, renamed_participants: renamed, skipped_participants: skipped },
+    detail: { ok: true, rename_person: { person_id: person.id, from: person.display_name, to: display_name, renamed_participants: renamed, skipped_participants: skipped } },
   });
+}
+
+// The entry's new display name when its current name is the one built from
+// its players' names (the way registration builds it: singles = the name,
+// pairs = "A / B" in slot order, either order accepted); null when the entry
+// has a custom name that must not be rewritten.
+function renamedEntryLabel(entry, members, personId, nameOf, newName) {
+  const norm = (v) => String(v ?? "").trim().replace(/\s+/g, " ");
+  const ids = members.filter((m) => m.participant_id === entry.id)
+    .sort((x, y) => (x.slot ?? 0) - (y.slot ?? 0))
+    .map((m) => m.person_id);
+  if (!ids.length) return null;
+  const current = norm(entry.display_name);
+  for (const order of [ids, [...ids].reverse()]) {
+    if (order.map((pid) => norm(nameOf(pid))).join(" / ") === current) {
+      return order.map((pid) => (pid === personId ? newName : norm(nameOf(pid)))).join(" / ");
+    }
+  }
+  return null;
 }
 
 async function handleRemovePerson(admin, actor, payload, envelope) {
@@ -2407,6 +2458,10 @@ async function handleDeclareDefaultWin(admin, actor, payload, envelope) {
   const division = await getDivision(admin, match.division_id);
   await assertMatchPlayable(admin, match, division);
   const settings = await matchScoringSettings(admin, division, match);
+  // Optional administrative score (e.g. 11–0). The result stays a win by
+  // default; the score is recorded as the match score so standings and
+  // qualifier ranking count it like any official score.
+  const score = defaultWinScoreOrThrow(payload.score, winner, settings);
   const prev = match.score_state || {};
   const at = nowIso();
   const state = {
@@ -2414,13 +2469,13 @@ async function handleDeclareDefaultWin(admin, actor, payload, envelope) {
     winTo: settings.winTo,
     winBy: settings.winBy,
     bestOf: settings.bestOf,
-    scoreA: 0,
-    scoreB: 0,
+    scoreA: score ? score.a : 0,
+    scoreB: score ? score.b : 0,
     games: [],
     status: "completed",
     winner,
     lastSeq: Number.isSafeInteger(prev.lastSeq) ? prev.lastSeq : 0,
-    defaultWin: { winner, reason, at },
+    defaultWin: { winner, reason, at, ...(score ? { score } : {}) },
   };
   const batch = createBatch();
   batch.expectMatch(match);
@@ -2436,10 +2491,149 @@ async function handleDeclareDefaultWin(admin, actor, payload, envelope) {
     tournamentId: match.tournament_id,
     matchId: match.id,
     result: { match: fin.match, progressed: fin.progressed },
-    detail: { ok: true, default_win: { match_id: match.id, winner, reason, from_status: match.status } },
+    detail: { ok: true, default_win: { match_id: match.id, winner, reason, from_status: match.status, score } },
   });
   await reconcilePlayoffChildren(admin, match.division_id, division.format);
   return result;
+}
+
+function defaultWinScoreOrThrow(raw, winner, settings) {
+  const check = validateDefaultWinScore(raw ?? null, winner, settings);
+  if (!check.ok) throw httpError(check.code === "CORRECTION_UNSUPPORTED" ? 409 : 400, check.code, check.reason);
+  return check.score;
+}
+
+// Organizer adds, corrects or clears the administrative score of a match that
+// was already won by default. The official result (winner, W/O status) never
+// changes here; the score is re-applied through the same completed-match
+// revision path as Edit score (match row, match_results, team-matchup
+// recount), which refuses if it would change a team result the playoffs were
+// already seeded from or a downstream match that has started.
+async function handleSetDefaultWinScore(admin, actor, payload, envelope) {
+  requireUserActor(actor);
+  const match = await getMatch(admin, payload.match_id);
+  const member = await loadMember(admin, match.tournament_id, actor.id);
+  await requireOrganizerLicensed(admin, actor, member);
+  const dw = match.score_state?.defaultWin;
+  if (match.status !== "completed" || !dw) {
+    throw httpError(409, "NOT_DEFAULT_WIN", "Only a match won by default can have its W/O score set");
+  }
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  if (!reason) throw httpError(400, "REASON_REQUIRED", "A reason is required to change a W/O score");
+  const division = await getDivision(admin, match.division_id);
+  const settings = await matchScoringSettings(admin, division, match);
+  const winner = match.winner || match.score_state?.winner || dw.winner;
+  const score = defaultWinScoreOrThrow(payload.score, winner, settings);
+  const from = dw.score ?? null;
+  const { score: _old, ...rest } = dw;
+  const entry = { from, to: score, reason, by: actor.id, at: nowIso() };
+  const state = {
+    ...match.score_state,
+    scoreA: score ? score.a : 0,
+    scoreB: score ? score.b : 0,
+    defaultWin: { ...rest, ...(score ? { score } : {}), scoreHistory: [...(dw.scoreHistory || []), entry] },
+  };
+  const batch = createBatch();
+  const fin = await reviseCompletedMatch(admin, batch, match, state);
+  const result = await commit(admin, batch, {
+    ...envelope,
+    actorId: actor.id,
+    tournamentId: match.tournament_id,
+    matchId: match.id,
+    result: { match: fin.match, progressed: fin.progressed },
+    detail: { ok: true, default_win_score: { match_id: match.id, winner, from, to: score, reason } },
+  });
+  await reconcilePlayoffChildren(admin, match.division_id, division.format);
+  return result;
+}
+
+// Organizer correction of a team-elimination playoff qualifier. Replaces the
+// pair in one SEEDED knockout slot (a slot no earlier match feeds) with
+// another pair of the same team, before that matchup or its pair match has
+// started. The automatic qualification result is never altered: the original
+// automatic occupants are kept in the knockout stage's config.auto_slots and
+// every override is appended to config.overrides (who, when, why), besides the
+// audit log. Playoffs are generated once and never regenerated, so no later
+// refresh or recalculation can silently undo an override.
+async function handleReplacePlayoffQualifier(admin, actor, payload, envelope) {
+  requireUserActor(actor);
+  const match = await getMatch(admin, payload.match_id);
+  const member = await loadMember(admin, match.tournament_id, actor.id);
+  await requireOrganizerLicensed(admin, actor, member);
+  const slot = payload.slot;
+  if (slot !== "A" && slot !== "B") throw httpError(400, "INVALID_COMMAND", "slot must be A or B");
+  if (!isUuid(payload.participant_id)) throw httpError(400, "INVALID_COMMAND", "participant_id must be a UUID");
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  if (!reason) throw httpError(400, "REASON_REQUIRED", "A reason is required to change a playoff qualifier");
+  const notSlot = () => httpError(400, "NOT_A_QUALIFIER_SLOT", "Only a seeded playoff slot (filled from qualification) can be changed");
+
+  const division = await getDivision(admin, match.division_id);
+  if (division.format !== "team_elimination" || match.parent_match_id) throw notSlot();
+  const { data: stages } = await admin.from("stages").select("*").eq("division_id", division.id);
+  const knockout = (stages || []).find((st) => st.kind === "team_knockout");
+  if (!knockout || match.stage_id !== knockout.id) throw notSlot();
+
+  const { data: stageMatches } = await admin.from("matches").select("*").eq("stage_id", knockout.id);
+  const matchups = (stageMatches || []).filter((m) => !m.parent_match_id);
+  const { data: allSides } = await admin.from("match_participants").select("*").in("match_id", matchups.map((m) => m.id));
+  const fed = (mid, s) => matchups.some((m) => (m.next_match_id === mid && m.next_match_slot === s)
+    || (m.loser_next_match_id === mid && m.loser_next_match_slot === s));
+  const sideRow = (mid, s) => (allSides || []).find((x) => x.match_id === mid && x.slot === s) || null;
+  const seeded = matchups.flatMap((m) => ["A", "B"].filter((s) => !fed(m.id, s)).map((s) => ({ match_id: m.id, slot: s, row: sideRow(m.id, s) })));
+  if (!seeded.some((x) => x.match_id === match.id && x.slot === slot)) throw notSlot();
+
+  const current = sideRow(match.id, slot);
+  const currentPid = current?.participant_id ?? null;
+  if ((payload.expected_participant_id ?? null) !== currentPid) {
+    throw httpError(409, "STALE_STATE", "This playoff slot was changed since you loaded it. Reload and try again.");
+  }
+  if (!currentPid) throw httpError(409, "NOT_ELIGIBLE", "This slot is a bye; it has no qualifier to replace");
+  const kids = (stageMatches || []).filter((k) => k.parent_match_id === match.id);
+  if (!downstreamOpen(match) || kids.some((k) => !downstreamOpen(k))) {
+    throw httpError(409, "PLAYOFF_MATCH_STARTED", "This playoff match has already started, so its qualifiers can't be changed");
+  }
+
+  const { data: entries } = await admin.from("participants").select("*").in("id", [currentPid, payload.participant_id]);
+  const was = (entries || []).find((p) => p.id === currentPid);
+  const next = (entries || []).find((p) => p.id === payload.participant_id);
+  const teamId = current.team_id ?? was?.team_id ?? null;
+  if (payload.participant_id === currentPid) throw httpError(400, "NOT_ELIGIBLE", "That pair is already in this slot");
+  if (!next || next.division_id !== division.id || (next.kind && next.kind !== "team_pair")) {
+    throw httpError(400, "NOT_ELIGIBLE", "The replacement must be a pair registered in this division");
+  }
+  if (!teamId || next.team_id !== teamId) {
+    throw httpError(400, "NOT_ELIGIBLE", "The replacement must be a pair from the same team");
+  }
+  if (seeded.some((x) => x.row?.participant_id === next.id)) {
+    throw httpError(409, "ALREADY_QUALIFIED", "That pair already holds a playoff slot");
+  }
+
+  const batch = createBatch();
+  batch.expectMatch(match);
+  persistMatch(batch, { ...match });
+  upsertMatchupSlot(batch, allSides, match.id, slot, next.id, teamId);
+  // Its pair match (if any) must carry exactly the parent's two pairs.
+  for (const k of kids) batch.expectMatch(k);
+  const overlay = ["A", "B"].map((s) => (s === slot
+    ? { slot: s, participant_id: next.id, team_id: teamId }
+    : { slot: s, participant_id: sideRow(match.id, s)?.participant_id ?? null, team_id: sideRow(match.id, s)?.team_id ?? null }));
+  await ensurePlayoffChildInBatch(admin, batch, match, overlay);
+
+  const cfg = knockout.config || {};
+  const autoSlots = Array.isArray(cfg.auto_slots)
+    ? cfg.auto_slots
+    : seeded.map((x) => ({ match_id: x.match_id, slot: x.slot, participant_id: x.row?.participant_id ?? null }));
+  const override = { match_id: match.id, slot, from_participant_id: currentPid, to_participant_id: next.id, team_id: teamId, reason, by: actor.id, at: nowIso() };
+  batch.upsert("stages", { ...knockout, config: { ...cfg, auto_slots: autoSlots, overrides: [...(cfg.overrides || []), override] } });
+
+  return commit(admin, batch, {
+    ...envelope,
+    actorId: actor.id,
+    tournamentId: match.tournament_id,
+    matchId: match.id,
+    result: { match_id: match.id, override },
+    detail: { ok: true, playoff_override: override },
+  });
 }
 
 // Game timer control. Enforced here, never in the client:
@@ -2700,6 +2894,8 @@ const HANDLERS = {
   complete_match: handleCompleteMatch,
   set_match_timer: handleSetMatchTimer,
   declare_default_win: handleDeclareDefaultWin,
+  set_default_win_score: handleSetDefaultWinScore,
+  replace_playoff_qualifier: handleReplacePlayoffQualifier,
 };
 
 // Deterministic JSON (object keys sorted, recursively) so the same request

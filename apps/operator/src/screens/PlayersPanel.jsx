@@ -94,12 +94,18 @@ export function PlayersPanel({ data, busy, run, command, load }) {
     setEditName(p.display_name);
   }
 
-  function saveRename(e, p) {
+  // The server renames the player and every entry built from the name (match,
+  // bracket, umpire, export views all show the entry name). The name this
+  // screen loaded is sent along, so a rename made meanwhile on another device
+  // is refused instead of silently overwritten.
+  async function saveRename(e, p) {
     e.preventDefault();
-    const name = editName.trim();
+    const name = editName.trim().replace(/\s+/g, " ");
     setEditingPersonId(null);
     if (name && name !== p.display_name) {
-      run("Rename player", "update_person", { person_id: p.id, display_name: name });
+      const out = await run("Rename player", "update_person", { person_id: p.id, display_name: name, expected_display_name: p.display_name });
+      const skipped = out?.result?.skipped_participants?.length || 0;
+      if (skipped) toast(`${skipped} entr${skipped === 1 ? "y has" : "ies have"} a custom name and kept it — edit those entries if needed`);
     }
   }
 

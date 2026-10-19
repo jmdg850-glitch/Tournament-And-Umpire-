@@ -1,4 +1,4 @@
-import { rankIndividualPairsForSemifinals, buildTeamStandingsFromRoundRobin, matchScoringTarget } from "@tournament/engine";
+import { rankIndividualPairsForSemifinals, buildTeamStandingsFromRoundRobin, buildOverallTeamStandings, matchScoringTarget } from "@tournament/engine";
 
 export const TOURNAMENT_FLOW = [
   "draft",
@@ -194,12 +194,24 @@ export function sideOf(matchId, slot, data) {
 }
 
 export function scoreLine(match, result) {
-  // Won by default (declare_default_win): recorded 0–0, shown as a walkover.
-  if (match?.score_state?.defaultWin) return "W/O";
+  // Won by default (declare_default_win): shown as a walkover, with the
+  // administrative score when the organizer recorded one (e.g. "W/O 11–0").
+  const dw = match?.score_state?.defaultWin;
+  if (dw) return dw.score ? `W/O ${dw.score.a}–${dw.score.b}` : "W/O";
   const a = result?.score_a ?? match?.score_state?.scoreA;
   const b = result?.score_b ?? match?.score_state?.scoreB;
   if (a == null && b == null) return "—";
   return `${a ?? 0}–${b ?? 0}`;
+}
+
+// Win-by-default score boxes: both empty → undefined (no score); one empty →
+// "invalid"; otherwise { a, b }.
+export function parseOptionalScore(scoreA, scoreB) {
+  const a = String(scoreA ?? "").trim();
+  const b = String(scoreB ?? "").trim();
+  if (!a && !b) return undefined;
+  if (!a || !b) return "invalid";
+  return { a: Number.parseInt(a, 10), b: Number.parseInt(b, 10) };
 }
 
 export function memberName(userId, profiles) {
@@ -230,6 +242,37 @@ export function stageTitle(label) {
   if (label === "final") return "Final";
   if (label === "knockout") return "Playoffs";
   return String(label).replaceAll("_", " ");
+}
+
+// The stage a match belongs to, from the stored bracket model — never from
+// display text. Team elimination stores the stage key on the matchup
+// (matches.stage_label); its pair matches (the ones actually played) carry no
+// label and inherit their matchup's stage. Single elimination stores no label,
+// so the stage follows from the round: last round = Final (bronze match:
+// Bronze), then Semifinals, Quarterfinals, otherwise "Round N".
+export function matchStageTitle(match, matches = []) {
+  if (!match) return "Match";
+  if (match.parent_match_id) {
+    const parent = matches.find((m) => m.id === match.parent_match_id);
+    if (parent) return matchStageTitle(parent, matches);
+  }
+  const label = match.stage_label;
+  if (label === "knockout") {
+    const final = matches.find((m) => m.stage_id === match.stage_id && m.stage_label === "final" && !m.parent_match_id);
+    const fromFinal = final && Number.isInteger(match.round) ? final.round - match.round : null;
+    if (fromFinal === 2) return "Quarterfinals";
+    if (fromFinal > 2) return `Round of ${2 ** (fromFinal + 1)}`;
+    return stageTitle(label);
+  }
+  if (label) return stageTitle(label);
+  if (match.bracket_side === "bronze") return "Bronze";
+  if (!Number.isInteger(match.round)) return "Match";
+  const bracket = matches.filter((m) => m.division_id === match.division_id && !m.parent_match_id && !m.stage_label && Number.isInteger(m.round));
+  const maxRound = Math.max(match.round, ...bracket.map((m) => m.round));
+  if (match.round === maxRound) return "Final";
+  if (match.round === maxRound - 1) return "Semifinals";
+  if (match.round === maxRound - 2) return "Quarterfinals";
+  return `Round ${match.round}`;
 }
 
 // The race-to target for a match. Scoring targets are decided by stage (and
@@ -454,6 +497,75 @@ export function teamStandings(division, data) {
   } catch {
     return [];
   }
+}
+
+// Overall Team Standings across every team-elimination division of the
+// tournament (Results tab). The aggregation policy lives with the pure
+// calculation in packages/engine (overallTeamStandings.js): teams combined by
+// name across divisions; every COMPLETED pair match counts, in every stage;
+// a win by default is a W/L with its recorded score (or 0–0); ranked
+// W → point diff → points for, full ties share a rank. Scores come from the
+// same place as the division standings (match_results, then score_state).
+export function overallTeamStandings(data) {
+  const divisions = (data.divisions || []).filter((d) => d.format === "team_elimination");
+  const divisionIds = new Set(divisions.map((d) => d.id));
+  const teams = (data.teams || [])
+    .filter((t) => divisionIds.has(t.division_id))
+    .map((t) => ({ id: t.id, name: t.name, divisionId: t.division_id }));
+  const pairResults = (data.matches || [])
+    .filter((m) => divisionIds.has(m.division_id) && m.parent_match_id && m.status === "completed" && (m.winner === "A" || m.winner === "B"))
+    .map((m) => {
+      const a = (data.matchParticipants || []).find((p) => p.match_id === m.id && p.slot === "A");
+      const b = (data.matchParticipants || []).find((p) => p.match_id === m.id && p.slot === "B");
+      const result = resultFor(m, data.results);
+      return {
+        matchId: m.id,
+        divisionId: m.division_id,
+        teamAId: a?.team_id,
+        teamBId: b?.team_id,
+        winnerSlot: m.winner,
+        scoreA: result?.score_a ?? m.score_state?.scoreA ?? 0,
+        scoreB: result?.score_b ?? m.score_state?.scoreB ?? 0,
+      };
+    });
+  return buildOverallTeamStandings({ teams, divisions: divisions.map((d) => ({ id: d.id, name: d.name })), pairResults });
+}
+
+const NOT_STARTED = new Set(["scheduled", "ready", "assigned"]);
+
+// The seeded playoff slots of a team-elimination division — the slots filled
+// from qualification (no earlier match feeds them) — for Edit qualifiers.
+// `autoParticipantId` is the automatic qualifier (from the knockout stage's
+// config.auto_slots once an override exists); `locked` once the matchup or its
+// pair match has started (the server refuses changes then too).
+export function seededPlayoffSlots(division, data) {
+  const stage = (data.stages || []).find((s) => s.division_id === division.id && s.kind === "team_knockout");
+  if (!stage) return [];
+  const matchups = (data.matches || [])
+    .filter((m) => m.stage_id === stage.id && !m.parent_match_id)
+    .sort((x, y) => (x.round - y.round) || ((x.bracket_position ?? 0) - (y.bracket_position ?? 0)));
+  const fed = (mid, s) => matchups.some((m) => (m.next_match_id === mid && m.next_match_slot === s)
+    || (m.loser_next_match_id === mid && m.loser_next_match_slot === s));
+  const cfg = stage.config || {};
+  const notStarted = (m) => NOT_STARTED.has(m.status) && !m.started_at;
+  return matchups.flatMap((m) => ["A", "B"].filter((slot) => !fed(m.id, slot)).map((slot) => {
+    const side = (data.matchParticipants || []).find((p) => p.match_id === m.id && p.slot === slot);
+    const participantId = side?.participant_id ?? null;
+    const auto = (cfg.auto_slots || []).find((x) => x.match_id === m.id && x.slot === slot);
+    const autoParticipantId = auto ? auto.participant_id : participantId;
+    const kids = (data.matches || []).filter((k) => k.parent_match_id === m.id);
+    return {
+      match: m,
+      slot,
+      stageTitle: matchStageTitle(m, data.matches),
+      participantId,
+      teamId: side?.team_id ?? null,
+      autoParticipantId,
+      overridden: participantId !== autoParticipantId,
+      overrides: (cfg.overrides || []).filter((o) => o.match_id === m.id && o.slot === slot),
+      locked: !notStarted(m) || kids.some((k) => !notStarted(k)),
+    };
+  }));
 }
 
 export function finalMatchOf(division, matches) {

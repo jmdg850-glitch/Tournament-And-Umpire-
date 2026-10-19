@@ -1,7 +1,8 @@
 import { useRef, useState } from "react";
 import { Alert, Badge, Button, Card, EmptyState, SectionHeader, StandingsTable, StatusBadge, useToast } from "@tournament/ui";
 import { ExternalLink } from "lucide-react";
-import { courtFor, isTeamMatchup, membersOfParticipant, personLabel, playableMatches, resultFor, scoreLine, sideOf, stageTitle, teamEliminationStandings, umpireFor, unresolvedTieGroups } from "./lib.js";
+import { courtFor, isTeamMatchup, matchStageTitle, membersOfParticipant, personLabel, playableMatches, resultFor, scoreLine, seededPlayoffSlots, sideOf, teamEliminationStandings, umpireFor, unresolvedTieGroups } from "./lib.js";
+import QualifierEditorModal from "./screens/QualifierEditorModal.jsx";
 import BracketImportModal from "./BracketImportModal.jsx";
 import { openBracketWindow } from "./useRealtimeChannel.js";
 import { CollapsibleSection, ExpandCollapseAll, useCollapsedSections } from "./CollapsibleSection.jsx";
@@ -30,19 +31,27 @@ function MatchChip({ match, data }) {
   const court = courtFor(match, data);
   const ump = umpireFor(match, data);
   const score = scoreLine(match, result);
+  // A win by default shows its recorded W/O score, or "W/O" for the winner and
+  // "–" for the other side — never a misleading 0–0.
+  const dw = match.score_state?.defaultWin;
+  const cell = (slot) => {
+    if (dw) return dw.score ? dw.score[slot === "A" ? "a" : "b"] : (match.winner === slot ? "W/O" : "–");
+    if (!(match.winner === slot || match.status === "in_progress" || match.status === "completed")) return "";
+    return slot === "A" ? (result?.score_a ?? match.score_state?.scoreA ?? "") : (result?.score_b ?? match.score_state?.scoreB ?? "");
+  };
   return (
     <div className="match-chip" data-status={match.status}>
       <div className="row" style={{ justifyContent: "space-between" }}>
         <StatusBadge status={match.status} />
-        {match.stage_label ? <Badge>{stageTitle(match.stage_label)}</Badge> : null}
+        <Badge>{matchStageTitle(match, data.matches)}</Badge>
       </div>
       <div className={`side ${match.winner === "A" ? "won" : ""}`}>
         <SideName side={a} data={data} />
-        <span className="mono">{match.winner === "A" || match.status === "in_progress" || match.status === "completed" ? (result?.score_a ?? match.score_state?.scoreA ?? "") : ""}</span>
+        <span className="mono">{cell("A")}</span>
       </div>
       <div className={`side ${match.winner === "B" ? "won" : ""}`}>
         <SideName side={b} data={data} />
-        <span className="mono">{match.winner === "B" || match.status === "in_progress" || match.status === "completed" ? (result?.score_b ?? match.score_state?.scoreB ?? "") : ""}</span>
+        <span className="mono">{cell("B")}</span>
       </div>
       <div className="muted" style={{ fontSize: "0.78rem" }}>
         {court ? court.name : "No court"}
@@ -62,15 +71,20 @@ function RoundColumn({ title, matches, data }) {
   );
 }
 
-function TeamEliminationBoard({ division, data }) {
+function TeamEliminationBoard({ division, data, command, load }) {
+  const [editingQualifiers, setEditingQualifiers] = useState(false);
   const parents = data.matches.filter((m) => m.division_id === division.id && isTeamMatchup(m));
   const qualParents = parents.filter((m) => m.stage_label === "round_robin" || m.bracket_side === "round_robin");
+  const knockouts = parents.filter((m) => m.stage_label === "knockout");
+  const knockoutRounds = [...new Set(knockouts.map((m) => m.round))].sort((x, y) => x - y);
   const semis = parents.filter((m) => m.stage_label === "semifinal");
   const bronze = parents.filter((m) => m.stage_label === "bronze");
   const finals = parents.filter((m) => m.stage_label === "final");
   const kidsOf = (list) => data.matches.filter((m) => list.some((p) => p.id === m.parent_match_id));
   const standings = teamEliminationStandings(division, data);
-  const playoffsExist = semis.length + bronze.length + finals.length > 0;
+  const playoffsExist = knockouts.length + semis.length + bronze.length + finals.length > 0;
+  const slots = playoffsExist ? seededPlayoffSlots(division, data) : [];
+  const overriddenIds = new Set(slots.filter((x) => x.overridden).map((x) => x.participantId));
   // The pairs the server actually placed into the knockout stage — not a
   // slice of the overall ranking (per-team qualification picks per team).
   const knockoutIds = new Set(parents.filter((m) => !qualParents.includes(m)).map((m) => m.id));
@@ -89,7 +103,7 @@ function TeamEliminationBoard({ division, data }) {
         <span className="sep">→</span>
         <span className={qualified.length ? "here" : ""}>Qualified</span>
         <span className="sep">→</span>
-        <span className={semis.length ? "here" : ""}>Semifinals</span>
+        <span className={semis.length || knockouts.length ? "here" : ""}>{knockouts.length ? "Playoffs" : "Semifinals"}</span>
         <span className="sep">→</span>
         <span className={bronze.length || finals.length ? "here" : ""}>Bronze / Final</span>
       </div>
@@ -98,11 +112,11 @@ function TeamEliminationBoard({ division, data }) {
         <EmptyState title="No qualification matches yet">Generate qualification from Divisions after teams and players are registered.</EmptyState>
       ) : (
         <div className="bracket">
-          <RoundColumn title="Qualification" matches={kidsOf(qualParents)} data={data} />
+          <RoundColumn title="Qualification (round robin)" matches={kidsOf(qualParents)} data={data} />
         </div>
       )}
 
-      {standings.length > 0 && <h3>Standings</h3>}
+      {standings.length > 0 && <h3>Qualification standings</h3>}
       {standings.length > 0 && (
         <StandingsTable
           rows={standings.map((row) => ({
@@ -124,13 +138,18 @@ function TeamEliminationBoard({ division, data }) {
 
       {qualified.length > 0 && (
         <div>
-          <h3>Qualified for playoffs</h3>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <h3>Qualified for playoffs</h3>
+            {command && slots.length > 0 && (
+              <Button type="button" variant="secondary" className="compact" onClick={() => setEditingQualifiers(true)}>Edit qualifiers…</Button>
+            )}
+          </div>
           <div className="row">
             {qualified.map((row) => {
               const part = data.participants.find((p) => p.id === row.registrationId);
               return (
                 <Badge key={row.registrationId} tone={row.rank <= 3 ? `rank-${row.rank}` : "ok"}>
-                  #{row.rank} {part?.display_name || row.registrationId} · {row.teamName}
+                  #{row.rank} {part?.display_name || row.registrationId} · {row.teamName}{overriddenIds.has(row.registrationId) ? " · manual" : ""}
                 </Badge>
               );
             })}
@@ -138,12 +157,25 @@ function TeamEliminationBoard({ division, data }) {
         </div>
       )}
 
-      {(semis.length > 0 || bronze.length > 0 || finals.length > 0) && (
+      {playoffsExist && (
         <div className="bracket">
+          {knockoutRounds.map((round) => {
+            const inRound = knockouts.filter((m) => m.round === round);
+            return <RoundColumn key={round} title={matchStageTitle(inRound[0], data.matches)} matches={[...inRound, ...kidsOf(inRound)]} data={data} />;
+          })}
           <RoundColumn title="Semifinals" matches={[...semis, ...kidsOf(semis)]} data={data} />
           <RoundColumn title="Bronze" matches={[...bronze, ...kidsOf(bronze)]} data={data} />
           <RoundColumn title="Final" matches={[...finals, ...kidsOf(finals)]} data={data} />
         </div>
+      )}
+      {editingQualifiers && (
+        <QualifierEditorModal
+          division={division}
+          data={data}
+          command={command}
+          onClose={() => setEditingQualifiers(false)}
+          onSaved={load}
+        />
       )}
     </div>
   );
@@ -163,11 +195,9 @@ function SingleElimBoard({ division, data }) {
         <RoundColumn
           key={round}
           title={
-            matches.some((m) => m.round === round && m.stage_label === "bronze")
-              ? "Bronze"
-              : matches.some((m) => m.round === round && m.stage_label === "final")
-                ? "Final"
-                : `Round ${round}`
+            matches.some((m) => m.round === round && (m.stage_label === "bronze" || m.bracket_side === "bronze"))
+              ? (matches.some((m) => m.round === round && m.stage_label !== "bronze" && m.bracket_side !== "bronze") ? "Final / Bronze" : "Bronze")
+              : matchStageTitle(matches.find((m) => m.round === round), data.matches)
           }
           matches={matches.filter((m) => m.round === round)}
           data={data}
@@ -185,10 +215,10 @@ function SingleElimBoard({ division, data }) {
 // Optionally collapsible: pass `open`/`onToggle` and the header (name,
 // format, match progress) stays visible while the board itself is hidden.
 // Without them the card is always expanded, exactly as before.
-export function DivisionBracketCard({ division, data, open, onToggle }) {
+export function DivisionBracketCard({ division, data, open, onToggle, command, load }) {
   const formatBadge = <Badge>{division.format === "team_elimination" ? "Team elimination" : division.format === "single_elim" ? "Single elimination" : "Round robin"}</Badge>;
   const board = division.format === "team_elimination" ? (
-    <TeamEliminationBoard division={division} data={data} />
+    <TeamEliminationBoard division={division} data={data} command={command} load={load} />
   ) : (
     <SingleElimBoard division={division} data={data} />
   );
@@ -311,7 +341,7 @@ export function BracketsPanel({ data, command, load }) {
         />
       )}
       {data.divisions.map((d) => (
-        <DivisionBracketCard key={d.id} division={d} data={data} open={sections.isOpen(d.id)} onToggle={() => sections.toggle(d.id)} />
+        <DivisionBracketCard key={d.id} division={d} data={data} open={sections.isOpen(d.id)} onToggle={() => sections.toggle(d.id)} command={command} load={load} />
       ))}
     </div>
   );
