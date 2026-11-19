@@ -41,6 +41,8 @@ import {
   adjustTimer,
   resetTimer,
   validateDefaultWinScore,
+  settleOnTimeExpiry,
+  timerView,
 } from "@tournament/engine";
 import { parseCommandEnvelope, isUuid } from "@tournament/contracts";
 import { applyBatch, createBatch, httpError, isUniqueViolation, nowIso, uuid } from "./writes.js";
@@ -2318,7 +2320,14 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     if (applied.code === "INVALID_SCORE") throw httpError(400, "INVALID_SCORE", applied.reason);
     throw httpError(400, "INVALID_COMMAND", "That score event could not be applied");
   }
-  const state = applied.state;
+  let state = applied.state;
+  // A match ended on time keeps that rule when its score is corrected: the
+  // side ahead wins (a tie is refused); the target need not be reached.
+  if (isCorrection && wasCompleted && match.score_state?.timeExpired) {
+    const out = settleOnTimeExpiry({ ...state, timeExpired: match.score_state.timeExpired });
+    if (!out.ok) throw httpError(409, out.code, out.reason);
+    state = out.state;
+  }
 
   // A completed match must stay completed. Only the organizer/admin may change
   // its winner (reviseCompletedMatch re-derives the bracket and team results);
@@ -2416,7 +2425,14 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
   }
   await assertMatchPlayable(admin, match, division);
   const { data: events } = await admin.from("score_events").select("*").eq("match_id", match.id).order("seq");
-  const state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
+  let state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
+  let detail;
+  if (state.status !== "completed" && payload.on_time === true) {
+    // End on time: the game timer has run out (checked on the server clock),
+    // so the side ahead wins at the actual score — see settleOnTimeExpiry.
+    state = settleOnTimeOrThrow(actor, match, state);
+    detail = { ok: true, time_expired: { match_id: match.id, winner: state.winner, score: { a: state.scoreA, b: state.scoreB } } };
+  }
   if (state.status !== "completed") {
     throw httpError(409, "MATCH_NOT_WON", "Scoring has not produced a winner");
   }
@@ -2429,9 +2445,24 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
     tournamentId: match.tournament_id,
     matchId: match.id,
     result: { match: fin.match, progressed: fin.progressed },
+    detail,
   });
   await reconcilePlayoffChildren(admin, match.division_id, division.format);
   return result;
+}
+
+// Organizer or assigned umpire only: a court station may complete a match
+// that scoring has won, never end one on time (like a score correction).
+function settleOnTimeOrThrow(actor, match, state) {
+  if (actor.kind === "station") {
+    throw httpError(403, "FORBIDDEN", "Court stations cannot end a match on time");
+  }
+  if (timerView(match, nowIso()).state !== "expired") {
+    throw httpError(409, "TIMER_NOT_EXPIRED", "The game timer has not run out");
+  }
+  const out = settleOnTimeExpiry(state, { at: nowIso() });
+  if (!out.ok) throw httpError(409, out.code, out.reason);
+  return out.state;
 }
 
 // Win by default (walkover / forfeit): the organizer or this match's assigned

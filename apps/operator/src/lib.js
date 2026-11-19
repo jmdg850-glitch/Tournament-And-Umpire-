@@ -1,4 +1,4 @@
-import { rankIndividualPairsForSemifinals, buildTeamStandingsFromRoundRobin, buildOverallTeamStandings, matchScoringTarget } from "@tournament/engine";
+import { rankIndividualPairsForSemifinals, buildTeamStandingsFromRoundRobin, buildOverallTeamStandings, matchScoringTarget, validateFinalScore } from "@tournament/engine";
 
 export const TOURNAMENT_FLOW = [
   "draft",
@@ -201,7 +201,25 @@ export function scoreLine(match, result) {
   const a = result?.score_a ?? match?.score_state?.scoreA;
   const b = result?.score_b ?? match?.score_state?.scoreB;
   if (a == null && b == null) return "—";
-  return `${a ?? 0}–${b ?? 0}`;
+  // Ended on time (complete_match on_time): the actual score, marked as such.
+  const onTime = match?.status === "completed" && match?.score_state?.timeExpired ? " (time)" : "";
+  return `${a ?? 0}–${b ?? 0}${onTime}`;
+}
+
+// Edit score on a COMPLETED match: the new score must still name a winner.
+// Normally one side must be at the race-to target; a match ended on time
+// (score_state.timeExpired) only needs one side ahead — the same rule the
+// server enforces (settleOnTimeExpiry).
+export function completedCorrectionCheck(match, scoreA, scoreB, winTo) {
+  const check = validateFinalScore(scoreA, scoreB, winTo);
+  if (!check.ok) return { ok: false, winner: null, reason: check.reason };
+  const leader = scoreA > scoreB ? "A" : "B";
+  if (match?.score_state?.timeExpired) {
+    if (scoreA === scoreB) return { ok: false, winner: null, reason: "The score is tied — a match ended on time needs one side ahead." };
+    return { ok: true, winner: leader, reason: null };
+  }
+  if (!check.complete) return { ok: false, winner: null, reason: `A completed match needs a final score — one side must reach ${winTo}.` };
+  return { ok: true, winner: leader, reason: null };
 }
 
 // Win-by-default score boxes: both empty → undefined (no score); one empty →

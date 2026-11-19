@@ -519,6 +519,27 @@ function resetTimer(timer, { now, by } = {}) {
     runningSince: t.runningSince ? toIso(now) : null
   }, now, by);
 }
+var FINISHED_STATUSES = /* @__PURE__ */ new Set(["completed", "cancelled", "abandoned", "bye"]);
+function timerView(match, now) {
+  const t = normalizeTimer(match?.timer);
+  if (!t) return { state: "none", remainingMs: 0, durationSec: 0 };
+  const base = { durationSec: t.durationSec };
+  const status = match?.status;
+  if (FINISHED_STATUSES.has(status)) {
+    const endMs = Date.parse(match?.completed_at);
+    const remainingMs2 = t.runningSince ? timerRemainingMs(t, Number.isFinite(endMs) ? endMs : now) : t.remainingMs;
+    return { ...base, state: "finished", remainingMs: remainingMs2 };
+  }
+  if (status === "in_progress" && t.runningSince) {
+    const remainingMs2 = timerRemainingMs(t, now);
+    return { ...base, state: remainingMs2 <= 0 ? "expired" : "running", remainingMs: remainingMs2 };
+  }
+  const remainingMs = t.runningSince ? timerRemainingMs(t, now) : t.remainingMs;
+  if (remainingMs <= 0) return { ...base, state: "expired", remainingMs: 0 };
+  const untouched = !t.runningSince && remainingMs === t.durationSec * 1e3;
+  const notStarted = ["scheduled", "ready", "assigned"].includes(status);
+  return { ...base, state: notStarted && untouched ? "configured" : "paused", remainingMs };
+}
 
 // packages/engine/src/ids.js
 var defaultId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -1182,6 +1203,32 @@ function validateDefaultWinScore(score, winner, { winTo, bestOf } = {}) {
     return { ok: false, code: "SCORE_WINNER_MISMATCH", reason: "The side that wins by default must have the higher score." };
   }
   return { ok: true, score: { a, b } };
+}
+
+// packages/engine/src/timeExpiry.js
+function settleOnTimeExpiry(state, { at } = {}) {
+  const st = state || {};
+  if ((st.bestOf || 1) > 1) {
+    return { ok: false, code: "CORRECTION_UNSUPPORTED", reason: "A multi-game match can't be ended on time." };
+  }
+  const scoreA = st.scoreA ?? 0;
+  const scoreB = st.scoreB ?? 0;
+  if (!Number.isInteger(scoreA) || !Number.isInteger(scoreB) || scoreA < 0 || scoreB < 0) {
+    return { ok: false, code: "INVALID_SCORE", reason: "Scores must be whole numbers of 0 or more." };
+  }
+  if (scoreA === scoreB) {
+    return { ok: false, code: "TIED_ON_TIME", reason: "The score is tied \u2014 play continues until one side leads." };
+  }
+  const winner = scoreA > scoreB ? "A" : "B";
+  return {
+    ok: true,
+    state: {
+      ...st,
+      status: "completed",
+      winner,
+      timeExpired: { at: at ?? st.timeExpired?.at ?? null, scoreA, scoreB }
+    }
+  };
 }
 
 // packages/engine/src/registration.js
@@ -3628,7 +3675,12 @@ async function handleScoreEvent(admin, actor, payload, envelope) {
     if (applied.code === "INVALID_SCORE") throw httpError(400, "INVALID_SCORE", applied.reason);
     throw httpError(400, "INVALID_COMMAND", "That score event could not be applied");
   }
-  const state = applied.state;
+  let state = applied.state;
+  if (isCorrection && wasCompleted && match.score_state?.timeExpired) {
+    const out = settleOnTimeExpiry({ ...state, timeExpired: match.score_state.timeExpired });
+    if (!out.ok) throw httpError(409, out.code, out.reason);
+    state = out.state;
+  }
   const isOrganizerActor = Boolean(scoringMember) && ["organizer", "admin"].includes(scoringMember.role);
   if (isCorrection && wasCompleted && state.status !== "completed") {
     throw httpError(409, "WOULD_CHANGE_WINNER", "A completed match needs a final score (one team must win).");
@@ -3710,7 +3762,12 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
   }
   await assertMatchPlayable(admin, match, division);
   const { data: events } = await admin.from("score_events").select("*").eq("match_id", match.id).order("seq");
-  const state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
+  let state = reduceScoreEvents(await matchScoringSettings(admin, division, match), events || []);
+  let detail;
+  if (state.status !== "completed" && payload.on_time === true) {
+    state = settleOnTimeOrThrow(actor, match, state);
+    detail = { ok: true, time_expired: { match_id: match.id, winner: state.winner, score: { a: state.scoreA, b: state.scoreB } } };
+  }
   if (state.status !== "completed") {
     throw httpError(409, "MATCH_NOT_WON", "Scoring has not produced a winner");
   }
@@ -3722,10 +3779,22 @@ async function handleCompleteMatch(admin, actor, payload, envelope) {
     ...actorCommit(actor),
     tournamentId: match.tournament_id,
     matchId: match.id,
-    result: { match: fin.match, progressed: fin.progressed }
+    result: { match: fin.match, progressed: fin.progressed },
+    detail
   });
   await reconcilePlayoffChildren(admin, match.division_id, division.format);
   return result;
+}
+function settleOnTimeOrThrow(actor, match, state) {
+  if (actor.kind === "station") {
+    throw httpError(403, "FORBIDDEN", "Court stations cannot end a match on time");
+  }
+  if (timerView(match, nowIso()).state !== "expired") {
+    throw httpError(409, "TIMER_NOT_EXPIRED", "The game timer has not run out");
+  }
+  const out = settleOnTimeExpiry(state, { at: nowIso() });
+  if (!out.ok) throw httpError(409, out.code, out.reason);
+  return out.state;
 }
 var DEFAULT_WIN_FROM = /* @__PURE__ */ new Set(["scheduled", "ready", "assigned", "postponed", "in_progress"]);
 async function handleDeclareDefaultWin(admin, actor, payload, envelope) {

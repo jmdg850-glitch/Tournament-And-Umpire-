@@ -1532,6 +1532,10 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const [busy, setBusy] = useState(false);
   const [laneBusy, setLaneBusy] = useState(false);
   const [confirmComplete, setConfirmComplete] = useState(false);
+  const [confirmEndOnTime, setConfirmEndOnTime] = useState(false);
+  // Bumped when the game timer reaches 00:00 so the desk re-renders and
+  // offers "End match on time" (the timer itself ticks in its own component).
+  const [, setGameTimeUpTick] = useState(0);
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [showEditScore, setShowEditScore] = useState(false);
   const [showScoringConfirm, setShowScoringConfirm] = useState(false);
@@ -1802,6 +1806,11 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
       if (baseRef.current) setError(message); else setLoadError(message);
     }
   }, [supabase, matchId, station, cfg, getAuth, owner, store, refreshLocal, engine]);
+  // On game-time expiry, one re-read picks up any time the organizer added.
+  const onGameTimeExpire = useCallback(() => {
+    setGameTimeUpTick((n) => n + 1);
+    load();
+  }, [load]);
 
   useEffect(() => {
     refreshLocal().catch(() => {}).finally(() => load());
@@ -2039,6 +2048,14 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
   const serverScore = base?.match?.score_state || {};
   const pendingHere = view ? view.pending.length : 0;
   const completionQueued = Boolean(view?.pending.some((e) => e.type === "complete_match"));
+  // End on time (signed-in umpire only): the game timer has run out, so the
+  // match may be completed at the actual score — the side ahead wins; a tie
+  // plays on until a rally puts one side ahead. The server re-checks the
+  // timer on its own clock (complete_match on_time).
+  const gameTimeUp = scoring && !readyToComplete && !station && (score.bestOf || 1) <= 1
+    && timerView(timerDisplayMatch(match), Date.now()).state === "expired";
+  const tiedOnTime = gameTimeUp && (score.scoreA ?? 0) === (score.scoreB ?? 0);
+  const leaderOnTime = !gameTimeUp || tiedOnTime ? null : (score.scoreA ?? 0) > (score.scoreB ?? 0) ? "A" : "B";
   const offlineNow = Boolean(syncStatus?.offline) || deviceOffline || loadOffline;
   // A paired court station may only score points and undo: the server refuses
   // corrections from a station, and a refused correction would block this
@@ -2111,8 +2128,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
                 Game {score.gameNumber || 1}
                 {multiGame ? <span className="ump-games"> · {gamesA}–{gamesB}</span> : null}
               </div>
-              {/* On expiry, one re-read picks up any time the organizer added. */}
-              <MatchGameTimer match={match} onExpire={load} />
+              <MatchGameTimer match={match} onExpire={onGameTimeExpire} />
               <StatusBadge status={match.status} />
             </>
           )}
@@ -2293,7 +2309,7 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
           </Modal>
         )}
 
-        {scoring && !readyToComplete && (
+        {scoring && !readyToComplete && !(gameTimeUp && completionQueued) && (
           <>
             <div className="pads">
               <Button
@@ -2342,6 +2358,16 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
         ) : !confirmComplete && (
           <Button className="cta ump-primary" disabled={busy || actionsLocked} onClick={() => setConfirmComplete(true)}>
             Complete match
+          </Button>
+        ))}
+
+        {gameTimeUp && (completionQueued ? (
+          <Alert tone="ok">Result saved on this device. It is sent automatically — you can go back to your matches.</Alert>
+        ) : tiedOnTime ? (
+          <Alert>Time is up and the score is tied. Play continues — the next point wins, then end the match on time.</Alert>
+        ) : !confirmEndOnTime && (
+          <Button className="cta ump-primary" disabled={busy || actionsLocked} onClick={() => setConfirmEndOnTime(true)}>
+            End match on time
           </Button>
         ))}
 
@@ -2508,6 +2534,20 @@ function MatchDesk({ cfg, supabase, station, matchId, sync, onBack, onSignOut })
           onConfirm={() => {
             setConfirmComplete(false);
             enqueue("complete_match", {});
+          }}
+        />
+      )}
+
+      {confirmEndOnTime && leaderOnTime && (
+        <ConfirmDialog
+          title="End match on time?"
+          body={`Time is up. Winner: ${leaderOnTime === "A" ? nameA : nameB}. Final score ${score.scoreA ?? 0}–${score.scoreB ?? 0} — the score is not changed. This records the official result.`}
+          confirmLabel="End match on time"
+          busy={busy}
+          onCancel={() => setConfirmEndOnTime(false)}
+          onConfirm={() => {
+            setConfirmEndOnTime(false);
+            enqueue("complete_match", { on_time: true });
           }}
         />
       )}

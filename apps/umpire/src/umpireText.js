@@ -35,6 +35,8 @@ const BY_CODE = {
   MATCH_NOT_ACTIVE: "This match isn't live any more. Tap Reload to see its current status.",
   ILLEGAL_TRANSITION: "This match can't do that from its current status. Tap Reload to see the latest.",
   MATCH_NOT_WON: "No one has won yet, so the match can't be completed.",
+  TIMER_NOT_EXPIRED: "The game time hasn't run out (the organizer may have added time). Keep playing.",
+  TIED_ON_TIME: "The score is tied — play continues until one side leads.",
   MATCH_NOT_EDITABLE: "This match can't be edited any more.",
   WOULD_CHANGE_WINNER: "That score would change the winner of a completed match. Ask the organizer to fix it.",
   CANCEL_BLOCKS_BRACKET: "This match's result is needed for the next round, so it can't be cancelled. Use Win by default instead.",

@@ -3,7 +3,7 @@
 // qualifiers (React rendering itself has no harness in this project).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { matchStageTitle, parseOptionalScore, scoreLine, overallTeamStandings, seededPlayoffSlots } from "./lib.js";
+import { matchStageTitle, parseOptionalScore, scoreLine, overallTeamStandings, seededPlayoffSlots, completedCorrectionCheck } from "./lib.js";
 
 const teamDivision = [
   { id: "rr", division_id: "d1", stage_id: "s-rr", stage_label: "round_robin", round: 1, parent_match_id: null },
@@ -42,6 +42,8 @@ test("scoreLine: a win by default shows W/O, with the recorded administrative sc
   assert.equal(scoreLine({ score_state: { defaultWin: { winner: "A" } } }, { score_a: 0, score_b: 0 }), "W/O");
   assert.equal(scoreLine({ score_state: { defaultWin: { winner: "A", score: { a: 11, b: 0 } }, scoreA: 11, scoreB: 0 } }, { score_a: 11, score_b: 0 }), "W/O 11–0");
   assert.equal(scoreLine({ score_state: { scoreA: 11, scoreB: 7 } }, { score_a: 11, score_b: 7 }), "11–7");
+  // Ended on time: the actual (sub-target) score, marked "(time)".
+  assert.equal(scoreLine({ status: "completed", score_state: { scoreA: 8, scoreB: 6, timeExpired: { scoreA: 8, scoreB: 6 } } }, { score_a: 8, score_b: 6 }), "8–6 (time)");
 });
 
 test("parseOptionalScore: empty = no score, half-filled = invalid, else numbers", () => {
@@ -113,4 +115,16 @@ test("seededPlayoffSlots: only slots not fed by an earlier match; override and l
   assert.equal(slots[0].autoParticipantId, "jeff");
   assert.equal(slots[0].stageTitle, "Semifinals");
   assert.deepEqual(seededPlayoffSlots({ id: "other" }, data), []);
+});
+
+test("completedCorrectionCheck: a played match still needs the target; a match ended on time only a leader", () => {
+  const played = { status: "completed", score_state: { scoreA: 11, scoreB: 6 } };
+  assert.deepEqual(completedCorrectionCheck(played, 11, 7, 11), { ok: true, winner: "A", reason: null });
+  assert.equal(completedCorrectionCheck(played, 9, 6, 11).ok, false);
+  assert.equal(completedCorrectionCheck(played, 12, 6, 11).ok, false);
+  const onTime = { status: "completed", score_state: { scoreA: 8, scoreB: 6, timeExpired: { scoreA: 8, scoreB: 6 } } };
+  assert.deepEqual(completedCorrectionCheck(onTime, 9, 6, 11), { ok: true, winner: "A", reason: null });
+  assert.deepEqual(completedCorrectionCheck(onTime, 6, 9, 11), { ok: true, winner: "B", reason: null });
+  assert.match(completedCorrectionCheck(onTime, 7, 7, 11).reason, /tied/);
+  assert.equal(completedCorrectionCheck(onTime, 12, 6, 11).ok, false);
 });

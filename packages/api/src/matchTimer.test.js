@@ -711,3 +711,128 @@ describe("division scoring targets", () => {
     expect(admin.tables.divisions[0].config.scoringTargets).toEqual({ qualification: 1, semifinal: 99, final: 21 });
   });
 });
+
+// End on time: once the game timer has run out, complete_match { on_time }
+// records the result at the actual score (side ahead wins, tie refused).
+describe("complete_match on_time — timer expired", () => {
+  const F = "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1";
+  let seq = 0;
+  const correct = (admin, actor, scoreA, scoreB, extra = {}) =>
+    send(admin, actor, "score_event", { match_id: M, event_id: cmdId(), seq: ++seq, type: "correction", payload: { scoreA, scoreB, ...extra } });
+  const endOnTime = (admin, actor) => send(admin, actor, "complete_match", { match_id: M, on_time: true });
+  async function live({ seconds = 600, divisionConfig, bracket = false } = {}) {
+    seq = 0;
+    const admin = fixture({ divisionConfig });
+    if (bracket) {
+      Object.assign(row(admin), { next_match_id: F, next_match_slot: "A" });
+      admin.tables.matches.push({ ...row(admin), id: F, round: 2, status: "scheduled", next_match_id: null, next_match_slot: null, timer: null });
+    }
+    await setTimer(admin, ORGANIZER, seconds);
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    return admin;
+  }
+
+  test("B: expires at 8–6 (race to 11) — umpire ends it at the actual score", async () => {
+    const admin = await live();
+    await correct(admin, UMPIRE, 8, 6);
+    advance(601);
+    const out = await endOnTime(admin, UMPIRE);
+    expect(row(admin)).toMatchObject({ status: "completed", winner: "A" });
+    expect(row(admin).score_state).toMatchObject({ scoreA: 8, scoreB: 6, winTo: 11, status: "completed", winner: "A", timeExpired: { scoreA: 8, scoreB: 6 } });
+    expect(admin.tables.match_results).toEqual([expect.objectContaining({ match_id: M, winner_slot: "A", winner_participant_id: PA, score_a: 8, score_b: 6 })]);
+    expect(out.result.match.status).toBe("completed");
+    expect(timerView(row(admin), Date.now()).state).toBe("finished");
+  });
+
+  test("C: expires at 12–10 (race to 15) — organizer ends it; the winner advances in the bracket", async () => {
+    const admin = await live({ divisionConfig: { scoringTargets: { qualification: 15 } }, bracket: true });
+    expect(row(admin).score_state.winTo).toBe(15);
+    await correct(admin, ORGANIZER, 10, 12);
+    advance(700);
+    await endOnTime(admin, ORGANIZER);
+    expect(row(admin)).toMatchObject({ status: "completed", winner: "B" });
+    expect(row(admin).score_state).toMatchObject({ scoreA: 10, scoreB: 12, winTo: 15 });
+    expect(admin.tables.match_participants).toContainEqual(expect.objectContaining({ match_id: F, slot: "A", participant_id: PB }));
+  });
+
+  test("D: a tied score at 00:00 is refused; the next point decides it", async () => {
+    const admin = await live();
+    await correct(admin, UMPIRE, 7, 7);
+    advance(601);
+    expect(await fail(endOnTime(admin, UMPIRE))).toMatchObject({ status: 409, code: "TIED_ON_TIME" });
+    expect(row(admin).status).toBe("in_progress");
+    expect(admin.tables.match_results).toHaveLength(0);
+    // Serving side A wins the rally → 8–7, then the match can end on time.
+    await send(admin, UMPIRE, "score_event", { match_id: M, event_id: cmdId(), seq: ++seq, type: "point", payload: { team: row(admin).score_state.servingTeam } });
+    await endOnTime(admin, UMPIRE);
+    expect(row(admin)).toMatchObject({ status: "completed" });
+    const { scoreA, scoreB } = row(admin).score_state;
+    expect(Math.abs(scoreA - scoreB)).toBe(1);
+    expect(Math.max(scoreA, scoreB)).toBe(8);
+  });
+
+  test("refused while the timer is still running, and after the organizer adds time", async () => {
+    const admin = await live();
+    await correct(admin, UMPIRE, 8, 6);
+    advance(300);
+    expect(await fail(endOnTime(admin, UMPIRE))).toMatchObject({ status: 409, code: "TIMER_NOT_EXPIRED" });
+    advance(301);
+    await send(admin, ORGANIZER, "set_match_timer", { match_id: M, action: "adjust", delta_seconds: 120 });
+    expect(await fail(endOnTime(admin, UMPIRE))).toMatchObject({ status: 409, code: "TIMER_NOT_EXPIRED" });
+    expect(row(admin).status).toBe("in_progress");
+  });
+
+  test("refused without a timer; plain complete_match is unchanged (still needs a winner)", async () => {
+    seq = 0;
+    const admin = fixture();
+    await send(admin, UMPIRE, "start_match", { match_id: M });
+    await correct(admin, UMPIRE, 8, 6);
+    expect(await fail(endOnTime(admin, UMPIRE))).toMatchObject({ status: 409, code: "TIMER_NOT_EXPIRED" });
+    const timed = await live();
+    await correct(timed, UMPIRE, 8, 6);
+    advance(601);
+    expect(await fail(send(timed, UMPIRE, "complete_match", { match_id: M }))).toMatchObject({ status: 409, code: "MATCH_NOT_WON" });
+  });
+
+  test("a court station, another umpire and a non-member are refused", async () => {
+    const admin = await live();
+    admin.tables.court_devices = [{ id: STATION.deviceId, tournament_id: T, court_id: "c-1", status: "active" }];
+    admin.tables.court_assignments.push({ id: "ca-1", match_id: M, court_id: "c-1" });
+    const OTHER = { kind: "user", id: "88888888-8888-4888-8888-888888888888", email: "o@example.com" };
+    admin.tables.tournament_members.push({ id: "tm-u2", tournament_id: T, user_id: OTHER.id, role: "umpire" });
+    await correct(admin, UMPIRE, 8, 6);
+    advance(601);
+    expect(await fail(endOnTime(admin, STATION))).toMatchObject({ status: 403, code: "FORBIDDEN" });
+    expect(await fail(endOnTime(admin, OTHER))).toMatchObject({ status: 403 });
+    expect(row(admin).status).toBe("in_progress");
+  });
+
+  test("J: a second submission (new or replayed command) changes nothing", async () => {
+    const admin = await live();
+    await correct(admin, UMPIRE, 8, 6);
+    advance(601);
+    const body = { command_id: cmdId(), type: "complete_match", payload: { match_id: M, on_time: true } };
+    await handleCommand({ admin, actor: UMPIRE, body });
+    const done = structuredClone(row(admin));
+    await handleCommand({ admin, actor: UMPIRE, body }); // same command_id (sync retry)
+    const again = await endOnTime(admin, ORGANIZER); // a new, separate submission
+    expect(again.already_complete ?? again.result?.already_complete).toBe(true);
+    expect(row(admin)).toEqual(done);
+    expect(admin.tables.match_results).toHaveLength(1);
+  });
+
+  test("the result can still be corrected: same winner by the umpire, a winner change by the organizer, no tie", async () => {
+    const admin = await live();
+    await correct(admin, UMPIRE, 8, 6);
+    advance(601);
+    await endOnTime(admin, UMPIRE);
+    const extra = { reason: "scorer mistake", confirm_completed: true };
+    await correct(admin, UMPIRE, 9, 6, extra);
+    expect(row(admin)).toMatchObject({ status: "completed", winner: "A", score_state: { scoreA: 9, scoreB: 6, timeExpired: { scoreA: 9, scoreB: 6 } } });
+    expect(await fail(correct(admin, UMPIRE, 6, 9, extra))).toMatchObject({ status: 409, code: "WOULD_CHANGE_WINNER" });
+    expect(await fail(correct(admin, ORGANIZER, 7, 7, extra))).toMatchObject({ status: 409, code: "TIED_ON_TIME" });
+    await correct(admin, ORGANIZER, 6, 9, extra);
+    expect(row(admin)).toMatchObject({ status: "completed", winner: "B" });
+    expect(admin.tables.match_results[0]).toMatchObject({ winner_slot: "B", score_a: 6, score_b: 9 });
+  });
+});

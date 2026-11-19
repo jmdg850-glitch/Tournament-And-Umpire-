@@ -124,6 +124,8 @@ export {
 
 export { validateDefaultWinScore } from "./defaultWin.js";
 
+export { settleOnTimeExpiry } from "./timeExpiry.js";
+
 export {
   normalizeTeamNameKey,
   buildOverallTeamStandings,

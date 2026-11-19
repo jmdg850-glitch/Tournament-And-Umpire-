@@ -39,7 +39,9 @@ function buildPayload(kind, matchId, eventId, seq, fields) {
       court_side: fields?.court_side,
     };
   }
-  return { match_id: matchId };
+  // complete_match: on_time ends the match at the current score once the game
+  // timer has run out (the server checks the timer).
+  return fields?.on_time === true ? { match_id: matchId, on_time: true } : { match_id: matchId };
 }
 
 function commandTypeOf(kind) {

@@ -408,6 +408,16 @@ describe("sequence allocation", () => {
     expect(a.entry.command_id).toBe(a.entry.payload.event_id);
   });
 
+  it("complete_match uses no seq and carries on_time only when asked (end on time)", async () => {
+    const { store, match } = await setup();
+    const lane = laneFor(store, match);
+    const plain = await lane.enqueue("complete_match", {});
+    const onTime = await lane.enqueue("complete_match", { on_time: true });
+    expect(plain.entry.payload).toEqual({ match_id: "m1" });
+    expect(onTime.entry).toMatchObject({ type: "complete_match", payload: { match_id: "m1", on_time: true } });
+    expect(onTime.entry.payload.seq).toBeUndefined();
+  });
+
   it("the allocator never goes below what is already queued or confirmed", async () => {
     const { store, match } = await setup();
     const lane = laneFor(store, match);

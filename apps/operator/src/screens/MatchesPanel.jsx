@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Badge, Button, Card, Dropdown, EmptyState, GameTimer, Input, Modal, SectionHeader, Select, ServeIndicator, Stat, StatusBadge, Table, TickNumber, useNow } from "@tournament/ui";
 import { ExternalLink } from "lucide-react";
 import { validateFinalScore, validateDefaultWinScore, timerView, formatClock, MIN_GAME_TIME_SEC, MAX_GAME_TIME_SEC } from "@tournament/engine";
@@ -20,6 +20,7 @@ import {
   sideOf,
   matchStageTitle,
   parseOptionalScore,
+  completedCorrectionCheck,
   umpireFor,
 } from "../lib.js";
 
@@ -54,11 +55,13 @@ function EditScoreModal({ match, target, nameA, nameB, command, onClose, onSaved
   const unchanged = validNumbers && nextA === (state.scoreA ?? 0) && nextB === (state.scoreB ?? 0);
   // Same rule the engine enforces: race to winTo, no deuce (e.g. 11–10 / 15–14 end the match).
   const check = validNumbers ? validateFinalScore(nextA, nextB, winTo) : null;
-  const scoreError = check && !check.ok
-    ? check.reason
-    : completedMatch && check && !check.complete ? `A completed match needs a final score — one side must reach ${winTo}.` : "";
+  // A completed match must keep a winner (ended on time: one side ahead).
+  const completedCheck = completedMatch && validNumbers ? completedCorrectionCheck(match, nextA, nextB, winTo) : null;
+  const scoreError = completedCheck
+    ? (completedCheck.ok ? "" : completedCheck.reason)
+    : check && !check.ok ? check.reason : "";
   const oldWinner = completedMatch ? (match.winner || state.winner) : null;
-  const newWinner = check?.complete ? (nextA > nextB ? "A" : "B") : null;
+  const newWinner = completedCheck ? completedCheck.winner : check?.complete ? (nextA > nextB ? "A" : "B") : null;
   const winnerChanges = completedMatch && newWinner && oldWinner && newWinner !== oldWinner;
   const needsReason = completedMatch && !reason.trim();
   const canContinue = validNumbers && !unchanged && !scoreError && !needsReason && !busy;
@@ -334,13 +337,70 @@ function MatchActionModal({ match, mode, nameA, nameB, target, command, onClose,
   );
 }
 
+// End on time (complete_match on_time): the game timer has run out, so the
+// match is completed at the ACTUAL score — the side ahead wins, the score is
+// never changed. A tied score plays on until one side leads. The server
+// re-checks the timer on its own clock and records the result, standings and
+// bracket advancement exactly like a played win.
+export function canEndOnTime(match) {
+  return match?.status === "in_progress" && (match.score_state?.bestOf || 1) <= 1
+    && timerView(match, Date.now()).state === "expired";
+}
+
+function EndOnTimeModal({ match, nameA, nameB, command, onClose, onSaved }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const sa = match.score_state?.scoreA ?? 0;
+  const sb = match.score_state?.scoreB ?? 0;
+  const tied = sa === sb;
+  const winnerName = sa > sb ? nameA : nameB;
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      await command("complete_match", { match_id: match.id, on_time: true });
+      await onSaved?.();
+      onClose();
+    } catch (err) {
+      setError(err.message || "The match was not completed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="End match on time" onClose={() => !busy && onClose()}>
+      <div className="stack">
+        <p className="muted" style={{ margin: 0 }}>{nameA} vs {nameB} · Score {sa}–{sb}</p>
+        {tied ? (
+          <Alert>Time is up and the score is tied. Play continues — the next point wins, then end the match on time.</Alert>
+        ) : (
+          <p style={{ margin: 0 }}>Time is up. {winnerName} wins {sa}–{sb} — the score is not changed. This records the official result; the winner moves on in the bracket.</p>
+        )}
+        {error && <Alert>{error}</Alert>}
+        <div className="row">
+          <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>Back</Button>
+          <Button type="button" disabled={busy || tied} onClick={submit}>{busy ? "Saving…" : "End match on time"}</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // Game timer readout. Its own component so only it re-renders on each tick;
 // the value is always recomputed from the match's persisted timer (the same
 // anchor every device uses), so realtime updates and reloads never restart it.
-export function MatchTimerClock({ match, className }) {
+// `onExpire` fires once when a running countdown reaches 00:00.
+export function MatchTimerClock({ match, className, onExpire }) {
   const running = timerView(match, Date.now()).state === "running";
   const now = useNow(running);
   const view = timerView(match, now);
+  const prevState = useRef(view.state);
+  useEffect(() => {
+    if (prevState.current === "running" && view.state === "expired") onExpire?.();
+    prevState.current = view.state;
+  }, [view.state, onExpire]);
   return <GameTimer view={view} clock={formatClock(view.remainingMs)} className={className} />;
 }
 
@@ -458,6 +518,11 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
   const timerMatch = timerId ? matches.find((m) => m.id === timerId) : null;
   const [action, setAction] = useState(null); // { id, mode }
   const actionMatch = action ? matches.find((m) => m.id === action.id) : null;
+  const [onTimeId, setOnTimeId] = useState(null);
+  const onTimeMatch = onTimeId ? matches.find((m) => m.id === onTimeId && m.status === "in_progress") : null;
+  // A game timer reaching 00:00 re-renders the tiles so "End on time" appears.
+  const [, setTimeUpTick] = useState(0);
+  const onTimeUp = useCallback(() => setTimeUpTick((n) => n + 1), []);
   return (
     <div className="live-strip">
       {matches.map((m) => {
@@ -480,7 +545,15 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
               {ump ? ` · ${ump.name}` : ""}
             </div>
             <ServeIndicator state={m.score_state} className="live-tile-serve" />
-            <MatchTimerClock match={m} className="live-tile-timer" />
+            <MatchTimerClock match={m} className="live-tile-timer" onExpire={onTimeUp} />
+            {command && canEndOnTime(m) ? (
+              <Button
+                style={{ marginTop: 10, width: "100%" }}
+                onClick={() => setOnTimeId(m.id)}
+              >
+                End on time
+              </Button>
+            ) : null}
             {onOpenLiveWindow ? (
               <Button
                 variant="tape"
@@ -533,6 +606,16 @@ export function LiveTiles({ data, matches, onOpenLiveWindow, command, load }) {
           target={scoringTargetFor(actionMatch, data.matches, divisionTargetsFor(actionMatch, data.divisions))}
           command={command}
           onClose={() => setAction(null)}
+          onSaved={load}
+        />
+      )}
+      {onTimeMatch && (
+        <EndOnTimeModal
+          match={onTimeMatch}
+          nameA={sideOf(onTimeMatch.id, "A", data).name}
+          nameB={sideOf(onTimeMatch.id, "B", data).name}
+          command={command}
+          onClose={() => setOnTimeId(null)}
           onSaved={load}
         />
       )}
